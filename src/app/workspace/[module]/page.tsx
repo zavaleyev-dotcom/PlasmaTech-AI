@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
+import { SciFinderSearch } from '@/components/scifinder/search';
 import { WorkspaceModule } from '@/components/workspace-module';
 import { getWorkspaceModule, workspaceModules } from '@/modules/workspace/registry';
 
@@ -23,11 +24,11 @@ export default async function ModulePage({ params }: Props) {
     <div className="page inner-page">
       <Link href="/workspace" className="text-link">← Все инструменты</Link>
       <div className="page-intro">
-        <div className="eyebrow">AI WORKSPACE / DEMO</div>
+        <div className="eyebrow">{workspaceModule.id === 'scifinder' ? 'AI WORKSPACE / CROSSREF' : 'AI WORKSPACE / DEMO'}</div>
         <h1>{workspaceModule.tool.name}</h1>
         <p>{workspaceModule.tool.description}</p>
       </div>
-      <WorkspaceModule key={workspaceModule.id} tool={workspaceModule.tool} example={workspaceModule.example} />
+      {workspaceModule.id === 'scifinder' ? <SciFinderSearch /> : <WorkspaceModule key={workspaceModule.id} tool={workspaceModule.tool} example={workspaceModule.example} />}
     </div>
   );
 }

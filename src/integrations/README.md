@@ -1,7 +1,8 @@
 # Integration boundaries
 
-Only TypeScript contracts are present. No connections, SDKs, credentials,
-authentication, network requests, databases or paid services are configured.
+Crossref is a working public server-side bibliographic adapter. OpenAlex is a
+prepared, inactive adapter. Other integrations contain TypeScript contracts only.
+No authentication, databases, paid AI services or Google Drive connections exist.
 
 Future implementations of these ports must run on the server, use a
 `server-only` boundary, and receive secrets from server environment variables.
@@ -13,3 +14,6 @@ an adapter, implement validation, access controls, timeouts and error handling.
 - `google-drive`: knowledge document source.
 - `scientific-databases`: searchable scientific source.
 - `postgresql`, `supabase`: alternatives implementing the database repository.
+
+- `crossref`: public REST search and DOI lookup; no API key.
+- `openalex`: inactive ScientificSourceProvider; optional OPENALEX_API_KEY reserved.

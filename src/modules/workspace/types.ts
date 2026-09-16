@@ -5,6 +5,6 @@ export type WorkspaceModuleId = Tool['id'];
 export interface WorkspaceModule {
   id: WorkspaceModuleId;
   slug: string;
-  mode: 'demo';
+  mode: 'demo' | 'live';
   example: string;
 }

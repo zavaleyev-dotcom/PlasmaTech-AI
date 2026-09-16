@@ -1,0 +1,55 @@
+import { normalizeDoi, normalizedTitle } from './normalization';
+import type { Publication } from './types';
+
+function titleKey(publication: Publication): string | null {
+  const title = normalizedTitle(publication.title);
+  // A missing title/year is insufficient to identify a work reliably.
+  return title && publication.title !== 'Без названия' && publication.year !== null
+    ? `${title}|${publication.year}` : null;
+}
+
+function merge(first: Publication, second: Publication): Publication {
+  const preferred = first.doi ? first : second.doi ? second : first;
+  const other = preferred === first ? second : first;
+  return {
+    ...preferred,
+    authors: preferred.authors.length ? preferred.authors : other.authors,
+    abstract: preferred.abstract || other.abstract,
+    journal: preferred.journal || other.journal,
+    publisher: preferred.publisher || other.publisher,
+    url: preferred.url || other.url,
+    year: preferred.year ?? other.year,
+    type: preferred.type || other.type,
+    openAccess: preferred.openAccess ?? other.openAccess,
+    sources: [...new Set([...first.sources, ...second.sources])],
+  };
+}
+
+export function deduplicatePublications(publications: readonly Publication[]): Publication[] {
+  const result: Publication[] = [];
+  // DOI-bearing records first: title-only records can enrich a known record,
+  // but must never bridge two different DOIs with similar titles.
+  const records = publications.map((publication, index) => ({
+    publication: { ...publication, doi: normalizeDoi(publication.doi) }, index,
+  }));
+  records.sort((a, b) => Number(!!b.publication.doi) - Number(!!a.publication.doi));
+  const originalOrder: number[] = [];
+  for (const { publication, index } of records) {
+    const key = titleKey(publication);
+    const matches = result.map((existing, position) => ({ existing, position })).filter(({ existing }) => {
+      if (publication.doi && existing.doi) return publication.doi === existing.doi;
+      return key !== null && key === titleKey(existing);
+    });
+    // Ambiguous title-only record: preserve it instead of choosing an arbitrary DOI.
+    if (matches.length === 1) {
+      const position = matches[0].position;
+      result[position] = merge(result[position], publication);
+      originalOrder[position] = Math.min(originalOrder[position], index);
+    } else {
+      result.push(publication);
+      originalOrder.push(index);
+    }
+  }
+  return result.map((publication, index) => ({ publication, order: originalOrder[index] }))
+    .sort((a, b) => a.order - b.order).map(item => item.publication);
+}
