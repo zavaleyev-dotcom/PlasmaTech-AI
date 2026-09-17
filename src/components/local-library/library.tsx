@@ -2,9 +2,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { filterLibrary } from '@/services/local-library/filter';
 import { documentTypes, type IndexProgress, type LibraryQuery, type PublicLibraryRecord } from '@/services/local-library/types';
+import { ContentSearch } from './content-search';
 import styles from '@/components/scifinder/search.module.css';
 interface Snapshot { records: PublicLibraryRecord[]; indexedAt: string | null; errors: { relativePath: string; message: string }[]; progress: IndexProgress }
 export function LocalLibrary() {
+  const [mode, setMode] = useState<'metadata' | 'content'>('metadata');
   const [data, setData] = useState<Snapshot | null>(null);
   const [error, setError] = useState('');
   const [starting, setStarting] = useState(false);
@@ -44,6 +46,8 @@ export function LocalLibrary() {
   const pages = Math.max(1, Math.ceil(records.length / 50));
   const currentPage = Math.min(page, pages);
   return <>
+    <div className={styles.actions} aria-label="Режим поиска"><button className={`button ${mode === 'metadata' ? 'primary' : 'secondary'}`} aria-pressed={mode === 'metadata'} onClick={() => setMode('metadata')}>Поиск по метаданным</button><button className={`button ${mode === 'content' ? 'primary' : 'secondary'}`} aria-pressed={mode === 'content'} onClick={() => setMode('content')}>Поиск по содержимому</button></div>
+    {mode === 'content' ? <ContentSearch /> : <div className={styles.results}>
     <div className={styles.actions}><button className="button primary" disabled={starting || data?.progress.running} onClick={() => void refresh()}>{starting || data?.progress.running ? 'Индексирование…' : 'Обновить индекс'}</button><span className={styles.hint}>PDF доступны только для чтения. Обогащение через внешние сервисы не выполняется.</span></div>
     {error && <div role="alert" className={`${styles.status} ${styles.error}`}>{error}<button className="button secondary" onClick={() => void load()}>Повторить загрузку</button></div>}
     {!data && !error && <p role="status">Загрузка индекса…</p>}
@@ -71,5 +75,6 @@ export function LocalLibrary() {
       {data.errors.length > 0 && <details className={`${styles.status} ${styles.results}`}><summary>Ошибки чтения файлов и каталогов: {data.errors.length}</summary><ul>{data.errors.map((item, i) => <li key={`${item.relativePath}-${i}`} style={{ overflowWrap: 'anywhere' }}>{item.relativePath}: {item.message}</li>)}</ul></details>}
       <p className={styles.hint}>Название и авторы берутся из метаданных PDF, если они доступны. Год не выводится из даты создания файла. Тип определяется по папкам и может нуждаться в уточнении. Для сканов без текстового слоя OCR не выполняется.</p>
     </>}
+    </div>}
   </>;
 }

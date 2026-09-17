@@ -8,3 +8,6 @@ out/
 
 # Private local scientific library index
 .local-data/
+
+# Full text, chunks, SQLite database and WAL are private local data
+.local-data/scientific-library/text/
