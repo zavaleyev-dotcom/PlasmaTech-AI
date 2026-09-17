@@ -12,6 +12,6 @@ export function getAnswerProvider(): AnswerProvider {
   return unconfiguredProvider;
 }
 
-export type { AnswerProvider, AnswerProviderInput } from './types';
+export type { AnswerProvider, AnswerProviderInput, AnswerProviderOutput } from './types';
 export { OpenAIAnswerProvider } from './openai';
 export { unconfiguredProvider } from './unconfigured';

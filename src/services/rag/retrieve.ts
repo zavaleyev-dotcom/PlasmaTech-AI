@@ -54,11 +54,17 @@ function toRetrievedChunk(store: TextStore, hit: ContentHit, score: number): Ret
   };
 }
 
+/** store.search() itself throws only if the reconstructed query exceeds 500 chars - our own
+ *  pre-flight limit, not an index failure, so this combination is simply skipped rather than
+ *  surfaced as an error. Any OTHER exception (a genuine SQLite/search failure) is deliberately
+ *  left to propagate out of collect()/retrieveChunks() uncaught: askLibrary() (service.ts)
+ *  catches it there and reports a distinct 'index_error' status, instead of this function
+ *  masking a real index problem as an ordinary "no results" empty array. */
 function collect(store: TextStore, terms: string[], limit: number): RetrievedChunk[] {
   if (!terms.length) return [];
-  let result;
-  try { result = store.search(buildFtsQuery(terms), 0); }
-  catch { return []; } // store.search() only throws for a >500 char query; defensively ignored here.
+  const query = buildFtsQuery(terms);
+  if (query.length > 500) return [];
+  const result = store.search(query, 0);
   // Reciprocal-rank score, same convention as scientific-search/pipeline.ts (1/(60+rank+1)),
   // so scores from independent per-term searches below can be fused by simple addition.
   return result.hits.slice(0, limit).map((hit, rank) => toRetrievedChunk(store, hit, 1 / (60 + rank + 1)));

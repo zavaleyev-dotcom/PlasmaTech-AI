@@ -1,14 +1,32 @@
 import 'server-only';
 import { SYSTEM_PROMPT, buildUserTurn } from '../prompt';
-import type { AnswerProvider, AnswerProviderInput } from './types';
+import type { AnswerProvider, AnswerProviderInput, AnswerProviderOutput } from './types';
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
 }
 
+/** Best-effort parse of the model's own JSON payload ({"answer":...,"citationIds":...}).
+ *  This is NOT a provider-transport failure if it doesn't parse or doesn't match the shape -
+ *  the model simply failed to follow instructions. Falling back to the raw text with no
+ *  citationIds lets validateAnswerGrounding() (citations.ts) reject it the same way it
+ *  rejects any other uncited answer, instead of this adapter inventing its own error path
+ *  for "the model ignored the format". */
+function parseModelOutput(content: string): AnswerProviderOutput {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (parsed && typeof parsed === 'object') {
+      const { answer, citationIds } = parsed as Record<string, unknown>;
+      if (typeof answer === 'string' && Array.isArray(citationIds)) return { answer, citationIds: citationIds as number[] };
+    }
+  } catch { /* not valid JSON - fall through to the uncited fallback below */ }
+  return { answer: content, citationIds: [] };
+}
+
 /** Real, testable OpenAI Chat Completions adapter. Mirrors the DI/timeout/error-handling
  *  style already used by CrossrefProvider/OpenAlexProvider: an injectable fetcher, a fixed
- *  timeout, and structured errors that never leak the API key or raw upstream bodies. */
+ *  timeout, and structured errors that never leak the API key, upstream response bodies,
+ *  or raw parser exceptions to the caller. */
 export class OpenAIAnswerProvider implements AnswerProvider {
   readonly id = 'openai' as const;
 
@@ -23,7 +41,7 @@ export class OpenAIAnswerProvider implements AnswerProvider {
     return !!this.apiKey;
   }
 
-  async generate({ question, context }: AnswerProviderInput): Promise<string> {
+  async generate({ question, context }: AnswerProviderInput): Promise<AnswerProviderOutput> {
     if (!this.apiKey) throw new Error('OPENAI_API_KEY не настроен.');
     let response: Response;
     try {
@@ -33,6 +51,7 @@ export class OpenAIAnswerProvider implements AnswerProvider {
         body: JSON.stringify({
           model: this.model,
           temperature: 0,
+          response_format: { type: 'json_object' },
           messages: [
             { role: 'system', content: SYSTEM_PROMPT },
             { role: 'user', content: buildUserTurn(question, context) },
@@ -42,15 +61,18 @@ export class OpenAIAnswerProvider implements AnswerProvider {
       });
     } catch (error) {
       if (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name)) throw new Error('OpenAI не ответил вовремя.');
+      // Never re-throw the original error: it may embed a URL, host, or other connection detail.
       throw new Error('Не удалось связаться с OpenAI.');
     }
     if (response.status === 401 || response.status === 403) throw new Error('OpenAI отклонил доступ. Проверьте OPENAI_API_KEY.');
     if (response.status === 429) throw new Error('Лимит запросов OpenAI исчерпан. Повторите позже.');
     if (!response.ok) throw new Error('OpenAI не смог обработать запрос.');
-    const body = asRecord(await response.json());
+    let body: Record<string, unknown>;
+    try { body = asRecord(await response.json()); }
+    catch { throw new Error('OpenAI вернул некорректный ответ.'); } // malformed JSON / unexpected content type
     const choices = body.choices;
-    const text = Array.isArray(choices) ? asRecord(asRecord(choices[0]).message).content : undefined;
-    if (typeof text !== 'string' || !text.trim()) throw new Error('Пустой ответ модели.');
-    return text;
+    const content = Array.isArray(choices) ? asRecord(asRecord(choices[0]).message).content : undefined;
+    if (typeof content !== 'string' || !content.trim()) throw new Error('Пустой ответ модели.');
+    return parseModelOutput(content);
   }
 }

@@ -1,9 +1,9 @@
 'use client';
 import { useState } from 'react';
-import type { Citation, RagDiagnostics, RetrievedChunk } from '@/services/rag/types';
+import type { Citation, RagDiagnostics, RagStatus, RetrievedChunk } from '@/services/rag/types';
 import styles from '@/components/scifinder/search.module.css';
 interface AskResponse {
-  question: string; limit: number; chunks: RetrievedChunk[]; citations: Citation[];
+  question: string; limit: number; status: RagStatus; chunks: RetrievedChunk[]; citations: Citation[];
   answer: { text: string; configured: boolean; error: string | null };
   diagnostics?: RagDiagnostics;
 }
@@ -51,14 +51,18 @@ export function AskLibrary() {
     </form>
     {error && <p role="alert" className={`${styles.status} ${styles.error}`}>{error}</p>}
     {result && <div className={styles.results} aria-live="polite">
-      {!result.chunks.length && <p className={styles.status}>В проиндексированной библиотеке недостаточно данных для уверенного ответа.</p>}
+      {(result.status === 'unavailable' || result.status === 'index_error') &&
+        <p role="alert" className={`${styles.status} ${styles.error}`}>{answer?.error}</p>}
+      {result.status !== 'unavailable' && result.status !== 'index_error' && !result.chunks.length &&
+        <p className={styles.status}>В проиндексированной библиотеке недостаточно данных для уверенного ответа.</p>}
       {!!result.chunks.length && answer && <>
-        {!answer.configured && <p className={styles.hint}>
+        {result.status === 'not_configured' && <p className={styles.hint}>
           Генерация ответа не настроена (нет ключа генеративной модели на сервере). Ниже показаны найденные источники и фрагменты -
           проверьте их вручную.
         </p>}
-        {answer.configured && answer.error && <p role="alert" className={`${styles.status} ${styles.error}`}>{answer.error} Ниже показаны найденные источники.</p>}
-        {answer.configured && !answer.error && answer.text && <article className={styles.publication}>
+        {result.status === 'generation_error' && <p role="alert" className={`${styles.status} ${styles.error}`}>{answer.error} Ниже показаны найденные источники.</p>}
+        {result.status === 'insufficient_evidence' && <p className={styles.status}>{answer.text} Ниже показаны найденные фрагменты для проверки.</p>}
+        {result.status === 'answered' && answer.text && <article className={styles.publication}>
           <h3>Ответ</h3>
           {answer.text.split(/\n+/).filter(Boolean).map((line, i) => <p key={i}>{line}</p>)}
         </article>}
@@ -92,6 +96,7 @@ export function AskLibrary() {
             <li>Время retrieval: {result.diagnostics.retrievalMs} мс</li>
             <li>Время generation: {result.diagnostics.generationMs} мс</li>
             <li>FTS score по чанкам: {result.diagnostics.scores.map(s => s.score.toFixed(4)).join(', ')}</li>
+            {result.diagnostics.answerRejectedReason && <li>Ответ отклонён: {result.diagnostics.answerRejectedReason}</li>}
           </ul>
         </details>}
       </>}

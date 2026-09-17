@@ -45,11 +45,28 @@ export interface RagContext {
 }
 
 export interface AnswerResult {
-  /** Empty when not configured, when the provider failed, or when citations could not be verified. */
+  /** Empty when not configured, when generation failed, or when the answer was not grounded. */
   text: string;
   configured: boolean;
   error: string | null;
 }
+
+/** Why a structured provider answer was rejected before ever reaching the user - see
+ *  citations.ts. This is a citation-integrity/evidence-sufficiency verdict, never a claim
+ *  that an *accepted* answer is factually true. */
+export type GroundingRejectionReason = 'malformed-response' | 'malformed-citations' | 'unknown-citation' | 'missing-citations';
+
+/** The overall outcome of one askLibrary() call - lets the API/UI tell apart a technical
+ *  failure (unavailable/index_error) from a legitimate "nothing confident to say"
+ *  (insufficient_evidence) instead of collapsing every failure into the same message. */
+export type RagStatus =
+  | 'answered'               // provider configured, chunks found, answer passed grounding validation
+  | 'insufficient_evidence'  // retrieval ran successfully but found nothing, OR the provider's
+                             // answer failed grounding validation despite chunks being found
+  | 'not_configured'         // chunks found, but no answer provider is configured
+  | 'generation_error'       // chunks found, provider configured, but generate() failed (network/timeout/bad response)
+  | 'unavailable'            // the local text index/config could not even be opened
+  | 'index_error';           // the index opened, but retrieval itself raised an unexpected error
 
 export interface RagDiagnostics {
   chunksFound: number;
@@ -59,11 +76,14 @@ export interface RagDiagnostics {
   contextTruncated: boolean;
   retrievalMs: number;
   generationMs: number;
+  /** Set only when status is 'insufficient_evidence' because a provider answer was rejected. */
+  answerRejectedReason: GroundingRejectionReason | null;
 }
 
 export interface RagResult {
   question: string;
   limit: number;
+  status: RagStatus;
   chunks: RetrievedChunk[];
   citations: Citation[];
   answer: AnswerResult;
@@ -76,9 +96,13 @@ export const DEFAULT_RETRIEVAL_LIMIT = 8;
  *  per term is always enough, so retrieval never needs to page through results. */
 export const MAX_RETRIEVAL_LIMIT = 20;
 export const MAX_QUESTION_LENGTH = 2000;
-/** Upper bound on the assembled prompt block sent to the answer provider. */
+/** Upper bound on the assembled prompt block sent to the answer provider. This is a hard
+ *  cap: buildContext() never returns a block longer than this, regardless of metadata size. */
 export const MAX_CONTEXT_CHARS = 6000;
-/** Upper bound on a single chunk's contribution to the context block. */
+/** Upper bound on a single chunk's CONTENT contribution to the context block. */
 export const MAX_CHUNK_CHARS_IN_CONTEXT = 1600;
+/** Upper bound on each individual untrusted metadata field (title, one author, DOI,
+ *  filename, ...) so oversized/adversarial PDF metadata alone can never dominate the budget. */
+export const MAX_METADATA_FIELD_CHARS = 300;
 
 export class RagValidationError extends Error {}
