@@ -11,7 +11,7 @@ import { POST as askPOST } from '../src/app/api/library/ask/route';
 import { askLibrary } from '../src/services/rag/service';
 import { extractSearchTerms, retrieveChunks } from '../src/services/rag/retrieve';
 import { buildContext } from '../src/services/rag/context';
-import { validateAnswerGrounding } from '../src/services/rag/citations';
+import { validateAnswerGrounding, stripCitationLikeBrackets } from '../src/services/rag/citations';
 import { parseAskInput } from '../src/services/rag/validation';
 import { MAX_CONTEXT_CHARS, RagValidationError, type Citation, type RagContext, type RetrievedChunk } from '../src/services/rag/types';
 import { getAnswerProvider } from '../src/services/rag/providers';
@@ -140,6 +140,88 @@ test('validateAnswerGrounding strips bracket sequences that look like citations 
     assert.deepEqual(result.claims[0].citationIds, [1]); // the structured id is untouched
   }
 });
+
+// ---------- edge case 1: a claim that becomes empty after sanitization must be rejected ----------
+
+test('validateAnswerGrounding rejects a claim whose text is nothing but a citation-like marker, for several such texts', () => {
+  const citations = [fixedCitation(1)];
+  for (const text of ['[999]', '[1]', ' [1] ', '[1][999]', '  [1]  [2]  ', '[1,999]', '[1-999]']) {
+    const result = validateAnswerGrounding({ claims: [{ text, citationIds: [1] }] }, citations);
+    assert.equal(result.valid, false, `claim text "${text}" must be rejected once sanitized down to nothing`);
+    if (!result.valid) assert.equal(result.reason, 'malformed-response');
+  }
+});
+
+test('validateAnswerGrounding rejects a claim that becomes only punctuation/whitespace after sanitization', () => {
+  const citations = [fixedCitation(1)];
+  for (const text of ['[999] - [1]', '...', '   ', '[1] , [2] ; [3]']) {
+    const result = validateAnswerGrounding({ claims: [{ text, citationIds: [1] }] }, citations);
+    assert.equal(result.valid, false, `claim text "${text}" must be rejected as non-substantive`);
+  }
+});
+
+test('a grounded answer is rejected entirely (safe insufficient_evidence fallback) when its only claim is empty after sanitization', () => fixture(async (root, indexFile, store, dbFile) => {
+  await writeFile(path.join(root, 'x.pdf'), 'x');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating hardness result reported for the empty-after-sanitization test.' }] }) });
+  const provider: AnswerProvider = { id: 'fake', configured: () => true, generate: async () => ({ claims: [{ text: '[999]', citationIds: [1] }] }) };
+  const result = await askLibrary({ question: 'coating hardness result empty after sanitization test' }, { openStore: askStoreFor(dbFile), provider });
+  assert.equal(result.status, 'insufficient_evidence');
+  assert.equal(result.answer.claims.length, 0);
+  assert.ok(result.citations.length >= 1, 'the real sources must still be surfaced');
+}));
+
+test('validateAnswerGrounding still accepts a normal claim with real text and valid citationIds', () => {
+  const citations = [fixedCitation(1), fixedCitation(2)];
+  const result = validateAnswerGrounding({ claims: [{ text: 'Coating hardness was measured at 24 GPa.', citationIds: [1, 2] }] }, citations);
+  assert.equal(result.valid, true);
+  if (result.valid) {
+    assert.equal(result.claims[0].text, 'Coating hardness was measured at 24 GPa.');
+    assert.deepEqual(result.claims[0].citationIds, [1, 2]);
+  }
+});
+
+// ---------- edge case 2: range/composite bracket forms must not survive as visual citations ----------
+
+test('stripCitationLikeBrackets removes numeric ranges, lists, and composite/adjacent forms', () => {
+  const cases: [string, string][] = [
+    ['Claim [1-999] end', 'Claim end'],
+    ['Claim [1–999] end', 'Claim end'], // en dash
+    ['Claim [1,999] end', 'Claim end'],
+    ['Claim [1, 999] end', 'Claim end'],
+    ['Claim [1;999] end', 'Claim end'],
+    ['Claim [1][999] end', 'Claim end'],
+    ['Claim [1] [2] [3] end', 'Claim end'],
+  ];
+  for (const [input, expected] of cases) assert.equal(stripCitationLikeBrackets(input), expected, `input: ${input}`);
+});
+
+test('stripCitationLikeBrackets leaves ordinary, non-numeric square brackets in scientific text untouched', () => {
+  for (const text of ['A [Ti] target was used.', 'The [OH] group reacted.', 'See [abc] for details.']) {
+    assert.equal(stripCitationLikeBrackets(text), text, `legitimate bracket usage must survive: ${text}`);
+  }
+});
+
+test('a claim containing a range/composite bracket alongside real text is accepted, with the bracket removed from the displayed text', () => {
+  const citations = [fixedCitation(1)];
+  const result = validateAnswerGrounding({ claims: [{ text: 'Hardness ranged from 20 to 24 GPa [1-999] across samples.', citationIds: [1] }] }, citations);
+  assert.equal(result.valid, true);
+  if (result.valid) {
+    assert.ok(!/\[[\d,;\s–—-]+\]/.test(result.claims[0].text), `a range/list bracket survived: ${result.claims[0].text}`);
+    assert.match(result.claims[0].text, /Hardness ranged from 20 to 24 GPa/);
+  }
+});
+
+test('askLibrary never lets a range/composite bracket in provider prose stand as a visually trusted citation - the UI builds [n] only from citationIds', () => fixture(async (root, indexFile, store, dbFile) => {
+  await writeFile(path.join(root, 'x.pdf'), 'x');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating hardness ranged from 20 to 24 GPa across the tested samples.' }] }) });
+  const provider: AnswerProvider = { id: 'fake', configured: () => true, generate: async () => ({ claims: [{ text: 'Hardness ranged 20-24 GPa [1-999].', citationIds: [1] }] }) };
+  const result = await askLibrary({ question: 'coating hardness ranged tested samples' }, { openStore: askStoreFor(dbFile), provider });
+  assert.equal(result.status, 'answered');
+  assert.equal(result.answer.claims.length, 1);
+  assert.ok(!result.answer.claims[0].text.includes('['), 'the range bracket must not survive in the text handed to the UI');
+  // The only trusted marker the UI would ever render comes from this structured field.
+  assert.deepEqual(result.answer.claims[0].citationIds, [1]);
+}));
 
 // ---------- end-to-end grounding via askLibrary ----------
 
