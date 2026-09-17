@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, realpath, writeFile, rm, symlink, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, writeFile, rm, symlink, readFile, truncate } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import { TextReader } from '../src/services/library-text/extract';
 import { TextStore } from '../src/services/library-text/store';
-import { runTextIndex } from '../src/services/library-text';
+import { runTextIndex, textConfig } from '../src/services/library-text';
 import { chunkPages } from '../src/services/library-text/chunk';
 import { textPdf } from './fixtures/pdf';
 import { GET as pdfGET } from '../src/app/api/library/pdf/route';
@@ -118,3 +119,94 @@ test('text processing leaves existing metadata index byte-for-byte unchanged', (
   await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Content.' }] }) });
   assert.equal(await readFile(indexFile, 'utf8'), metadata);
 }));
+test('PDF larger than 128 MB is recorded as skipped without ever being read or extracted', () => fixture(async (root, indexFile, store) => {
+  const big = path.join(root, 'huge.pdf');
+  await writeFile(big, ''); await truncate(big, 128 * 1024 * 1024 + 1);
+  await writeFile(path.join(root, 'small.pdf'), 'small');
+  let calls = 0;
+  const extract = async () => { calls++; return { pageCount: 1, pages: [{ page: 1, text: 'Coating text.' }] }; };
+  await runTextIndex({ root, indexFile, store, extract });
+  assert.equal(calls, 1, 'extract must only run for the file under the limit');
+  assert.equal(store.stats().documents, 2); assert.equal(store.stats().skipped, 1);
+  const huge = store.records().find(r => r.relativePath === 'huge.pdf')!;
+  const doc = store.db.prepare('SELECT status, error, text FROM documents WHERE id=?').get(huge.id) as { status: string; error: string; text: string };
+  assert.equal(doc.status, 'skipped'); assert.match(doc.error, /128 МБ/); assert.equal(doc.text, '');
+}));
+test('a second text-index run is rejected while one is already in progress, and resumes once it finishes', () => fixture(async (root, indexFile, store) => {
+  await writeFile(path.join(root, 'one.pdf'), 'one');
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  // claim() runs synchronously before the first await inside runTextIndex, so by the time
+  // this call returns a pending promise the "running" state is already committed to SQLite.
+  const first = runTextIndex({ root, indexFile, store, extract: async () => { await gate; return { pageCount: 1, pages: [{ page: 1, text: 'Coating text.' }] }; } });
+  await assert.rejects(
+    runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'x' }] }) }),
+    /уже запущено/,
+  );
+  release();
+  await first;
+  assert.equal(store.progress()!.running, false);
+  assert.equal(store.stats().successful, 1);
+  // Now that the first run finished, a new run must be allowed again.
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating text.' }] }) });
+  assert.equal(store.progress()!.running, false);
+}));
+test('a run resumes after a previous process died leaving a stale running flag with a dead PID', () => fixture(async (root, indexFile, store) => {
+  await writeFile(path.join(root, 'one.pdf'), 'one');
+  const dead = spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid!;
+  store.setProgress({
+    running: true, cancelled: false, stopRequested: false, pid: dead,
+    total: 1, processed: 0, reused: 0, extracted: 0, errors: 0, skipped: 0, chunks: 0,
+    startedAt: new Date().toISOString(), finishedAt: null, error: null,
+  });
+  const overview = store.overview();
+  assert.equal(overview.progress?.running, false);
+  assert.match(overview.progress?.error ?? '', /остановлен/);
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating text.' }] }) });
+  assert.equal(store.stats().successful, 1);
+  assert.equal(store.progress()!.running, false);
+  assert.equal(store.progress()!.error, null);
+}));
+test('repeated replace cycles of the same document keep the FTS index consistent with chunks', () => fixture(async (root, indexFile, store) => {
+  const file = path.join(root, 'one.pdf');
+  for (let i = 0; i < 5; i++) {
+    await writeFile(file, `revision content marker ${i} padding to change file size`);
+    await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: `Plasma coating revision ${i}.` }] }) });
+  }
+  assert.equal(store.stats().documents, 1);
+  // fts5 'integrity-check' throws if the shadow index disagrees with the chunks content table.
+  assert.doesNotThrow(() => store.db.prepare("INSERT INTO content_search(content_search) VALUES('integrity-check')").run());
+  assert.equal(store.search('coating').total, 1);
+  assert.match(store.search('coating').hits[0].snippet, /revision 4/);
+  const orphanChunks = store.db.prepare('SELECT count(*) n FROM chunks WHERE documentId NOT IN (SELECT id FROM documents)').get()!.n as number;
+  assert.equal(orphanChunks, 0);
+}));
+test('PDF endpoint streams partial content and returns 416 for out-of-range or malformed Range requests', async () => {
+  const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'text-range-test-')));
+  const root = path.join(temp, 'pdfs'); await mkdir(root);
+  const cwd = path.join(temp, 'cwd'); await mkdir(cwd);
+  const previousCwd = process.cwd();
+  const previousPath = process.env.SCIENTIFIC_LIBRARY_PATH;
+  process.env.SCIENTIFIC_LIBRARY_PATH = root;
+  process.chdir(cwd);
+  let store: TextStore | undefined;
+  try {
+    await writeFile(path.join(root, 'sample.pdf'), 'sample pdf bytes for a range request test');
+    const config = await textConfig();
+    store = new TextStore(config.databaseFile, config.rootId);
+    await runTextIndex({ root: config.root, indexFile: config.indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating text.' }] }) });
+    const id = store.records()[0].id;
+    const ok = await pdfGET(new Request(`http://localhost/api/library/pdf?id=${id}`, { headers: { host: 'localhost', range: 'bytes=0-4' } }));
+    assert.equal(ok.status, 206);
+    const malformed = await pdfGET(new Request(`http://localhost/api/library/pdf?id=${id}`, { headers: { host: 'localhost', range: 'bytes=abc-def' } }));
+    assert.equal(malformed.status, 416);
+    const outOfRange = await pdfGET(new Request(`http://localhost/api/library/pdf?id=${id}`, { headers: { host: 'localhost', range: 'bytes=999999-999999' } }));
+    assert.equal(outOfRange.status, 416);
+    assert.match(outOfRange.headers.get('content-range') ?? '', /^bytes \*\/\d+$/);
+  } finally {
+    store?.close();
+    process.chdir(previousCwd);
+    if (previousPath === undefined) delete process.env.SCIENTIFIC_LIBRARY_PATH; else process.env.SCIENTIFIC_LIBRARY_PATH = previousPath;
+    await rm(temp, { recursive: true, force: true });
+  }
+});

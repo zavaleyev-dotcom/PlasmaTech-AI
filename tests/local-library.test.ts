@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
-import { mkdtemp, mkdir, writeFile, rm, symlink, utimes, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, symlink, utimes, realpath, truncate } from 'node:fs/promises';
 import { discoverPdfs, libraryRelativePath, readLibraryPdf, safeLibraryFile } from '../src/services/local-library/files';
-import { loadIndex, saveIndex, scanLibrary } from '../src/services/local-library';
+import { libraryConfig, loadIndex, saveIndex, scanLibrary } from '../src/services/local-library';
 import { filterLibrary, inferDocumentType } from '../src/services/local-library/filter';
 import { PdfReader } from '../src/services/local-library/pdf';
 import { GET, POST } from '../src/app/api/library/route';
@@ -109,4 +109,32 @@ test('library search across title, author, DOI, filename; filters and sorting', 
 test('library API rejects remote hosts and cross-origin refreshes', async () => {
   assert.equal((await GET(new Request('http://evil.example/api/library', { headers: { host: 'evil.example' } }))).status, 403);
   assert.equal((await POST(new Request('http://localhost:3000/api/library', { method: 'POST', headers: { host: 'localhost:3000', origin: 'https://evil.example', 'content-type': 'application/json' } }))).status, 403);
+});
+test('PDF larger than 128 MB is not read but stays in the index with an error', () => fixture(async (root, indexFile) => {
+  const big = path.join(root, 'huge.pdf');
+  await writeFile(big, ''); await truncate(big, 128 * 1024 * 1024 + 1);
+  const result = await scanLibrary(root, await loadIndex(root, indexFile));
+  assert.equal(result.records.length, 1);
+  assert.match(result.records[0].error ?? '', /128 МБ/);
+  assert.equal(result.records[0].title, 'huge');
+}));
+test('libraryConfig rejects a missing path, a non-directory path, and an index directory nested inside the library root', async () => {
+  const previous = process.env.SCIENTIFIC_LIBRARY_PATH;
+  try {
+    delete process.env.SCIENTIFIC_LIBRARY_PATH;
+    await assert.rejects(libraryConfig(), /SCIENTIFIC_LIBRARY_PATH/);
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'library-config-test-'));
+    try {
+      const file = path.join(temp, 'not-a-directory');
+      await writeFile(file, 'x');
+      process.env.SCIENTIFIC_LIBRARY_PATH = file;
+      await assert.rejects(libraryConfig(), /каталогом/);
+    } finally { await rm(temp, { recursive: true, force: true }); }
+    // The index directory lives under process.cwd(); pointing the library root at cwd
+    // itself nests the index inside the library it would scan.
+    process.env.SCIENTIFIC_LIBRARY_PATH = await realpath(process.cwd());
+    await assert.rejects(libraryConfig(), /вне исходной библиотеки/);
+  } finally {
+    if (previous === undefined) delete process.env.SCIENTIFIC_LIBRARY_PATH; else process.env.SCIENTIFIC_LIBRARY_PATH = previous;
+  }
 });

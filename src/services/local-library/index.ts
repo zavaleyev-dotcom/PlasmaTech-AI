@@ -76,6 +76,7 @@ export async function saveIndex(indexFile: string, index: LibraryIndex) {
   await writeFile(temp, JSON.stringify(index), { mode: 0o600 });
   await rename(temp, indexFile);
 }
+// In-memory only: guards a single process, not multiple processes on the same library (see docs/architecture.md).
 const state = globalThis as typeof globalThis & { libraryProgress?: IndexProgress };
 export function getProgress(): IndexProgress { return state.libraryProgress ??= { running: false, processed: 0, discovered: 0, error: null }; }
 export async function startIndexing() {

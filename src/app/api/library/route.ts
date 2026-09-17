@@ -1,16 +1,11 @@
 import { NextResponse } from 'next/server';
 import { getProgress, libraryConfig, loadIndex, startIndexing } from '@/services/local-library';
+import { isLocalLibraryRequest } from '@/services/local-library/http';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-function localRequest(request: Request) {
-  const host = request.headers.get('host') ?? '';
-  if (!/^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/.test(host)) return false;
-  const origin = request.headers.get('origin');
-  return (!origin || origin === `http://${host}` || origin === `https://${host}`) && request.headers.get('sec-fetch-site') !== 'cross-site';
-}
 const json = (data: unknown, status = 200) => NextResponse.json(data, { status, headers: { 'Cache-Control': 'no-store' } });
 export async function GET(request: Request) {
-  if (!localRequest(request)) return json({ error: 'Библиотека доступна только локально.' }, 403);
+  if (!isLocalLibraryRequest(request)) return json({ error: 'Библиотека доступна только локально.' }, 403);
   try {
     const { root, indexFile } = await libraryConfig();
     const index = await loadIndex(root, indexFile);
@@ -22,7 +17,7 @@ export async function GET(request: Request) {
   } catch { return json({ error: 'Библиотека недоступна. Проверьте SCIENTIFIC_LIBRARY_PATH в .env.local и доступ к каталогу.' }, 503); }
 }
 export async function POST(request: Request) {
-  if (!localRequest(request) || !request.headers.get('content-type')?.startsWith('application/json')) return json({ error: 'Недопустимый локальный запрос.' }, 403);
+  if (!isLocalLibraryRequest(request) || !request.headers.get('content-type')?.startsWith('application/json')) return json({ error: 'Недопустимый локальный запрос.' }, 403);
   // No path, file name, or directory is accepted from the client.
   try { await startIndexing(); return json({ progress: getProgress() }, 202); }
   catch { return json({ error: 'Не удалось запустить индексирование. Проверьте локальную конфигурацию.' }, 503); }
