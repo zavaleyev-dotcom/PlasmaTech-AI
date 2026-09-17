@@ -167,34 +167,46 @@ test('a run resumes after a previous process died leaving a stale running flag w
   assert.equal(store.progress()!.running, false);
   assert.equal(store.progress()!.error, null);
 }));
-test('repeated replace cycles of the same document keep the FTS index consistent with chunks', () => fixture(async (root, indexFile, store) => {
+test('repeated replace cycles reprocess every iteration and keep the FTS index consistent with chunks', () => fixture(async (root, indexFile, store) => {
   const file = path.join(root, 'one.pdf');
+  // The incremental index only skips reprocessing when BOTH fileSize and modifiedDate match
+  // the prior run (src/services/library-text/index.ts). Giving every revision a strictly
+  // different byte length forces fileSize to always differ, so each iteration is guaranteed
+  // to be reprocessed regardless of filesystem mtime resolution or timing.
   for (let i = 0; i < 5; i++) {
-    await writeFile(file, `revision content marker ${i} padding to change file size`);
+    await writeFile(file, `revision content marker ${i} ${'x'.repeat(i * 8 + 1)}`);
     await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: `Plasma coating revision ${i}.` }] }) });
+    assert.equal(store.progress()!.reused, 0, `iteration ${i} must be reprocessed, not reused`);
+    const current = store.db.prepare('SELECT text FROM documents WHERE relativePath=?').get('one.pdf') as { text: string };
+    assert.match(current.text, new RegExp(`revision ${i}\\.`), `document text must reflect iteration ${i} right after it runs`);
   }
   assert.equal(store.stats().documents, 1);
-  // fts5 'integrity-check' throws if the shadow index disagrees with the chunks content table.
-  assert.doesNotThrow(() => store.db.prepare("INSERT INTO content_search(content_search) VALUES('integrity-check')").run());
-  // store.search() joins content_search to chunks, so a stale FTS posting for an already
-  // deleted rowid would be silently hidden by that join. Compare the raw FTS shadow index
-  // directly against the current chunks table instead, bypassing the app-level join.
-  const chunkRowids = (store.db.prepare('SELECT rowid FROM chunks ORDER BY rowid').all() as { rowid: number }[]).map(r => r.rowid);
-  const ftsRowids = (store.db.prepare('SELECT rowid FROM content_search ORDER BY rowid').all() as { rowid: number }[]).map(r => r.rowid);
-  assert.deepEqual(ftsRowids, chunkRowids, 'every current chunk row, and only current chunk rows, must be present in the raw FTS index');
-  assert.equal(chunkRowids.length, 1);
-  const currentChunk = store.db.prepare('SELECT rowid, text FROM chunks WHERE rowid=?').get(chunkRowids[0]) as { rowid: number; text: string };
-  assert.match(currentChunk.text, /revision 4/);
-  // Direct MATCH against content_search (no join to chunks/documents): the current
-  // revision must resolve to exactly the live chunk rowid, and each superseded revision's
-  // text must be genuinely purged from the raw FTS postings, not merely filtered out later.
+
+  // The plain 'integrity-check' command only verifies that the FTS shadow structures are
+  // internally well-formed; it does NOT compare them against the external content table, so
+  // it cannot prove FTS/chunks consistency. Passing rank=1 additionally re-derives the index
+  // from the CURRENT `chunks` rows and fails if they disagree - this is the documented fts5
+  // mechanism for checking an external-content table against its content table.
+  const integrityCheck = () => store.db.prepare("INSERT INTO content_search(content_search, rank) VALUES('integrity-check', 1)").run();
+  assert.doesNotThrow(integrityCheck, 'FTS index must match current chunks after five replace cycles');
+
+  // Direct MATCH against content_search (no join to chunks/documents): the current revision
+  // must resolve to exactly the live chunk rowid, and each superseded revision's text must be
+  // genuinely purged from the raw FTS postings, not merely filtered out by a later join.
   const rawMatch = (term: string) => (store.db.prepare('SELECT rowid FROM content_search WHERE content_search MATCH ?').all(`"${term}"`) as { rowid: number }[]).map(r => r.rowid);
+  const currentChunk = store.db.prepare('SELECT rowid FROM chunks').get() as { rowid: number };
   assert.deepEqual(rawMatch('revision 4'), [currentChunk.rowid]);
   for (let i = 0; i < 4; i++) assert.deepEqual(rawMatch(`revision ${i}`), [], `stale posting for revision ${i} must not remain in the raw FTS index`);
   assert.equal(store.search('coating').total, 1);
   assert.match(store.search('coating').hits[0].snippet, /revision 4/);
   const orphanChunks = store.db.prepare('SELECT count(*) n FROM chunks WHERE documentId NOT IN (SELECT id FROM documents)').get()!.n as number;
   assert.equal(orphanChunks, 0);
+
+  // Prove the rank=1 check is not vacuous: an artificial posting for a rowid that does not
+  // exist in chunks (a stale/orphaned FTS entry) must make the same check fail. This mirrors
+  // exactly the kind of desync a broken delete trigger would leave behind.
+  store.db.prepare('INSERT INTO content_search(rowid, text) VALUES (?, ?)').run(999_999_999, 'orphaned stale posting');
+  assert.throws(integrityCheck, 'a desynced FTS entry must be detected by integrity-check(rank=1)');
 }));
 test('PDF endpoint streams partial content and returns 416 for out-of-range or malformed Range requests', async () => {
   const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'text-range-test-')));
