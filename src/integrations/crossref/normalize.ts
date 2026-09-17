@@ -45,5 +45,7 @@ export function normalizeCrossrefWork(value: unknown): Publication {
     sources: ['crossref'],
     // A license URL or a journal-article type does not establish OA or peer review.
     openAccess: null,
+    citationCount: null,
+    openAlexId: null,
   };
 }

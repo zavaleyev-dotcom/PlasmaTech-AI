@@ -3,6 +3,9 @@ import { test } from 'node:test';
 import { CrossrefProvider, buildCrossrefUrl } from '../src/integrations/crossref';
 import { normalizeCrossrefWork } from '../src/integrations/crossref/normalize';
 import { OpenAlexProvider } from '../src/integrations/openalex';
+import { normalizeOpenAlexWork, reconstructAbstract } from '../src/integrations/openalex/normalize';
+import { sortPublications } from '../src/services/scientific-search/sort';
+import { ScientificSearchError } from '../src/services/scientific-search/errors';
 import { deduplicatePublications } from '../src/services/scientific-search/deduplicate';
 import { filterPublications } from '../src/services/scientific-search/filters';
 import { normalizeDoi, plainText, safeUrl } from '../src/services/scientific-search/normalization';
@@ -123,25 +126,86 @@ test('pipeline distinguishes source total, fetched records, duplicates and filte
   assert.equal(response.duplicatesRemoved, 1); assert.equal(response.filteredOut, 1); assert.equal(response.returned, 1);
 });
 
-test('OpenAlex stays inactive regardless of key presence', async () => {
-  const previous = process.env.OPENALEX_API_KEY;
-  try {
-    delete process.env.OPENALEX_API_KEY;
-    assert.deepEqual(new OpenAlexProvider().getStatus(), { configured: false, active: false });
-    process.env.OPENALEX_API_KEY = 'test-placeholder-not-a-real-key';
-    assert.deepEqual(new OpenAlexProvider().getStatus(), { configured: true, active: false });
-    await assert.rejects(new OpenAlexProvider().search(query), { code: 'SOURCE_NOT_ACTIVE' });
-  } finally {
-    if (previous === undefined) delete process.env.OPENALEX_API_KEY;
-    else process.env.OPENALEX_API_KEY = previous;
-  }
-});
-
 test('API route validates bodies and returns structured errors without making external requests', async () => {
-  for (const [body, status] of [['{', 400], ['{}', 400], ['x'.repeat(17000), 413], [JSON.stringify({ query: 'PVD', source: 'openalex' }), 503]] as const) {
+  for (const [body, status] of [['{', 400], ['{}', 400], ['x'.repeat(17000), 413], [JSON.stringify({ query: 'PVD', source: 'unknown' }), 400]] as const) {
     const response = await POST(new Request('http://localhost/api/scifinder/search', { method: 'POST', body }));
     assert.equal(response.status, status);
     assert.equal(response.headers.get('cache-control'), 'no-store');
     assert.ok((await response.json()).error.message);
   }
+});
+
+const openAlexFixture = {
+  id: 'https://openalex.org/W123456', doi: 'https://doi.org/10.1234/TIN',
+  title: 'TiN & wear', publication_year: 2022, type: 'article', cited_by_count: 42,
+  authorships: [{ author: { display_name: 'A. Researcher' } }],
+  primary_location: { source: { display_name: 'Surface Engineering', type: 'journal', host_organization: 'https://openalex.org/P123', host_organization_name: 'Publisher' }, landing_page_url: 'https://example.org/article' },
+  open_access: { is_oa: true }, abstract_inverted_index: { Wear: [0, 3], resistance: [1], and: [2] },
+};
+
+test('OpenAlex normalizes original abstracts, OA, citations and source type', () => {
+  const normalized = normalizeOpenAlexWork(openAlexFixture);
+  assert.equal(normalized.abstract, 'Wear resistance and Wear');
+  assert.equal(normalized.citationCount, 42);
+  assert.equal(normalized.openAccess, true);
+  assert.equal(normalized.publisher, 'Publisher');
+  assert.equal(normalized.type, 'journal-article');
+  assert.equal(normalized.openAlexId, 'https://openalex.org/W123456');
+  assert.equal(reconstructAbstract({ text: [0, -1, 900000000] }), 'text');
+  const sparse = normalizeOpenAlexWork({ id: openAlexFixture.id, type: 'article' });
+  assert.equal(sparse.type, 'article'); assert.equal(sparse.citationCount, null); assert.equal(sparse.openAccess, null);
+});
+
+test('OpenAlex supports keyless requests and keeps keys only in server headers', async () => {
+  for (const key of ['', 'unit-test-placeholder']) {
+    const fetcher: typeof fetch = async (url, init) => {
+      assert.equal(new URL(String(url)).origin, 'https://api.openalex.org');
+      assert.ok(!String(url).includes('unit-test-placeholder'));
+      assert.equal(new Headers(init?.headers).get('Authorization'), key ? `Bearer ${key}` : null);
+      return new Response(JSON.stringify({ meta: { count: 1 }, results: [openAlexFixture] }));
+    };
+    const response = await new OpenAlexProvider(fetcher, 20000, key).search({ ...query, source: 'openalex' });
+    assert.equal(response.publications[0].doi, base.doi);
+  }
+  const doi = await new OpenAlexProvider(fakeResponse(200, openAlexFixture), 20000, '').search({ ...query, doi: base.doi! });
+  assert.equal(doi.total, 1);
+  assert.equal((await new OpenAlexProvider(fakeResponse(404, {}), 20000, '').search({ ...query, doi: base.doi! })).total, 0);
+});
+
+test('OpenAlex returns safe errors for authentication, rate limits, malformed responses and timeout', async () => {
+  for (const [status, code] of [[401, 'OPENALEX_AUTH'], [429, 'OPENALEX_RATE_LIMIT'], [500, 'OPENALEX_ERROR'], [200, 'OPENALEX_UNAVAILABLE']] as const) {
+    await assert.rejects(new OpenAlexProvider(fakeResponse(status, {}), 20000, '').search(query), { code });
+  }
+  const fetcher: typeof fetch = async () => { throw new DOMException('timeout', 'TimeoutError'); };
+  await assert.rejects(new OpenAlexProvider(fetcher, 10, '').search(query), { code: 'OPENALEX_TIMEOUT' });
+});
+
+test('combined search merges DOI metadata, preserves source badges and counts duplicates', async () => {
+  const crossref: ScientificSourceProvider = { id: 'crossref', async search() { return { total: 100, publications: [base] }; } };
+  const openalex: ScientificSourceProvider = { id: 'openalex', async search() { return { total: 20, publications: [normalizeOpenAlexWork(openAlexFixture)] }; } };
+  const result = await runSearch({ ...query, source: 'combined', openAccessOnly: true }, [crossref, openalex]);
+  assert.equal(result.returned, 1); assert.equal(result.retrieved, 2); assert.equal(result.duplicatesRemoved, 1);
+  assert.equal(result.uniqueRetrieved, 1); assert.equal(result.publications[0].citationCount, 42);
+  assert.equal(result.publications[0].openAccess, true);
+  assert.deepEqual(result.publications[0].sources, ['crossref', 'openalex']);
+  assert.deepEqual(result.sourceStats.map(stat => stat.total), [100, 20]);
+});
+
+test('combined search preserves successful results on partial failure and reports all failures', async () => {
+  const good: ScientificSourceProvider = { id: 'crossref', async search() { return { total: 1, publications: [base] }; } };
+  const bad: ScientificSourceProvider = { id: 'openalex', async search() { throw new ScientificSearchError('OPENALEX_TIMEOUT', 'OpenAlex timeout', 504, true); } };
+  const result = await runSearch({ ...query, source: 'combined' }, [good, bad]);
+  assert.equal(result.returned, 1); assert.equal(result.warnings.length, 1);
+  assert.equal(result.sourceStats[1].total, null); assert.ok(result.sourceStats[1].error);
+  await assert.rejects(runSearch(query, [bad]), { code: 'OPENALEX_TIMEOUT' });
+});
+
+test('sorting places unavailable values last and OA filter excludes unknown status', () => {
+  const records = [publication({ id: 'unknown', year: null, citationCount: null }), publication({ id: 'older', year: 2020, citationCount: 42, openAccess: true }), publication({ id: 'newer', year: 2024, citationCount: 0, openAccess: false })];
+  assert.deepEqual(sortPublications(records, 'year').map(p => p.id), ['newer', 'older', 'unknown']);
+  assert.deepEqual(sortPublications(records, 'citations').map(p => p.id), ['older', 'newer', 'unknown']);
+  assert.deepEqual(sortPublications(records, 'open-access').map(p => p.id), ['older', 'newer', 'unknown']);
+  assert.deepEqual(filterPublications(records, { ...query, openAccessOnly: true }).map(p => p.id), ['older']);
+  assert.equal(parseSearchQuery({ query: 'PVD', source: 'combined', sort: 'citations' }).source, 'combined');
+  assert.throws(() => parseSearchQuery({ query: 'PVD', sort: 'unsupported' }));
 });

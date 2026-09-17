@@ -39,14 +39,16 @@ export function parseSearchQuery(input: unknown): ScientificSearchQuery {
   const limit = data.limit ?? 10;
   if (limit !== 10 && limit !== 25 && limit !== 50) invalid('Выберите 10, 25 или 50 результатов.');
   const source = data.source ?? 'crossref';
-  if (source !== 'crossref' && source !== 'openalex') invalid('Неизвестный научный источник.');
+  if (source !== 'crossref' && source !== 'openalex' && source !== 'combined') invalid('Неизвестный научный источник.');
+  const sort = data.sort ?? 'relevance';
+  if (sort !== 'relevance' && sort !== 'year' && sort !== 'citations' && sort !== 'open-access') invalid('Неизвестный порядок сортировки.');
   const type = text('type', 40);
   if (type && !publicationTypes.some(item => item === type)) invalid('Неизвестный тип публикации.');
   const journalOnly = flag('journalOnly');
   if (journalOnly && type && type !== 'journal-article') invalid('Фильтр journal article несовместим с выбранным типом публикации.');
   return {
-    query, keywords, doi: doi || '', yearFrom, yearTo, limit, source,
+    query, keywords, doi: doi || '', yearFrom, yearTo, limit, source, sort,
     type: type as ScientificSearchQuery['type'], journalOnly,
-    hasDoi: flag('hasDoi'), hasAbstract: flag('hasAbstract'),
+    hasDoi: flag('hasDoi'), hasAbstract: flag('hasAbstract'), openAccessOnly: flag('openAccessOnly'),
   };
 }

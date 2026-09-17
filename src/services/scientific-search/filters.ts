@@ -6,6 +6,7 @@ export function filterPublications(publications: readonly Publication[], filters
     (!filters.yearFrom || (publication.year !== null && publication.year >= filters.yearFrom)) &&
     (!filters.yearTo || (publication.year !== null && publication.year <= filters.yearTo)) &&
     (!type || publication.type === type) &&
+    (!filters.openAccessOnly || publication.openAccess === true) &&
     (!filters.hasDoi || !!publication.doi) &&
     (!filters.hasAbstract || !!publication.abstract?.trim()),
   );

@@ -21,6 +21,9 @@ function merge(first: Publication, second: Publication): Publication {
     year: preferred.year ?? other.year,
     type: preferred.type || other.type,
     openAccess: preferred.openAccess ?? other.openAccess,
+    citationCount: preferred.citationCount ?? other.citationCount,
+    openAlexId: preferred.openAlexId ?? other.openAlexId,
+    relevanceScore: (first.relevanceScore ?? 0) + (second.relevanceScore ?? 0),
     sources: [...new Set([...first.sources, ...second.sources])],
   };
 }

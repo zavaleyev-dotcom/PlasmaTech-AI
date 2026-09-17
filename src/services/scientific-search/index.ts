@@ -11,5 +11,5 @@ const providers = {
 
 export async function searchPublications(input: unknown) {
   const query = parseSearchQuery(input);
-  return runSearch(query, providers[query.source]);
+  return runSearch(query, query.source === 'combined' ? [providers.crossref, providers.openalex] : providers[query.source]);
 }

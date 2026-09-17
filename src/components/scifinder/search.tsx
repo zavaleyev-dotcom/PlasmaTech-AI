@@ -19,6 +19,9 @@ export function SciFinderSearch() {
   const [yearFrom, setYearFrom] = useState('');
   const [yearTo, setYearTo] = useState('');
   const [limit, setLimit] = useState<10 | 25 | 50>(10);
+  const [source, setSource] = useState<ScientificSearchQuery['source']>('crossref');
+  const [sort, setSort] = useState<ScientificSearchQuery['sort']>('relevance');
+  const [openAccessOnly, setOpenAccessOnly] = useState(false);
   const [type, setType] = useState<ScientificSearchQuery['type']>('');
   const [journalOnly, setJournalOnly] = useState(false);
   const [hasDoi, setHasDoi] = useState(false);
@@ -67,11 +70,12 @@ export function SciFinderSearch() {
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (yearFrom && yearTo && Number(yearFrom) > Number(yearTo)) {
+      setResult(null);
       setError({ code: 'INVALID_QUERY', message: 'Год «от» не может быть больше года «до».', retryable: false });
       return;
     }
     void search({
-      query, keywords, doi, limit, source: 'crossref', type, journalOnly, hasDoi, hasAbstract,
+      query, keywords, doi, limit, source, sort, openAccessOnly, type, journalOnly, hasDoi, hasAbstract,
       yearFrom: yearFrom ? Number(yearFrom) : undefined,
       yearTo: yearTo ? Number(yearTo) : undefined,
     });
@@ -80,12 +84,12 @@ export function SciFinderSearch() {
   function example() {
     setQuery('AlTiSiN coating cutting tools'); setKeywords(''); setDoi('');
     setYearFrom(''); setYearTo(''); setType(''); setJournalOnly(false);
-    setHasDoi(false); setHasAbstract(false); setLimit(10); setError(null); setResult(null);
+    setOpenAccessOnly(false); setSort('relevance'); setHasDoi(false); setHasAbstract(false); setLimit(10); setError(null); setResult(null);
   }
 
   return (
     <>
-      <div className="notice"><Icon name="search" /><span>Реальный библиографический поиск в Crossref. Отображаются метаданные источника без AI-аннотаций и выводов.</span></div>
+      <div className="notice"><Icon name="search" /><span>Реальный библиографический поиск в Crossref и OpenAlex. Отображаются метаданные источника без AI-аннотаций и выводов.</span></div>
       <section className="content-card" aria-label="Поиск научных публикаций">
         <form onSubmit={submit}>
           <fieldset disabled={busy} className={styles.form}>
@@ -110,19 +114,25 @@ export function SciFinderSearch() {
               <select className={styles.control} value={limit} onChange={event => setLimit(Number(event.target.value) as 10 | 25 | 50)}>{[10, 25, 50].map(value => <option key={value} value={value}>{value}</option>)}</select>
             </label>
             <label className={styles.field}>Источник
-              <select className={styles.control} defaultValue="crossref"><option value="crossref">Crossref</option><option value="openalex" disabled>OpenAlex — подготовлен, не активирован</option></select>
+              <select className={styles.control} value={source} onChange={event => setSource(event.target.value as ScientificSearchQuery['source'])}><option value="crossref">Crossref</option><option value="openalex">OpenAlex</option><option value="combined">Crossref + OpenAlex</option></select>
             </label>
             <label className={`${styles.field} ${styles.full}`}>Тип публикации
               <select className={styles.control} value={journalOnly ? 'journal-article' : type} disabled={journalOnly || busy} onChange={event => setType(event.target.value as ScientificSearchQuery['type'])}>
                 <option value="">Все типы</option>{publicationTypes.map(value => <option value={value} key={value}>{typeLabels[value]} · {value}</option>)}
               </select>
             </label>
+            <label className={styles.field}>Сортировка загруженных результатов
+              <select className={styles.control} value={sort} onChange={event => setSort(event.target.value as ScientificSearchQuery['sort'])}>
+                <option value="relevance">По релевантности</option><option value="year">По году: сначала новые</option><option value="citations">По числу цитирований</option><option value="open-access">Сначала Open Access</option>
+              </select>
+            </label>
             <div className={`${styles.checks} ${styles.full}`}>
+              <label><input type="checkbox" checked={openAccessOnly} onChange={event => setOpenAccessOnly(event.target.checked)} />Только Open Access</label>
               <label><input type="checkbox" checked={journalOnly} onChange={event => { setJournalOnly(event.target.checked); setType(''); }} />Только journal article</label>
               <label><input type="checkbox" checked={hasDoi} onChange={event => setHasDoi(event.target.checked)} />Наличие DOI</label>
               <label><input type="checkbox" checked={hasAbstract} onChange={event => setHasAbstract(event.target.checked)} />Наличие abstract</label>
             </div>
-            <p className={`${styles.hint} ${styles.full}`}>Тип journal-article не подтверждает рецензирование. Abstract может отсутствовать в метаданных. Фильтры применяются после нажатия «Найти публикации».</p>
+            <p className={`${styles.hint} ${styles.full}`}>Тип journal-article не подтверждает рецензирование. Abstract может отсутствовать в метаданных. Фильтры и сортировка применяются после нажатия «Найти публикации».</p>
             <div className={`${styles.actions} ${styles.full}`}>
               <button className="button primary" disabled={busy || !(query.trim() || keywords.trim() || doi.trim())}>
                 <Icon name="search" size={18} />{busy ? 'Поиск…' : 'Найти публикации'}
@@ -135,9 +145,15 @@ export function SciFinderSearch() {
       <section className={styles.results} aria-label="Результаты поиска" aria-busy={busy}>
         <div className={styles.resultsHeader}><h2>Публикации</h2>{result && <span className="muted small">Показано: {result.returned}</span>}</div>
         <div role="status" aria-live="polite">
-          {busy && <div className={`${styles.status} ${styles.actions}`}><span className={styles.spinner}><Icon name="atom" /></span>Поиск публикаций в Crossref…</div>}
-          {result && <p className={styles.hint}>Совпадений в Crossref: {result.total.toLocaleString('ru-RU')}. Загружено: {result.retrieved}; удалено дублей: {result.duplicatesRemoved}; исключено фильтрами: {result.filteredOut}; показано: {result.returned}.<br />Запрос: {result.query.doi || [result.query.query, result.query.keywords].filter(Boolean).join(' ')}. Это первая выборка до {result.query.limit} записей; общее число не означает точное тематическое соответствие каждой публикации.</p>}
+          {busy && <div className={`${styles.status} ${styles.actions}`}><span className={styles.spinner}><Icon name="atom" /></span>Поиск публикаций в выбранных источниках…</div>}
+          {result && <div className={styles.hint}>
+            {result.sourceStats.map(stat => <p key={stat.source}>{stat.source === 'crossref' ? 'Crossref' : 'OpenAlex'}: {stat.error ? 'недоступен' : `совпадений ${stat.total?.toLocaleString('ru-RU')}, загружено ${stat.retrieved}`}.</p>)}
+            <p>Загружено всего: {result.retrieved}; удалено дублей: {result.duplicatesRemoved}; уникальных: {result.uniqueRetrieved}; исключено фильтрами: {result.filteredOut}; показано: {result.returned}.</p>
+            <p>Запрос: {result.query.doi || [result.query.query, result.query.keywords].filter(Boolean).join(' ')}. Загружается до {result.query.limit} записей из каждого источника. Счётчики источников пересекаются и не равны числу уникальных публикаций.</p>
+            <p>Сортировка действует на загруженную выборку. Совместная релевантность объединяет позиции в выдачах источников; неизвестные годы и цитирования идут в конце. Статус OA известен только из метаданных OpenAlex.</p>
+          </div>}
         </div>
+        {result && result.warnings.length > 0 && <div className="notice" role="status"><div>{result.warnings.map(warning => <p key={warning}>{warning}</p>)}<button className="button secondary mt-4" disabled={busy} onClick={() => lastRequest.current && void search(lastRequest.current)}>Повторить запрос</button></div></div>}
         {error && <div className={`${styles.status} ${styles.error}`} role="alert"><p>{error.message}</p>{error.retryable && <button className="button secondary mt-4" disabled={busy} onClick={() => lastRequest.current && void search(lastRequest.current)}>Повторить запрос</button>}</div>}
         {!busy && !error && !result && <p className={styles.status}>Введите тему, ключевые слова или DOI и нажмите «Найти публикации».</p>}
         {result && result.returned === 0 && <p className={`${styles.status} mt-4`}>Ничего не найдено. Уточните запрос, проверьте DOI или ослабьте фильтры.</p>}

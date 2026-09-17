@@ -15,6 +15,10 @@ export interface Publication {
   source: PublicationSource;
   sources: PublicationSource[];
   openAccess: boolean | null;
+  citationCount: number | null;
+  openAlexId: string | null;
+  /** Reciprocal source-rank score, calculated only by the search pipeline. */
+  relevanceScore?: number;
 }
 
 export const publicationTypes = [
@@ -30,6 +34,7 @@ export interface PublicationFilters {
   journalOnly: boolean;
   hasDoi: boolean;
   hasAbstract: boolean;
+  openAccessOnly: boolean;
 }
 
 export interface ScientificSearchQuery extends PublicationFilters {
@@ -37,7 +42,8 @@ export interface ScientificSearchQuery extends PublicationFilters {
   keywords: string;
   doi: string;
   limit: 10 | 25 | 50;
-  source: 'crossref' | 'openalex';
+  source: 'crossref' | 'openalex' | 'combined';
+  sort: 'relevance' | 'year' | 'citations' | 'open-access';
 }
 
 export interface SourceSearchResult {
@@ -58,6 +64,9 @@ export interface ScientificSearchResult extends SourceSearchResult {
   filteredOut: number;
   returned: number;
   query: ScientificSearchQuery;
+  sourceStats: { source: PublicationSource; total: number | null; retrieved: number; error?: string }[];
+  warnings: string[];
+  uniqueRetrieved: number;
 }
 
 export interface SearchErrorBody {

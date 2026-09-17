@@ -6,12 +6,14 @@ export function PublicationCard({ publication, index }: { publication: Publicati
   const fields = [
     ['Год', publication.year], ['Журнал / источник', publication.journal],
     ['Тип публикации', publication.type], ['Издатель', publication.publisher],
+    ['Цитирований (OpenAlex)', publication.citationCount],
+    ['Open Access', publication.openAccess === null ? null : publication.openAccess ? 'Да' : 'Нет'],
   ];
   return (
     <article className={styles.publication}>
       <div className={styles.meta}>
         <span>{String(index + 1).padStart(2, '0')}</span>
-        <span className="mode-badge">{publication.source === 'crossref' ? 'Crossref' : publication.source === 'openalex' ? 'OpenAlex' : publication.source}</span>
+        <span className="mode-badge">{publication.sources.map(source => source === 'crossref' ? 'Crossref' : source === 'openalex' ? 'OpenAlex' : source).join(' + ')}</span>
       </div>
       <h3>{publication.title}</h3>
       {publication.authors.length > 0 && <p className={styles.authors}>{publication.authors.join(', ')}</p>}
@@ -20,6 +22,7 @@ export function PublicationCard({ publication, index }: { publication: Publicati
           <dt>{label}</dt><dd>{value}</dd>
         </div>)}
         {publication.doi && <div><dt>DOI</dt><dd><a className={styles.link} href={doiUrl(publication.doi)} target="_blank" rel="noopener noreferrer">{publication.doi}</a></dd></div>}
+        {publication.openAlexId && <div><dt>OpenAlex ID</dt><dd><a className={styles.link} href={publication.openAlexId} target="_blank" rel="noopener noreferrer">{publication.openAlexId}</a></dd></div>}
         {publication.url && <div><dt>URL</dt><dd><a className={styles.link} href={publication.url} target="_blank" rel="noopener noreferrer">{publication.url}</a></dd></div>}
       </dl>
       {publication.abstract && <div className={styles.abstract}>
