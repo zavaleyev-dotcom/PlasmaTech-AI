@@ -18,6 +18,9 @@ import { getAnswerProvider } from '../src/services/rag/providers';
 import { unconfiguredProvider } from '../src/services/rag/providers/unconfigured';
 import { OpenAIAnswerProvider } from '../src/services/rag/providers/openai';
 import type { AnswerProvider } from '../src/services/rag/providers/types';
+import { EmbeddingStore } from '../src/services/embeddings/store';
+import { runEmbeddingIndex } from '../src/services/embeddings';
+import { DeterministicEmbeddingProvider } from '../src/services/embeddings/providers/deterministic';
 
 async function fixture(fn: (root: string, indexFile: string, store: TextStore, dbFile: string) => Promise<void>) {
   const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'rag-test-')));
@@ -553,6 +556,15 @@ test('parseAskInput rejects empty/too long questions and out-of-range limits', (
   const parsed = parseAskInput({ question: '  ok  ' });
   assert.equal(parsed.question, 'ok');
   assert.equal(parsed.limit, 8);
+  assert.equal(parsed.mode, 'hybrid', 'the default retrieval mode must be hybrid');
+});
+
+test('parseAskInput accepts the three retrieval modes and rejects anything else', () => {
+  assert.equal(parseAskInput({ question: 'ok', mode: 'lexical' }).mode, 'lexical');
+  assert.equal(parseAskInput({ question: 'ok', mode: 'semantic' }).mode, 'semantic');
+  assert.equal(parseAskInput({ question: 'ok', mode: 'hybrid' }).mode, 'hybrid');
+  assert.throws(() => parseAskInput({ question: 'ok', mode: 'vector' }), RagValidationError);
+  assert.throws(() => parseAskInput({ question: 'ok', mode: 123 }), RagValidationError);
 });
 
 test('ask API route rejects remote hosts, missing content-type, and oversized bodies', async () => {
@@ -599,3 +611,40 @@ test('opening a PDF from a citation returns the real file bytes end-to-end, and 
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+// ---------- RAG guarantees remain intact when retrieval goes through the hybrid (embeddings) path ----------
+
+test('citations, grounding, and context budget all remain intact when retrieval goes through the hybrid (FTS + semantic) path', () => fixture(async (root, indexFile, store, dbFile) => {
+  const text = 'Titanium nitride coating hardness was measured at 24 GPa for the hybrid RAG guarantee test.';
+  await writeFile(path.join(root, 'x.pdf'), 'x');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text }] }) });
+  const embeddingProvider = new DeterministicEmbeddingProvider({ dimension: 8 });
+  const temp = path.dirname(root);
+  const embeddingDbFile = path.join(temp, 'embeddings', 'index.sqlite');
+  const indexingStore = new EmbeddingStore(embeddingDbFile, 'test');
+  await runEmbeddingIndex({ textStore: store, embeddingStore: indexingStore, provider: embeddingProvider });
+  indexingStore.close();
+  const openEmbeddingStore = async () => new EmbeddingStore(embeddingDbFile, 'test');
+
+  const provider: AnswerProvider = { id: 'fake', configured: () => true, generate: async () => ({ claims: [{ text: 'Твёрдость покрытия составила 24 ГПа.', citationIds: [1] }] }) };
+  const result = await askLibrary(
+    { question: 'titanium nitride coating hardness hybrid guarantee test', mode: 'hybrid' },
+    { openStore: askStoreFor(dbFile), provider, embeddingProvider, openEmbeddingStore },
+  );
+  assert.equal(result.mode, 'hybrid');
+  assert.equal(result.status, 'answered');
+  assert.equal(result.answer.claims.length, 1);
+  assert.deepEqual(result.answer.claims[0].citationIds, [1]);
+  assert.ok(result.citations.length >= 1);
+  const context = buildContext(result.chunks);
+  assert.ok(context.block.length <= MAX_CONTEXT_CHARS, 'the hard context budget must still apply to hybrid-retrieved chunks');
+
+  // No unknown citations survive the hybrid path either.
+  const badProvider: AnswerProvider = { id: 'fake2', configured: () => true, generate: async () => ({ claims: [{ text: 'Неверная ссылка.', citationIds: [999] }] }) };
+  const badResult = await askLibrary(
+    { question: 'titanium nitride coating hardness hybrid guarantee test', mode: 'hybrid' },
+    { openStore: askStoreFor(dbFile), provider: badProvider, embeddingProvider, openEmbeddingStore },
+  );
+  assert.equal(badResult.status, 'insufficient_evidence');
+  assert.equal(badResult.answer.claims.length, 0);
+}));

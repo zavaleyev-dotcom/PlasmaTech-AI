@@ -1,12 +1,15 @@
 import 'server-only';
 import { openTextStore } from '@/services/library-text';
 import type { TextStore } from '@/services/library-text/store';
+import { computeEmbeddingOverview, getEmbeddingProvider, openEmbeddingStore } from '@/services/embeddings';
+import type { EmbeddingOverview, EmbeddingProvider } from '@/services/embeddings/types';
+import type { EmbeddingStore } from '@/services/embeddings/store';
 import { buildContext } from './context';
 import { validateAnswerGrounding } from './citations';
 import { getAnswerProvider } from './providers';
 import type { AnswerProvider } from './providers/types';
-import { retrieveChunks } from './retrieve';
-import type { AnswerResult, GroundingRejectionReason, RagContext, RagDiagnostics, RagResult, RagStatus, RetrievedChunk } from './types';
+import { hybridRetrieve } from './hybrid';
+import type { AnswerResult, FusedChunk, GroundingRejectionReason, RagContext, RagDiagnostics, RagResult, RagStatus, RetrievalDiagnostics, RetrievalMode, RetrievedChunk } from './types';
 import { parseAskInput } from './validation';
 
 export interface AskLibraryOptions {
@@ -19,6 +22,13 @@ export interface AskLibraryOptions {
   /** Injected for tests, e.g. to force a tiny context budget end-to-end; defaults to the
    *  real buildContext() with its default size limits. */
   buildContext?: typeof buildContext;
+  /** Injected for tests. `undefined` means "use the real getEmbeddingProvider() auto-
+   *  detection"; explicit `null` forces "no embedding provider configured" even if one
+   *  would otherwise be auto-detected. */
+  embeddingProvider?: EmbeddingProvider | null;
+  /** Injected for tests; defaults to the real on-disk store via openEmbeddingStore(). Only
+   *  ever called when an embeddingProvider is configured. */
+  openEmbeddingStore?: () => Promise<EmbeddingStore>;
 }
 
 /** Fixed, generic message for every answer-provider failure. Deliberately never built from
@@ -37,8 +47,8 @@ function emptyAnswer(configured: boolean, error: string | null): AnswerResult {
   return { claims: [], configured, error };
 }
 
-function baseResult(question: string, limit: number, status: RagStatus, answer: AnswerResult): RagResult {
-  return { question, limit, status, chunks: [], citations: [], answer };
+function baseResult(question: string, limit: number, mode: RetrievalMode, status: RagStatus, answer: AnswerResult): RagResult {
+  return { question, limit, mode, status, chunks: [], citations: [], answer };
 }
 
 function withDiagnostics(result: RagResult, diagnostics: RagDiagnostics, options: AskLibraryOptions): RagResult {
@@ -46,14 +56,14 @@ function withDiagnostics(result: RagResult, diagnostics: RagDiagnostics, options
   return include ? { ...result, diagnostics } : result;
 }
 
-function baseDiagnostics(chunks: readonly RetrievedChunk[], context: RagContext | null, retrievalMs: number, generationMs: number, answerRejectedReason: GroundingRejectionReason | null): RagDiagnostics {
+function baseDiagnostics(chunks: readonly RetrievedChunk[], context: RagContext | null, retrieval: RetrievalDiagnostics, generationMs: number, answerRejectedReason: GroundingRejectionReason | null): RagDiagnostics {
   return {
     chunksFound: chunks.length,
     documentsUsed: [...new Set(chunks.map(c => c.documentId))],
     scores: chunks.map(c => ({ chunkId: c.chunkId, score: c.score })),
     contextChars: context?.block.length ?? 0,
     contextTruncated: context?.truncated ?? false,
-    retrievalMs, generationMs, answerRejectedReason,
+    retrievalMs: retrieval.totalMs, generationMs, answerRejectedReason, retrieval,
   };
 }
 
@@ -83,28 +93,53 @@ async function generateAnswer(question: string, context: RagContext, provider: A
   return { answer: { claims: grounding.claims, configured: true, error: null }, status: 'answered', rejectedReason: null };
 }
 
-/** Retrieval -> context -> generation, kept as separate steps (retrieveChunks / buildContext
- *  / generateAnswer) so a future embeddings-based retrieval provider can replace only the
- *  first step without touching context building, prompting, citation validation or the
- *  answer-provider abstraction. */
+/** Opens the embedding provider/store, if configured, without ever letting a failure here
+ *  propagate: hybridRetrieve() treats a null provider/store as "semantic unavailable" and
+ *  degrades to lexical-only, with the reason recorded in diagnostics - the same safe-
+ *  degradation contract as every other optional piece of this pipeline. */
+async function openEmbeddingContext(options: AskLibraryOptions, textStore: TextStore): Promise<{ provider: EmbeddingProvider | null; store: EmbeddingStore | null; overview: EmbeddingOverview | null }> {
+  const provider = options.embeddingProvider !== undefined ? options.embeddingProvider : getEmbeddingProvider();
+  if (!provider) return { provider: null, store: null, overview: null };
+  try {
+    const open = options.openEmbeddingStore ?? openEmbeddingStore;
+    const store = await open();
+    const overview = computeEmbeddingOverview(store, provider, textStore.chunkCount());
+    return { provider, store, overview };
+  } catch (error) {
+    console.error('[rag] failed to open embedding store', error);
+    return { provider, store: null, overview: null };
+  }
+}
+
+/** Retrieval (hybridRetrieve: lexical FTS5 and/or semantic vector search, rank-fused) ->
+ *  context -> generation, kept as separate steps so the retrieval layer can evolve (e.g.
+ *  adding embeddings, as it now has) without touching context building, prompting,
+ *  citation validation or the answer-provider abstraction. */
 export async function askLibrary(input: unknown, options: AskLibraryOptions = {}): Promise<RagResult> {
-  const { question, limit } = parseAskInput(input);
+  const { question, limit, mode: requestedMode } = parseAskInput(input);
   const openStore = options.openStore ?? openTextStore;
   let store: TextStore;
   try { store = await openStore(); }
-  catch { return baseResult(question, limit, 'unavailable', emptyAnswer(false, UNAVAILABLE_MESSAGE)); }
+  catch { return baseResult(question, limit, requestedMode, 'unavailable', emptyAnswer(false, UNAVAILABLE_MESSAGE)); }
+  let embeddingStore: EmbeddingStore | null = null;
   try {
-    let chunks: RetrievedChunk[];
-    const retrievalStart = Date.now();
-    try { chunks = retrieveChunks(store, question, limit); }
-    catch (error) {
+    const embedding = await openEmbeddingContext(options, store);
+    embeddingStore = embedding.store;
+    let chunks: FusedChunk[];
+    let retrieval: RetrievalDiagnostics;
+    try {
+      const result = await hybridRetrieve({
+        textStore: store, mode: requestedMode, question, limit,
+        embeddingProvider: embedding.provider, embeddingStore: embedding.store, embeddingOverview: embedding.overview,
+      });
+      chunks = result.chunks; retrieval = result.diagnostics;
+    } catch (error) {
       console.error('[rag] retrieval failed', error);
-      return baseResult(question, limit, 'index_error', emptyAnswer(false, INDEX_ERROR_MESSAGE));
+      return baseResult(question, limit, requestedMode, 'index_error', emptyAnswer(false, INDEX_ERROR_MESSAGE));
     }
-    const retrievalMs = Date.now() - retrievalStart;
     if (!chunks.length) {
-      const result: RagResult = { question, limit, status: 'insufficient_evidence', chunks: [], citations: [], answer: emptyAnswer(true, null) };
-      return withDiagnostics(result, baseDiagnostics([], null, retrievalMs, 0, null), options);
+      const result: RagResult = { question, limit, mode: retrieval.mode, status: 'insufficient_evidence', chunks: [], citations: [], answer: emptyAnswer(true, null) };
+      return withDiagnostics(result, baseDiagnostics([], null, retrieval, 0, null), options);
     }
     const build = options.buildContext ?? buildContext;
     const context = build(chunks);
@@ -112,14 +147,14 @@ export async function askLibrary(input: unknown, options: AskLibraryOptions = {}
       // Budget enforcement (context.ts) left no source with any surviving evidence text -
       // there is nothing a provider could possibly ground an answer in, so this is reported
       // (and short-circuited) the same way as an empty retrieval, without spending a call.
-      const result: RagResult = { question, limit, status: 'insufficient_evidence', chunks, citations: [], answer: emptyAnswer(true, null) };
-      return withDiagnostics(result, baseDiagnostics(chunks, context, retrievalMs, 0, null), options);
+      const result: RagResult = { question, limit, mode: retrieval.mode, status: 'insufficient_evidence', chunks, citations: [], answer: emptyAnswer(true, null) };
+      return withDiagnostics(result, baseDiagnostics(chunks, context, retrieval, 0, null), options);
     }
     const provider = options.provider ?? getAnswerProvider();
     const generationStart = Date.now();
     const { answer, status, rejectedReason } = await generateAnswer(question, context, provider);
     const generationMs = Date.now() - generationStart;
-    const result: RagResult = { question, limit, status, chunks, citations: context.citations, answer };
-    return withDiagnostics(result, baseDiagnostics(chunks, context, retrievalMs, generationMs, rejectedReason), options);
-  } finally { store.close(); }
+    const result: RagResult = { question, limit, mode: retrieval.mode, status, chunks, citations: context.citations, answer };
+    return withDiagnostics(result, baseDiagnostics(chunks, context, retrieval, generationMs, rejectedReason), options);
+  } finally { store.close(); embeddingStore?.close(); }
 }

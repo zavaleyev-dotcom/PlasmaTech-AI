@@ -392,10 +392,145 @@ retrieval и generation.
 PDF по id из цитаты через существующий защищённый эндпоинт и отклонение
 подделанного id, валидация входа и защита API-роута.
 
-### Следующий этап (semantic embeddings)
+### Следующий этап (реализован ниже)
 
-Не реализовано намеренно: векторный индекс, embedding-провайдер, семантический
-(не только лексический) retrieval, гибридный ranking (FTS5 + векторное сходство),
+Векторный индекс, embedding-провайдер, семантический retrieval и гибридный
+FTS5+vector ranking реализованы — см. «Этап 4» ниже. Не реализовано намеренно:
 Anthropic/локальный answer-provider (тривиально добавляются той же реализацией
-`AnswerProvider`), настраиваемый через UI выбор источника генерации, персистентность
-истории вопросов/ответов.
+`AnswerProvider`), персистентность истории вопросов/ответов, полный embedding
+build всей библиотеки, OCR, reranker LLM, knowledge graph.
+
+
+## Этап 4: semantic embeddings и hybrid retrieval (FTS5 + vectors)
+
+Новый, полностью отдельный модуль `src/services/embeddings` — свой SQLite-файл
+(`.local-data/scientific-library/embeddings/index.sqlite`, уже покрыт общим
+правилом `.local-data/` в `.gitignore`), своя схема, независимая от FTS5-индекса
+`library-text`. Модуль только ЧИТАЕТ таблицу `chunks` существующего текстового
+индекса (через уже публичное поле `store.db`, как и `rag/hydrate.ts`); ни схема,
+ни код `library-text` не менялись.
+
+### EmbeddingProvider
+
+```ts
+interface EmbeddingProvider {
+  readonly id: string; readonly model: string; readonly dimension: number;
+  configured(): boolean;
+  embedDocuments(texts: readonly string[]): Promise<Float32Array[]>;
+  embedQuery(text: string): Promise<Float32Array>;
+  readonly outboundDataDescription: string; // что покидает машину при использовании
+}
+```
+
+Реализации: `DeterministicEmbeddingProvider` (без сети и ключей, воспроизводимые
+unit-векторы через SHA-256; поддерживает `failOn`/`emptyVectorOn`/
+`wrongDimensionOn` для тестов сбоев) и `OpenAIEmbeddingProvider` (`/v1/embeddings`,
+DI `fetch`, тайм-аут, строгая проверка `Content-Type: application/json`,
+нормализованные ошибки — по образцу `OpenAIAnswerProvider`).
+
+`getEmbeddingProvider()` возвращает провайдер **только** если явно задан
+`EMBEDDING_PROVIDER=openai` — наличия `OPENAI_API_KEY` (уже используемого RAG
+answer-provider'ом) для этого недостаточно: это осознанное разделение, потому что
+эмбеддинг всей библиотеки — принципиально другой по объёму отправляемых данных
+сценарий, чем небольшой контекст одного вопроса. Полный embedding build не
+запускается автоматически ни при каких условиях в этой версии — только через
+`scripts/index-embeddings.ts`, и только с `--sample <n>` (без `--all`; жёсткий
+потолок `MAX_SAMPLE_SIZE=300` применяется даже к ошибочно большому числу).
+
+### Хранилище эмбеддингов
+
+Таблица `embeddings`: `chunkId` (PK), `documentId`, `contentHash` (SHA-256 текста
+чанка, считается этим модулем самостоятельно — не полагается на то, что `chunkId`
+у `library-text` сам является хэшем содержимого), `providerId`, `model`,
+`dimension`, `vector` (BLOB, `Float32Array`), `createdAt`/`updatedAt`. Эмбеддинг
+считается актуальным только при совпадении ВСЕХ четырёх: `contentHash`,
+`providerId`, `model`, `dimension` — смена модели или провайдера никогда не
+позволяет молча использовать старый вектор.
+
+### Incremental indexing (`runEmbeddingIndex`)
+
+Курсор по `rowid` в `chunks` (`WHERE rowid > ? ORDER BY rowid LIMIT ?`) —
+библиотека никогда не грузится в память целиком. Прогресс (`running`/`pid`/
+`stopRequested`, счётчики `processed`/`reused`/`embedded`/`failed`/`skipped`)
+хранится в той же БД по образцу `TextStore.claim()`/`progress()` — resume после
+прерывания и защита от двух одновременных прогонов работают идентично этапу 2.
+Отказ одного батча у провайдера считается `failed` только для его чанков и не
+прерывает прогон. Orphan cleanup (удаление эмбеддингов для исчезнувших чанков)
+выполняется только после полного (не sample) прогона — как и у `runTextIndex`.
+
+`computeEmbeddingOverview()` сводит состояние хранилища и провайдера в статус:
+`not_configured | empty | partial | ready | stale | rebuilding | error`.
+
+### Semantic retrieval и векторный поиск
+
+**Решение по технологии векторного поиска: чистый JS, без native-зависимостей.**
+Никакого native extension SQLite (sqlite-vec/sqlite-vss), никакой отдельной БД
+или сервера. `src/services/embeddings/search.ts` — brute-force cosine similarity
+по всем векторам текущего provider/model/dimension, загруженным в память для
+одного запроса. Причина: единственный способ работать идентично на Mac Intel и
+на Windows без компиляции нативного модуля и без внешней инфраструктуры;
+стоимость — O(n) по времени и памяти на запрос — измерена бенчмарком на реальной
+выборке (см. ниже), а не предполагается для всех 54 958 чанков.
+
+### HybridRetriever (`src/services/rag/hybrid.ts`)
+
+Три режима: `lexical` (только `retrieveChunks()`, этап 3, без изменений),
+`semantic` (только векторы), `hybrid` (оба, default). Fusion — **rank-based**
+(weighted Reciprocal Rank Fusion, тот же `RRF_K=60`, что и в
+`scientific-search/pipeline.ts`), никогда прямая сумма BM25 и cosine similarity:
+несопоставимые шкалы. Параметры (`RRF_K`, `RRF_LEXICAL_WEIGHT`,
+`RRF_SEMANTIC_WEIGHT`) — константы в `rag/types.ts`, `fuseRankings()` —
+чистая, экспортируемая, независимо тестируемая функция.
+
+`FusedChunk` хранит provenance: `lexicalRank`/`semanticRank`/`fusedRank`,
+`lexicalScore`/`semanticScore`, `foundBy: 'lexical'|'semantic'|'both'`.
+Дедупликация — по `chunkId` (`Map`), тай-брейк при равном fused score — по
+`chunkId` (детерминированный порядок).
+
+Безопасная деградация: если провайдер/хранилище эмбеддингов недоступны, пусты
+или запрос к ним упал — `hybrid`/`semantic` автоматически становятся `lexical`,
+с `fallbackReason` в диагностике; падения не происходит никогда.
+`RagResult.mode` — реально использованный режим (может отличаться от
+запрошенного), не только в dev-диагностике.
+
+### Что не меняется в существующем RAG grounding
+
+`buildContext` (жёсткий бюджет), `validateAnswerGrounding` (claim-level,
+citation только для реально вошедшего evidence), защита от prompt injection —
+не тронуты: `hybridRetrieve()` возвращает `FusedChunk[]`, структурно являющийся
+`RetrievedChunk[]`, и `context.ts`/`citations.ts` принимают его без изменений.
+
+### UI
+
+В «Спросить библиотеку» — переключатель «Поиск»: Гибридный (default) / По
+смыслу / По словам. Если выбран Гибридный/По смыслу, а семантический индекс не
+построен или недоступен — обычный (не только dev) баннер: «Семантический индекс
+пока не построен или недоступен - используется поиск по словам (FTS5)».
+В dev-диагностике — режим, количество кандидатов FTS/semantic/после fusion,
+время каждого этапа, покрытие embedding-индекса, число устаревших записей,
+причина деградации, и происхождение (`FTS`/`Semantic`/`FTS + Semantic`) каждого
+показанного фрагмента.
+
+### Тесты
+
+`tests/embeddings.test.ts` — провайдеры (детерминированный: воспроизводимость,
+сбой, пустой/неверный вектор; OpenAI: Content-Type application/json обязателен,
+malformed JSON, non-2xx, timeout, network failure, malformed result, без утечки
+ключа/тела), `getEmbeddingProvider()` никогда не включает OpenAI только по
+`OPENAI_API_KEY`, `EmbeddingStore` (upsert/fingerprint/чужой rootId),
+`runEmbeddingIndex` (insert/reuse/re-embed изменённого чанка/orphan cleanup
+только на полном прогоне/stale при смене model или provider/resume после dead
+PID/batch failure не прерывает прогон/interrupt+resume).
+`tests/hybrid-retrieval.test.ts` — `fuseRankings` (lexical-only/semantic-only/
+both/дедупликация/детерминизм/тай-брейк/лимит), `semanticSearch` (совпадение,
+пусто, dimension mismatch), `hybridRetrieve` (fallback без провайдера, fallback
+при пустом индексе, `lexical` никогда не трогает провайдер, `semantic` находит
+результат при пустой лексической выдаче, `hybrid` объединяет оба с provenance,
+частичное покрытие в диагностике). `tests/rag.test.ts` — сквозная проверка, что
+citations/grounding/hard context budget не ломаются при прохождении через
+hybrid-путь, включая отказ несуществующей цитаты.
+
+### Внешние зависимости
+
+Не добавлено ни одной новой npm-зависимости и ни одного native-модуля — весь
+этап реализован на встроенном `node:sqlite`, `node:crypto` и чистом JS.

@@ -1,6 +1,9 @@
-import { DEFAULT_RETRIEVAL_LIMIT, MAX_QUESTION_LENGTH, MAX_RETRIEVAL_LIMIT, RagValidationError } from './types';
+import { DEFAULT_RETRIEVAL_LIMIT, DEFAULT_RETRIEVAL_MODE, MAX_QUESTION_LENGTH, MAX_RETRIEVAL_LIMIT, RagValidationError } from './types';
+import type { RetrievalMode } from './types';
 
-export function parseAskInput(input: unknown): { question: string; limit: number } {
+const RETRIEVAL_MODES: readonly RetrievalMode[] = ['lexical', 'semantic', 'hybrid'];
+
+export function parseAskInput(input: unknown): { question: string; limit: number; mode: RetrievalMode } {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new RagValidationError('Неверный формат запроса.');
   const data = input as Record<string, unknown>;
   const question = data.question;
@@ -14,5 +17,13 @@ export function parseAskInput(input: unknown): { question: string; limit: number
     }
     limit = rawLimit;
   }
-  return { question: question.trim(), limit };
+  const rawMode = data.mode;
+  let mode: RetrievalMode = DEFAULT_RETRIEVAL_MODE;
+  if (rawMode !== undefined) {
+    if (typeof rawMode !== 'string' || !RETRIEVAL_MODES.includes(rawMode as RetrievalMode)) {
+      throw new RagValidationError(`mode должен быть одним из: ${RETRIEVAL_MODES.join(', ')}.`);
+    }
+    mode = rawMode as RetrievalMode;
+  }
+  return { question: question.trim(), limit, mode };
 }

@@ -1,29 +1,36 @@
 'use client';
 import { useState } from 'react';
-import type { AnswerClaim, Citation, RagDiagnostics, RagStatus, RetrievedChunk } from '@/services/rag/types';
+import type { AnswerClaim, Citation, FusedChunk, RagDiagnostics, RagStatus, RetrievalMode } from '@/services/rag/types';
 import { INSUFFICIENT_DATA_ANSWER } from '@/services/rag/prompt';
 import styles from '@/components/scifinder/search.module.css';
 interface AskResponse {
-  question: string; limit: number; status: RagStatus; chunks: RetrievedChunk[]; citations: Citation[];
+  question: string; limit: number; mode: RetrievalMode; status: RagStatus; chunks: FusedChunk[]; citations: Citation[];
   answer: { claims: AnswerClaim[]; configured: boolean; error: string | null };
   diagnostics?: RagDiagnostics;
 }
 const DEFAULT_LIMIT = 8;
 const MAX_LIMIT = 20;
+const MODE_LABELS: Record<RetrievalMode, string> = { hybrid: 'Гибридный', semantic: 'По смыслу', lexical: 'По словам' };
+const ORIGIN_LABELS: Record<FusedChunk['foundBy'], string> = { lexical: 'FTS', semantic: 'Semantic', both: 'FTS + Semantic' };
 export function AskLibrary() {
   const [question, setQuestion] = useState('');
   const [limit, setLimit] = useState(DEFAULT_LIMIT);
+  const [mode, setMode] = useState<RetrievalMode>('hybrid');
   const [showFragments, setShowFragments] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState<AskResponse | null>(null);
+  // Captured at request time, separate from the live `mode` selector: the user may change
+  // the selector before the next submit, and comparisons against a stale result must always
+  // use the mode that result actually corresponds to, not whatever is currently selected.
+  const [requestedMode, setRequestedMode] = useState<RetrievalMode>('hybrid');
   async function ask(e: React.FormEvent) {
     e.preventDefault();
-    setBusy(true); setError(''); setResult(null);
+    setBusy(true); setError(''); setResult(null); setRequestedMode(mode);
     try {
       const response = await fetch('/api/library/ask', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, limit }), signal: AbortSignal.timeout(60_000),
+        body: JSON.stringify({ question, limit, mode }), signal: AbortSignal.timeout(60_000),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error ?? 'Не удалось получить ответ.');
@@ -34,14 +41,19 @@ export function AskLibrary() {
   const answer = result?.answer;
   return <section aria-label="Спросить библиотеку" className={styles.results}>
     <p className={styles.hint}>
-      Ответ строится только на фрагментах, найденных в вашей локальной библиотеке через лексический поиск (FTS5) -
-      без embeddings и без внешних знаний. Если данных недостаточно, так и будет сказано.
+      Ответ строится только на фрагментах, найденных в вашей локальной библиотеке - лексически (FTS5) и/или по смыслу
+      (semantic embeddings, если построены) - без внешних знаний. Если данных недостаточно, так и будет сказано.
     </p>
     <form className={`${styles.publication} ${styles.results}`} onSubmit={e => void ask(e)}>
       <label className={`${styles.field} ${styles.full}`}>Вопрос к библиотеке
         <textarea className={styles.control} rows={3} maxLength={2000} value={question}
           onChange={e => setQuestion(e.target.value)}
           placeholder="Например: какие температуры осаждения AlTiSiN использовались для режущего инструмента?" />
+      </label>
+      <label className={styles.field}>Поиск
+        <select className={styles.control} value={mode} onChange={e => setMode(e.target.value as RetrievalMode)}>
+          {(['hybrid', 'semantic', 'lexical'] as const).map(m => <option key={m} value={m}>{MODE_LABELS[m]}</option>)}
+        </select>
       </label>
       <label className={styles.field}>Сколько фрагментов искать
         <select className={styles.control} value={limit} onChange={e => setLimit(Number(e.target.value))}>
@@ -52,6 +64,8 @@ export function AskLibrary() {
     </form>
     {error && <p role="alert" className={`${styles.status} ${styles.error}`}>{error}</p>}
     {result && <div className={styles.results} aria-live="polite">
+      {result.mode !== requestedMode && (requestedMode === 'hybrid' || requestedMode === 'semantic') &&
+        <p className={styles.hint}>Семантический индекс пока не построен или недоступен - используется поиск по словам (FTS5).</p>}
       {(result.status === 'unavailable' || result.status === 'index_error') &&
         <p role="alert" className={`${styles.status} ${styles.error}`}>{answer?.error}</p>}
       {result.status !== 'unavailable' && result.status !== 'index_error' && !result.chunks.length &&
@@ -86,19 +100,25 @@ export function AskLibrary() {
           {showFragments ? 'Скрыть найденные фрагменты' : 'Показать найденные фрагменты'}
         </button>
         {showFragments && <div className={styles.list}>{result.chunks.map(chunk => <article key={chunk.chunkId} className={styles.publication}>
-          <div className={styles.meta}>стр. {chunk.pageStart}–{chunk.pageEnd} · релевантность {chunk.score.toFixed(4)}</div>
+          <div className={styles.meta}>
+            стр. {chunk.pageStart}–{chunk.pageEnd} · релевантность {chunk.score.toFixed(4)}
+            {result.diagnostics && <> · {ORIGIN_LABELS[chunk.foundBy]}</>}
+          </div>
           <h4>{chunk.filename}</h4>
           <p>{chunk.snippet}</p>
         </article>)}</div>}
         {result.diagnostics && <details className={`${styles.status} ${styles.results}`}>
           <summary>Диагностика (development)</summary>
           <ul>
-            <li>Найдено фрагментов: {result.diagnostics.chunksFound}</li>
+            <li>Режим поиска: {result.diagnostics.retrieval.mode}{result.diagnostics.retrieval.fallbackReason ? ` (${result.diagnostics.retrieval.fallbackReason})` : ''}</li>
+            <li>Найдено фрагментов: {result.diagnostics.chunksFound} · FTS: {result.diagnostics.retrieval.ftsCandidates} · Semantic: {result.diagnostics.retrieval.semanticCandidates} · после fusion: {result.diagnostics.retrieval.fusedCandidates}</li>
             <li>Документов использовано: {result.diagnostics.documentsUsed.length}</li>
             <li>Размер контекста: {result.diagnostics.contextChars} символов{result.diagnostics.contextTruncated ? ' (обрезан по лимиту)' : ''}</li>
-            <li>Время retrieval: {result.diagnostics.retrievalMs} мс</li>
+            <li>Время FTS: {result.diagnostics.retrieval.ftsMs} мс · Время semantic: {result.diagnostics.retrieval.semanticMs} мс · Время retrieval всего: {result.diagnostics.retrieval.totalMs} мс</li>
             <li>Время generation: {result.diagnostics.generationMs} мс</li>
-            <li>FTS score по чанкам: {result.diagnostics.scores.map(s => s.score.toFixed(4)).join(', ')}</li>
+            {result.diagnostics.retrieval.embeddingProviderId && <li>Embedding provider/model: {result.diagnostics.retrieval.embeddingProviderId} / {result.diagnostics.retrieval.embeddingModel}</li>}
+            {result.diagnostics.retrieval.embeddingCoverage !== null && <li>Покрытие embedding-индекса: {(result.diagnostics.retrieval.embeddingCoverage * 100).toFixed(1)}%{result.diagnostics.retrieval.staleEmbeddingsCount ? ` · устаревших: ${result.diagnostics.retrieval.staleEmbeddingsCount}` : ''}</li>}
+            <li>Fused score по чанкам: {result.diagnostics.scores.map(s => s.score.toFixed(4)).join(', ')}</li>
             {result.diagnostics.answerRejectedReason && <li>Ответ отклонён: {result.diagnostics.answerRejectedReason}</li>}
           </ul>
         </details>}

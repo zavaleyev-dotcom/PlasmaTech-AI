@@ -1,5 +1,6 @@
 import type { TextStore } from '@/services/library-text/store';
 import type { ContentHit } from '@/services/library-text/types';
+import { hydrateChunk } from './hydrate';
 import type { RetrievedChunk } from './types';
 
 // A small, deliberately simple stopword list (RU + EN): strips generic question/function
@@ -42,16 +43,11 @@ function buildFtsQuery(terms: string[]): string {
   return terms.map(t => (t.includes(' ') ? `"${t.replaceAll('"', '""')}"` : t)).join(' ');
 }
 
-function toRetrievedChunk(store: TextStore, hit: ContentHit, score: number): RetrievedChunk {
-  // ContentHit only carries a short FTS snippet; the full chunk text lives in `chunks.text`.
-  // TextStore.search()/the schema are not touched - this reads through the already-public
-  // `store.db` the same way tests already do, without adding a new method to TextStore.
-  const row = store.db.prepare('SELECT text FROM chunks WHERE id=?').get(hit.chunkId) as { text: string } | undefined;
-  return {
-    chunkId: hit.chunkId, documentId: hit.id, relativePath: hit.relativePath, filename: hit.filename,
-    title: hit.title, authors: hit.authors, doi: hit.doi, year: hit.year, sourceFolder: hit.sourceFolder,
-    pageStart: hit.pageStart, pageEnd: hit.pageEnd, text: row?.text ?? hit.snippet, snippet: hit.snippet, score,
-  };
+function toRetrievedChunk(store: TextStore, hit: ContentHit, score: number): RetrievedChunk | null {
+  // hit.id is the document id (ContentHit extends TextMetadata, whose `id` field is the
+  // document, not the chunk); hydrateChunk re-reads the chunk/document rows directly so the
+  // lexical and semantic retrieval paths always produce an identical RetrievedChunk shape.
+  return hydrateChunk(store, hit.chunkId, hit.id, score, hit.snippet);
 }
 
 /** store.search() itself throws only if the reconstructed query exceeds 500 chars - our own
@@ -67,7 +63,9 @@ function collect(store: TextStore, terms: string[], limit: number): RetrievedChu
   const result = store.search(query, 0);
   // Reciprocal-rank score, same convention as scientific-search/pipeline.ts (1/(60+rank+1)),
   // so scores from independent per-term searches below can be fused by simple addition.
-  return result.hits.slice(0, limit).map((hit, rank) => toRetrievedChunk(store, hit, 1 / (60 + rank + 1)));
+  return result.hits.slice(0, limit)
+    .map((hit, rank) => toRetrievedChunk(store, hit, 1 / (60 + rank + 1)))
+    .filter((chunk): chunk is RetrievedChunk => chunk !== null);
 }
 
 /** At most this many distinct keywords get their own fallback search below. */

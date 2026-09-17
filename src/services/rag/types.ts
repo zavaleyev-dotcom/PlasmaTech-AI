@@ -79,6 +79,50 @@ export type RagStatus =
   | 'unavailable'            // the local text index/config could not even be opened
   | 'index_error';           // the index opened, but retrieval itself raised an unexpected error
 
+export type RetrievalMode = 'lexical' | 'semantic' | 'hybrid';
+export const DEFAULT_RETRIEVAL_MODE: RetrievalMode = 'hybrid';
+
+/** Centralized, independently-testable fusion parameters for HybridRetriever (hybrid.ts).
+ *  Rank-based (Reciprocal Rank Fusion), not a sum of BM25 and cosine similarity: the two
+ *  scores live on incomparable scales, so only their RANK within each list is fused. */
+export const RRF_K = 60;
+export const RRF_LEXICAL_WEIGHT = 1;
+export const RRF_SEMANTIC_WEIGHT = 1;
+
+export type ChunkOrigin = 'lexical' | 'semantic' | 'both';
+
+/** A retrieved chunk enriched with per-method provenance. `score` (inherited from
+ *  RetrievedChunk) is the FUSED reciprocal-rank score used for final ordering;
+ *  lexicalScore/semanticScore preserve each method's own original score for diagnostics. */
+export interface FusedChunk extends RetrievedChunk {
+  lexicalRank: number | null;
+  semanticRank: number | null;
+  fusedRank: number;
+  lexicalScore: number | null;
+  semanticScore: number | null;
+  foundBy: ChunkOrigin;
+}
+
+/** Development-only retrieval diagnostics (see RagDiagnostics.retrieval). */
+export interface RetrievalDiagnostics {
+  /** The mode actually used, which may differ from what was requested if semantic search
+   *  was unavailable and hybrid/semantic safely degraded to lexical-only (see fallbackReason). */
+  mode: RetrievalMode;
+  ftsCandidates: number;
+  semanticCandidates: number;
+  fusedCandidates: number;
+  ftsMs: number;
+  semanticMs: number;
+  totalMs: number;
+  embeddingProviderId: string | null;
+  embeddingModel: string | null;
+  /** Fraction (0..1) of the library's current chunks that have a current embedding, or null
+   *  if unknown/not configured. */
+  embeddingCoverage: number | null;
+  staleEmbeddingsCount: number | null;
+  fallbackReason: string | null;
+}
+
 export interface RagDiagnostics {
   chunksFound: number;
   documentsUsed: string[];
@@ -89,13 +133,22 @@ export interface RagDiagnostics {
   generationMs: number;
   /** Set only when status is 'insufficient_evidence' because a provider answer was rejected. */
   answerRejectedReason: GroundingRejectionReason | null;
+  retrieval: RetrievalDiagnostics;
 }
 
 export interface RagResult {
   question: string;
   limit: number;
+  /** The retrieval mode actually used (see RetrievalDiagnostics.mode for why it may differ
+   *  from what was requested). Always present, not just in development, since it is exactly
+   *  what the user chose (or what it safely degraded to) - never a hidden implementation detail. */
+  mode: RetrievalMode;
   status: RagStatus;
-  chunks: RetrievedChunk[];
+  /** Always FusedChunk[] in practice (askLibrary always retrieves via hybridRetrieve, even
+   *  in 'lexical'/'semantic' mode) - carries per-method provenance (lexicalRank/
+   *  semanticRank/foundBy/...) for development diagnostics, on top of the plain
+   *  RetrievedChunk fields every existing consumer already relies on. */
+  chunks: FusedChunk[];
   citations: Citation[];
   answer: AnswerResult;
   /** Only populated outside production (see askLibrary in service.ts). */
