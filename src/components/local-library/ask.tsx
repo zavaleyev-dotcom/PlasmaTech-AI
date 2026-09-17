@@ -1,10 +1,11 @@
 'use client';
 import { useState } from 'react';
-import type { Citation, RagDiagnostics, RagStatus, RetrievedChunk } from '@/services/rag/types';
+import type { AnswerClaim, Citation, RagDiagnostics, RagStatus, RetrievedChunk } from '@/services/rag/types';
+import { INSUFFICIENT_DATA_ANSWER } from '@/services/rag/prompt';
 import styles from '@/components/scifinder/search.module.css';
 interface AskResponse {
   question: string; limit: number; status: RagStatus; chunks: RetrievedChunk[]; citations: Citation[];
-  answer: { text: string; configured: boolean; error: string | null };
+  answer: { claims: AnswerClaim[]; configured: boolean; error: string | null };
   diagnostics?: RagDiagnostics;
 }
 const DEFAULT_LIMIT = 8;
@@ -61,10 +62,12 @@ export function AskLibrary() {
           проверьте их вручную.
         </p>}
         {result.status === 'generation_error' && <p role="alert" className={`${styles.status} ${styles.error}`}>{answer.error} Ниже показаны найденные источники.</p>}
-        {result.status === 'insufficient_evidence' && <p className={styles.status}>{answer.text} Ниже показаны найденные фрагменты для проверки.</p>}
-        {result.status === 'answered' && answer.text && <article className={styles.publication}>
+        {result.status === 'insufficient_evidence' && <p className={styles.status}>{INSUFFICIENT_DATA_ANSWER} Ниже показаны найденные фрагменты для проверки.</p>}
+        {result.status === 'answered' && !!answer.claims.length && <article className={styles.publication}>
           <h3>Ответ</h3>
-          {answer.text.split(/\n+/).filter(Boolean).map((line, i) => <p key={i}>{line}</p>)}
+          {/* Citation markers are built here from each claim's own citationIds - never taken
+              from the model's text - so the model cannot forge a trusted-looking [n]. */}
+          {answer.claims.map((claim, i) => <p key={i}>{claim.text} {claim.citationIds.map(id => `[${id}]`).join('')}</p>)}
         </article>}
         <div>
           <h3>Источники</h3>

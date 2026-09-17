@@ -2,8 +2,7 @@ import 'server-only';
 import { openTextStore } from '@/services/library-text';
 import type { TextStore } from '@/services/library-text/store';
 import { buildContext } from './context';
-import { sanitizeInlineCitations, validateAnswerGrounding } from './citations';
-import { INSUFFICIENT_DATA_ANSWER } from './prompt';
+import { validateAnswerGrounding } from './citations';
 import { getAnswerProvider } from './providers';
 import type { AnswerProvider } from './providers/types';
 import { retrieveChunks } from './retrieve';
@@ -17,6 +16,9 @@ export interface AskLibraryOptions {
   provider?: AnswerProvider;
   /** Force-include diagnostics regardless of NODE_ENV (tests use this instead of the env var). */
   includeDiagnostics?: boolean;
+  /** Injected for tests, e.g. to force a tiny context budget end-to-end; defaults to the
+   *  real buildContext() with its default size limits. */
+  buildContext?: typeof buildContext;
 }
 
 /** Fixed, generic message for every answer-provider failure. Deliberately never built from
@@ -30,6 +32,10 @@ const GENERATION_ERROR_MESSAGE = 'Не удалось получить отве�
 const INDEX_ERROR_MESSAGE = 'Внутренняя ошибка локального текстового индекса. Обновите индекс в разделе «Моя библиотека» или повторите позже.';
 
 const UNAVAILABLE_MESSAGE = 'Локальный текстовый индекс недоступен. Проверьте SCIENTIFIC_LIBRARY_PATH и запустите индексирование в разделе «Моя библиотека».';
+
+function emptyAnswer(configured: boolean, error: string | null): AnswerResult {
+  return { claims: [], configured, error };
+}
 
 function baseResult(question: string, limit: number, status: RagStatus, answer: AnswerResult): RagResult {
   return { question, limit, status, chunks: [], citations: [], answer };
@@ -57,23 +63,24 @@ interface GeneratedAnswer { answer: AnswerResult; status: RagStatus; rejectedRea
  *  sources. Three independently-checkable outcomes, never conflated:
  *    - the provider call itself fails technically (network/timeout/bad response) -> 'generation_error'
  *    - the provider responds, but the answer is not grounded in RagContext.citations
- *      (missing/unknown/malformed citationIds) -> 'insufficient_evidence', safe fallback text
- *    - the answer is grounded -> 'answered', with any stray unverifiable [n] marker in the
- *      display text stripped as defense in depth (sanitizeInlineCitations). */
+ *      (missing/unknown/malformed citationIds, on any claim) -> 'insufficient_evidence'
+ *    - every claim is grounded -> 'answered', with claim text already stripped of any
+ *      self-authored bracket sequence that could be mistaken for a citation marker
+ *      (validateAnswerGrounding/citations.ts) - the caller (API/UI) builds the displayed
+ *      [n] markers itself, from citationIds, never from provider prose. */
 async function generateAnswer(question: string, context: RagContext, provider: AnswerProvider): Promise<GeneratedAnswer> {
-  if (!provider.configured()) return { answer: { text: '', configured: false, error: null }, status: 'not_configured', rejectedReason: null };
+  if (!provider.configured()) return { answer: emptyAnswer(false, null), status: 'not_configured', rejectedReason: null };
   let output: Awaited<ReturnType<AnswerProvider['generate']>>;
   try { output = await provider.generate({ question, context }); }
   catch (error) {
     console.error('[rag] answer provider failed', error);
-    return { answer: { text: '', configured: true, error: GENERATION_ERROR_MESSAGE }, status: 'generation_error', rejectedReason: null };
+    return { answer: emptyAnswer(true, GENERATION_ERROR_MESSAGE), status: 'generation_error', rejectedReason: null };
   }
   const grounding = validateAnswerGrounding(output, context.citations);
   if (!grounding.valid) {
-    return { answer: { text: INSUFFICIENT_DATA_ANSWER, configured: true, error: null }, status: 'insufficient_evidence', rejectedReason: grounding.reason };
+    return { answer: emptyAnswer(true, null), status: 'insufficient_evidence', rejectedReason: grounding.reason };
   }
-  const text = sanitizeInlineCitations(output.answer, output.citationIds);
-  return { answer: { text, configured: true, error: null }, status: 'answered', rejectedReason: null };
+  return { answer: { claims: grounding.claims, configured: true, error: null }, status: 'answered', rejectedReason: null };
 }
 
 /** Retrieval -> context -> generation, kept as separate steps (retrieveChunks / buildContext
@@ -85,21 +92,29 @@ export async function askLibrary(input: unknown, options: AskLibraryOptions = {}
   const openStore = options.openStore ?? openTextStore;
   let store: TextStore;
   try { store = await openStore(); }
-  catch { return baseResult(question, limit, 'unavailable', { text: '', configured: false, error: UNAVAILABLE_MESSAGE }); }
+  catch { return baseResult(question, limit, 'unavailable', emptyAnswer(false, UNAVAILABLE_MESSAGE)); }
   try {
     let chunks: RetrievedChunk[];
     const retrievalStart = Date.now();
     try { chunks = retrieveChunks(store, question, limit); }
     catch (error) {
       console.error('[rag] retrieval failed', error);
-      return baseResult(question, limit, 'index_error', { text: '', configured: false, error: INDEX_ERROR_MESSAGE });
+      return baseResult(question, limit, 'index_error', emptyAnswer(false, INDEX_ERROR_MESSAGE));
     }
     const retrievalMs = Date.now() - retrievalStart;
     if (!chunks.length) {
-      const result: RagResult = { question, limit, status: 'insufficient_evidence', chunks: [], citations: [], answer: { text: INSUFFICIENT_DATA_ANSWER, configured: true, error: null } };
+      const result: RagResult = { question, limit, status: 'insufficient_evidence', chunks: [], citations: [], answer: emptyAnswer(true, null) };
       return withDiagnostics(result, baseDiagnostics([], null, retrievalMs, 0, null), options);
     }
-    const context = buildContext(chunks);
+    const build = options.buildContext ?? buildContext;
+    const context = build(chunks);
+    if (!context.citations.length) {
+      // Budget enforcement (context.ts) left no source with any surviving evidence text -
+      // there is nothing a provider could possibly ground an answer in, so this is reported
+      // (and short-circuited) the same way as an empty retrieval, without spending a call.
+      const result: RagResult = { question, limit, status: 'insufficient_evidence', chunks, citations: [], answer: emptyAnswer(true, null) };
+      return withDiagnostics(result, baseDiagnostics(chunks, context, retrievalMs, 0, null), options);
+    }
     const provider = options.provider ?? getAnswerProvider();
     const generationStart = Date.now();
     const { answer, status, rejectedReason } = await generateAnswer(question, context, provider);

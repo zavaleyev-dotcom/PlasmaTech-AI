@@ -36,17 +36,28 @@ export interface Citation {
   pageEnd: number;
 }
 
-/** The bounded, delimited prompt block built from retrieved chunks, plus its citation list. */
+/** The bounded, JSON-serialized prompt block built from retrieved chunks, plus the citation
+ *  list a source only ever joins once its own evidence text actually made it into `block`
+ *  (see context.ts) - `citations` is therefore always exactly "what the model can truthfully
+ *  cite", never a superset of it. */
 export interface RagContext {
   block: string;
   citations: Citation[];
-  /** True if some retrieved chunks were dropped to respect the context size cap. */
+  /** True if anything was left out or cut short: a whole chunk, a metadata field, or content. */
   truncated: boolean;
 }
 
-export interface AnswerResult {
-  /** Empty when not configured, when generation failed, or when the answer was not grounded. */
+/** One self-contained statement plus the sources that support it. Only ever constructed by
+ *  validateAnswerGrounding() (citations.ts) from an already-checked AnswerProviderOutput -
+ *  the UI/service layer builds any [n] marker FROM citationIds, never from provider prose. */
+export interface AnswerClaim {
   text: string;
+  citationIds: number[];
+}
+
+export interface AnswerResult {
+  /** Populated only when status is 'answered'; empty for every other status. */
+  claims: AnswerClaim[];
   configured: boolean;
   error: string | null;
 }

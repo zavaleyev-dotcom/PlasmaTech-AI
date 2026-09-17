@@ -6,27 +6,26 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
 }
 
-/** Best-effort parse of the model's own JSON payload ({"answer":...,"citationIds":...}).
- *  This is NOT a provider-transport failure if it doesn't parse or doesn't match the shape -
- *  the model simply failed to follow instructions. Falling back to the raw text with no
- *  citationIds lets validateAnswerGrounding() (citations.ts) reject it the same way it
- *  rejects any other uncited answer, instead of this adapter inventing its own error path
- *  for "the model ignored the format". */
+/** Best-effort parse of the model's own JSON payload ({"claims": [...]}). This is NOT a
+ *  provider-transport failure if it doesn't parse or doesn't match the shape - the model
+ *  simply failed to follow instructions. Falling back to a single uncited claim lets
+ *  validateAnswerGrounding() (citations.ts) reject it the same way it rejects any other
+ *  uncited claim, instead of this adapter inventing its own error path for "the model
+ *  ignored the format". */
 function parseModelOutput(content: string): AnswerProviderOutput {
   try {
     const parsed = JSON.parse(content) as unknown;
-    if (parsed && typeof parsed === 'object') {
-      const { answer, citationIds } = parsed as Record<string, unknown>;
-      if (typeof answer === 'string' && Array.isArray(citationIds)) return { answer, citationIds: citationIds as number[] };
+    if (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).claims)) {
+      return parsed as AnswerProviderOutput;
     }
   } catch { /* not valid JSON - fall through to the uncited fallback below */ }
-  return { answer: content, citationIds: [] };
+  return { claims: [{ text: content, citationIds: [] }] };
 }
 
 /** Real, testable OpenAI Chat Completions adapter. Mirrors the DI/timeout/error-handling
  *  style already used by CrossrefProvider/OpenAlexProvider: an injectable fetcher, a fixed
- *  timeout, and structured errors that never leak the API key, upstream response bodies,
- *  or raw parser exceptions to the caller. */
+ *  timeout, and structured errors that never leak the API key, upstream response bodies, or
+ *  raw parser exceptions to the caller. */
 export class OpenAIAnswerProvider implements AnswerProvider {
   readonly id = 'openai' as const;
 
@@ -67,9 +66,15 @@ export class OpenAIAnswerProvider implements AnswerProvider {
     if (response.status === 401 || response.status === 403) throw new Error('OpenAI отклонил доступ. Проверьте OPENAI_API_KEY.');
     if (response.status === 429) throw new Error('Лимит запросов OpenAI исчерпан. Повторите позже.');
     if (!response.ok) throw new Error('OpenAI не смог обработать запрос.');
+    // A successful response must be declared as JSON. A non-2xx aside, some proxies/gateways
+    // return a 200 with an HTML or plain-text error page instead of the expected API
+    // response; treating that as success would hand an arbitrary string to the JSON parser
+    // below and to the model-output parser. Reject on the header alone, before even trying.
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!/^application\/json\b/i.test(contentType.trim())) throw new Error('OpenAI вернул неожиданный тип ответа.');
     let body: Record<string, unknown>;
     try { body = asRecord(await response.json()); }
-    catch { throw new Error('OpenAI вернул некорректный ответ.'); } // malformed JSON / unexpected content type
+    catch { throw new Error('OpenAI вернул некорректный ответ.'); } // malformed JSON despite the declared content type
     const choices = body.choices;
     const content = Array.isArray(choices) ? asRecord(asRecord(choices[0]).message).content : undefined;
     if (typeof content !== 'string' || !content.trim()) throw new Error('Пустой ответ модели.');
