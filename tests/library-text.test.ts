@@ -176,6 +176,21 @@ test('repeated replace cycles of the same document keep the FTS index consistent
   assert.equal(store.stats().documents, 1);
   // fts5 'integrity-check' throws if the shadow index disagrees with the chunks content table.
   assert.doesNotThrow(() => store.db.prepare("INSERT INTO content_search(content_search) VALUES('integrity-check')").run());
+  // store.search() joins content_search to chunks, so a stale FTS posting for an already
+  // deleted rowid would be silently hidden by that join. Compare the raw FTS shadow index
+  // directly against the current chunks table instead, bypassing the app-level join.
+  const chunkRowids = (store.db.prepare('SELECT rowid FROM chunks ORDER BY rowid').all() as { rowid: number }[]).map(r => r.rowid);
+  const ftsRowids = (store.db.prepare('SELECT rowid FROM content_search ORDER BY rowid').all() as { rowid: number }[]).map(r => r.rowid);
+  assert.deepEqual(ftsRowids, chunkRowids, 'every current chunk row, and only current chunk rows, must be present in the raw FTS index');
+  assert.equal(chunkRowids.length, 1);
+  const currentChunk = store.db.prepare('SELECT rowid, text FROM chunks WHERE rowid=?').get(chunkRowids[0]) as { rowid: number; text: string };
+  assert.match(currentChunk.text, /revision 4/);
+  // Direct MATCH against content_search (no join to chunks/documents): the current
+  // revision must resolve to exactly the live chunk rowid, and each superseded revision's
+  // text must be genuinely purged from the raw FTS postings, not merely filtered out later.
+  const rawMatch = (term: string) => (store.db.prepare('SELECT rowid FROM content_search WHERE content_search MATCH ?').all(`"${term}"`) as { rowid: number }[]).map(r => r.rowid);
+  assert.deepEqual(rawMatch('revision 4'), [currentChunk.rowid]);
+  for (let i = 0; i < 4; i++) assert.deepEqual(rawMatch(`revision ${i}`), [], `stale posting for revision ${i} must not remain in the raw FTS index`);
   assert.equal(store.search('coating').total, 1);
   assert.match(store.search('coating').hits[0].snippet, /revision 4/);
   const orphanChunks = store.db.prepare('SELECT count(*) n FROM chunks WHERE documentId NOT IN (SELECT id FROM documents)').get()!.n as number;
