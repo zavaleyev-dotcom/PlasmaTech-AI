@@ -3,6 +3,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { SciFinderSearch } from '@/components/scifinder/search';
 import { WorkspaceModule } from '@/components/workspace-module';
+import { EngineeringCalculators } from '@/components/engineering-calculators';
 import { getWorkspaceModule, workspaceModules } from '@/modules/workspace/registry';
 
 type Props = { params: Promise<{ module: string }> };
@@ -24,11 +25,17 @@ export default async function ModulePage({ params }: Props) {
     <div className="page inner-page">
       <Link href="/workspace" className="text-link">← Все инструменты</Link>
       <div className="page-intro">
-        <div className="eyebrow">{workspaceModule.id === 'scifinder' ? 'AI WORKSPACE / SCIENTIFIC SEARCH' : 'AI WORKSPACE / DEMO'}</div>
+        <div className="eyebrow">
+          {workspaceModule.id === 'scifinder' ? 'AI WORKSPACE / SCIENTIFIC SEARCH'
+            : workspaceModule.id === 'calculators' ? 'AI WORKSPACE / ENGINEERING CALCULATORS'
+            : 'AI WORKSPACE / DEMO'}
+        </div>
         <h1>{workspaceModule.tool.name}</h1>
         <p>{workspaceModule.tool.description}</p>
       </div>
-      {workspaceModule.id === 'scifinder' ? <SciFinderSearch /> : <WorkspaceModule key={workspaceModule.id} tool={workspaceModule.tool} example={workspaceModule.example} />}
+      {workspaceModule.id === 'scifinder' ? <SciFinderSearch />
+        : workspaceModule.id === 'calculators' ? <EngineeringCalculators />
+        : <WorkspaceModule key={workspaceModule.id} tool={workspaceModule.tool} example={workspaceModule.example} />}
     </div>
   );
 }
