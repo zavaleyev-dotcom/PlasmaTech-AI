@@ -89,6 +89,7 @@ export async function runEmbeddingIndex(options: RunEmbeddingIndexOptions): Prom
     running: true, cancelled: false, stopRequested: false, pid: process.pid,
     total: 0, processed: 0, reused: 0, embedded: 0, failed: 0, skipped: 0, orphanRemoved: 0,
     startedAt: new Date().toISOString(), finishedAt: null, error: null,
+    ...(sample !== undefined ? { sampleTarget: sample } : {}),
   };
   embeddingStore.claim(progress);
   const aborter = new AbortController();

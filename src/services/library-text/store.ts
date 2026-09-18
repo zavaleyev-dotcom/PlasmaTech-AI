@@ -112,14 +112,14 @@ export class TextStore {
     if (progress?.running) { try { process.kill(progress.pid, 0); } catch { progress.running = false; progress.error = 'Предыдущий процесс остановлен. Запустите обновление для продолжения.'; } }
     return { progress, stats: this.stats(), errors: this.db.prepare("SELECT relativePath,json_extract(metadata,'$.filename') filename,status,error FROM documents WHERE status!='success' ORDER BY relativePath").all() as unknown as TextOverview['errors'] };
   }
-  search(query: string, offset = 0): { total: number; hits: ContentHit[]; rankingDegraded: boolean } {
+  search(query: string, offset = 0): { total: number; hits: ContentHit[]; rankingDegraded: boolean; offsetCapped: boolean } {
     if (query.length > 500) throw new Error('Запрос длиннее 500 символов.');
     // Quotes express phrases; all other input is literal Unicode words, never FTS syntax.
     const rawTerms = [...query.matchAll(/"([^"]+)"|([\p{L}\p{N}_-]+)/gu)].map(m => m[1] ?? m[2]).filter(t => /[\p{L}\p{N}]/u.test(t));
     // A repeated token (accidental or pasted noise) adds nothing to selectivity but doubles
     // the work of finding/scoring it - drop duplicates before building the query at all.
     const terms = [...new Set(rawTerms)];
-    if (!terms.length || terms.length > 30) return { hits: [], total: 0, rankingDegraded: false };
+    if (!terms.length || terms.length > 30) return { hits: [], total: 0, rankingDegraded: false, offsetCapped: false };
     const match = terms.map(t => `"${t.replaceAll('"', '""')}"`).join(' AND ');
     const total = Number(this.db.prepare('SELECT count(*) n FROM content_search WHERE content_search MATCH ?').get(match)!.n);
 
@@ -141,7 +141,13 @@ export class TextStore {
         if (candidateBudget > RANK_CANDIDATE_BUDGET) break;
       }
     }
-    const cappedOffset = Math.max(0, Math.min(MAX_SEARCH_OFFSET, offset));
+    const normalizedOffset = Math.max(0, offset);
+    const cappedOffset = Math.min(MAX_SEARCH_OFFSET, normalizedOffset);
+    // Never let a caller silently keep re-fetching the SAME capped page while believing it is
+    // paging deeper (confirmed regression: the content-search UI's "next page" control had no
+    // way to know the requested offset was clamped, so it kept incrementing its own displayed
+    // "X-Y of total" range while the actual returned rows silently stayed frozen at the cap).
+    const offsetCapped = cappedOffset !== normalizedOffset;
     // Deep pagination has the SAME root cause even for an otherwise cheap term: bm25 order is
     // not index-backed, so reaching row `offset+20` in ranked order still costs roughly
     // proportional to `offset` regardless of how selective the query itself is (measured:
@@ -160,6 +166,6 @@ export class TextStore {
     const orderBy = rankingDegraded ? 'content_search.rowid' : 'bm25(content_search), c.id';
     const rows = this.db.prepare(`SELECT d.metadata, c.id chunkId,c.pageStart,c.pageEnd,snippet(content_search,0,'','',' … ',48) snippet FROM content_search JOIN chunks c ON c.rowid=content_search.rowid JOIN documents d ON d.id=c.documentId WHERE content_search MATCH ? ORDER BY ${orderBy} LIMIT 20 OFFSET ?`).all(match, cappedOffset);
     const hits = rows.map(({ metadata, ...row }) => ({ ...JSON.parse(metadata as string), ...row })) as ContentHit[];
-    return { total, hits, rankingDegraded };
+    return { total, hits, rankingDegraded, offsetCapped };
   }
 }

@@ -84,6 +84,15 @@ export interface EmbeddingProgress {
   startedAt: string;
   finishedAt: string | null;
   error: string | null;
+  /** The `sample` this run was called with, if any - set once at the start of a sample run
+   *  and never changed. `total` alone cannot answer "how much of the requested job is done"
+   *  while a sample run is still in its first batch (it only reflects chunks discovered SO
+   *  FAR, which starts at 0 and grows toward `sample` as the cursor advances) - a caller that
+   *  wants a meaningful progress percentage during a bounded run needs the actual target, not
+   *  just what has been read yet. Optional and absent for a full (non-sample) run, and for
+   *  every progress object that existed before this field was added (old persisted JSON in an
+   *  existing embedding store still deserializes fine as `undefined` here). */
+  sampleTarget?: number;
 }
 
 export interface EmbeddingStats {

@@ -6,7 +6,7 @@ export function ContentSearch() {
   const [overview, setOverview] = useState<TextOverview | null>(null);
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState(''); const [searched, setSearched] = useState('');
-  const [result, setResult] = useState<{ hits: ContentHit[]; total: number } | null>(null);
+  const [result, setResult] = useState<{ hits: ContentHit[]; total: number; offsetCapped?: boolean } | null>(null);
   const [offset, setOffset] = useState(0); const [searching, setSearching] = useState(false);
   const load = useCallback(async () => {
     try { const response = await fetch('/api/library/text', { cache: 'no-store', signal: AbortSignal.timeout(15000) }); const data = await response.json(); if (!response.ok) throw new Error(data.error); setOverview(data); }
@@ -49,7 +49,8 @@ export function ContentSearch() {
     {result && <div className={styles.results} aria-live="polite"><h2>Найдено фрагментов: {result.total}</h2><p className={styles.hint}>Запрос: {searched}. Один документ может содержать несколько подходящих фрагментов.</p>
       {!result.hits.length && <p className={styles.status}>Ничего не найдено. Попробуйте другие слова или обновите текстовый индекс.</p>}
       <div className={styles.list}>{result.hits.map(hit => <article key={hit.chunkId} className={styles.publication}><div className={styles.meta}>Страницы {hit.pageStart}–{hit.pageEnd} · {hit.year ?? 'Год не указан'}</div><h3>{hit.title}</h3><p className={styles.authors}>{hit.authors.join('; ') || 'Авторы не указаны'}</p><p>{hit.snippet}</p><dl className={styles.details}><div><dt>DOI</dt><dd>{hit.doi ? <a className={styles.link} href={`https://doi.org/${encodeURIComponent(hit.doi)}`} target="_blank" rel="noreferrer">{hit.doi}</a> : 'Не указан'}</dd></div><div><dt>Исходная папка</dt><dd>{hit.sourceFolder}</dd></div><div><dt>Имя PDF</dt><dd>{hit.filename}</dd></div><div><dt>Путь относительно библиотеки</dt><dd>{hit.relativePath}</dd></div></dl><a className={`button secondary ${styles.results}`} href={`/api/library/pdf?id=${hit.id}#page=${hit.pageStart}`} target="_blank" rel="noreferrer">Открыть исходный PDF</a></article>)}</div>
-      {result.total > 20 && <div className={`${styles.actions} ${styles.results}`}><button className="button secondary" disabled={searching || offset === 0} onClick={() => void search(searched, offset - 20)}>Назад</button><span>{offset + 1}–{Math.min(offset + 20, result.total)} из {result.total}</span><button className="button secondary" disabled={searching || offset + 20 >= result.total || offset >= 10000} onClick={() => void search(searched, offset + 20)}>Далее</button></div>}
+      {result.total > 20 && <div className={`${styles.actions} ${styles.results}`}><button className="button secondary" disabled={searching || offset === 0} onClick={() => void search(searched, offset - 20)}>Назад</button><span>{offset + 1}–{Math.min(offset + 20, result.total)} из {result.total}</span><button className="button secondary" disabled={searching || offset + 20 >= result.total || result.offsetCapped} onClick={() => void search(searched, offset + 20)}>Далее</button></div>}
+      {result.offsetCapped && <p className={styles.hint}>Показана только первая часть результатов — при таком количестве совпадений более глубокая навигация недоступна. Уточните запрос словами, чтобы сузить выдачу.</p>}
     </div>}
     {!!overview?.errors.length && <details className={`${styles.status} ${styles.results}`}><summary>Пропуски и ошибки: {overview.errors.length}</summary><ul>{overview.errors.map(e => <li key={e.relativePath} style={{ overflowWrap: 'anywhere' }}>{e.relativePath}: {e.error}</li>)}</ul></details>}
   </section>;

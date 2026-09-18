@@ -142,6 +142,27 @@ test('search() caps pagination depth: a large offset on a non-trivial result set
   assert.ok(deep.hits.length <= 20);
 }));
 
+test('search() (Codex regression) reports offsetCapped so a caller can never silently keep "paging deeper" past the enforced pagination limit while actually re-fetching the same frozen page', () => fixture(async (root, indexFile, store) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'A single real document establishing one real documentId for the bulk-insert fixture.' }] }) });
+  const documentId = store.records()[0].id;
+  bulkInsertChunks(store, documentId, 2000, 'paginationword');
+
+  const withinCap = store.search('paginationword', 480);
+  assert.equal(withinCap.offsetCapped, false, 'an offset still within the enforced limit must not be reported as capped');
+
+  const atCap = store.search('paginationword', 500);
+  assert.equal(atCap.offsetCapped, false, 'the exact cap boundary itself is not "beyond" the cap');
+
+  const beyondCap = store.search('paginationword', 520);
+  assert.equal(beyondCap.offsetCapped, true, 'a requested offset beyond the enforced limit must be reported as capped, not silently clamped');
+  // The two "beyond the cap" requests must return the IDENTICAL frozen page (both clamped to
+  // the same effective offset) - this is exactly the condition the UI must stop paging into.
+  const alsoBeyondCap = store.search('paginationword', 100_000);
+  assert.equal(alsoBeyondCap.offsetCapped, true);
+  assert.deepEqual(alsoBeyondCap.hits.map(h => h.chunkId), beyondCap.hits.map(h => h.chunkId));
+}));
+
 test('search() rejects malformed/adversarial FTS syntax safely regardless of the new candidate-budget logic (no crash, no injection)', () => fixture(async (root, indexFile, store) => {
   await writeFile(path.join(root, 'a.pdf'), 'a');
   await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating hardness malformed-syntax regression test.' }] }) });
