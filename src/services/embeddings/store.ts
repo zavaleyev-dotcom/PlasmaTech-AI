@@ -2,17 +2,35 @@ import 'server-only';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import path from 'node:path';
+import { validateEmbeddingVector } from './vector';
 import type { EmbeddingFingerprint, EmbeddingProgress, EmbeddingRecord } from './types';
 
 function toBuffer(vector: Float32Array): Buffer {
   return Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength);
 }
 
-function toFloat32Array(blob: Uint8Array): Float32Array {
+/** Decodes a stored vector BLOB, but only if it is genuinely well-formed for its OWN
+ *  declared dimension: real binary data (not a string/number/anything else a corrupted or
+ *  hand-crafted row could hold), and EXACTLY `expectedDimension * 4` bytes - one 32-bit
+ *  float per dimension, no fewer (truncated) and no more (trailing garbage silently
+ *  ignored). Anything else is corruption and is never partially decoded: this returns a
+ *  deliberately empty vector, which validateEmbeddingVector's length check downstream is
+ *  guaranteed to reject regardless of what the caller's OWN expected dimension is. */
+function toFloat32Array(blob: unknown, expectedDimension: number): Float32Array {
+  if (!(blob instanceof Uint8Array) || blob.byteLength !== expectedDimension * 4) return new Float32Array(0);
   // Copy into a freshly-aligned buffer: a BLOB read back from node:sqlite is not guaranteed
   // to start at a 4-byte-aligned offset, which Float32Array's view constructor requires.
   const copy = Buffer.from(blob);
-  return new Float32Array(copy.buffer, copy.byteOffset, copy.byteLength / 4);
+  return new Float32Array(copy.buffer, copy.byteOffset, expectedDimension);
+}
+
+/** A full stored row, vector included (already converted to a Float32Array, NOT yet
+ *  validated - see vector.ts; a corrupted BLOB can still deserialize into a Float32Array
+ *  full of garbage, which is exactly why every caller must run it through
+ *  validateEmbeddingVector before trusting it). */
+export interface EmbeddingRow {
+  chunkId: string; documentId: string; contentHash: string;
+  providerId: string; model: string; dimension: number; vector: Float32Array;
 }
 
 /** A store fully separate from the existing FTS5 text index (src/services/library-text) -
@@ -69,20 +87,44 @@ export class EmbeddingStore {
   }
 
   /** The fingerprint of the currently stored embedding for one chunk, or null if there is
-   *  none. Comparing this to the chunk's current {contentHash, providerId, model, dimension}
-   *  is the entire reuse decision - see runEmbeddingIndex (index.ts). */
+   *  none. This alone is NOT sufficient to decide reuse - see recordFor(), which also
+   *  returns the vector so its integrity can be validated (a stored row can have a
+   *  perfectly matching fingerprint and still hold a corrupted vector). */
   fingerprint(chunkId: string): EmbeddingFingerprint | null {
     const row = this.db.prepare('SELECT contentHash, providerId, model, dimension FROM embeddings WHERE chunkId=?').get(chunkId) as EmbeddingFingerprint | undefined;
     return row ?? null;
   }
 
-  upsert(record: EmbeddingRecord) {
-    this.db.prepare(`INSERT INTO embeddings (chunkId,documentId,contentHash,providerId,model,dimension,vector,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(chunkId) DO UPDATE SET documentId=excluded.documentId, contentHash=excluded.contentHash, providerId=excluded.providerId,
-        model=excluded.model, dimension=excluded.dimension, vector=excluded.vector, updatedAt=excluded.updatedAt`)
-      .run(record.chunkId, record.documentId, record.contentHash, record.providerId, record.model, record.dimension,
-        toBuffer(record.vector), record.createdAt, record.updatedAt);
+  /** The full stored row for one chunk, vector included - the caller (runEmbeddingIndex)
+   *  validates the vector itself (validateEmbeddingVector) before ever treating it as
+   *  reusable: a fingerprint match alone never implies a usable vector. */
+  recordFor(chunkId: string): EmbeddingRow | null {
+    const row = this.db.prepare('SELECT chunkId, documentId, contentHash, providerId, model, dimension, vector FROM embeddings WHERE chunkId=?').get(chunkId) as
+      { chunkId: string; documentId: string; contentHash: string; providerId: string; model: string; dimension: number; vector: Uint8Array } | undefined;
+    return row ? { ...row, vector: toFloat32Array(row.vector, row.dimension) } : null;
   }
+
+  /** Writes every record in one atomic transaction: either all of them end up durably
+   *  stored, or (on any single failure) none of them do - a partial, half-written batch
+   *  never persists. Callers that need to know exactly what survived a failed write should
+   *  re-check with fingerprint()/recordFor() rather than assume based on transaction
+   *  semantics alone (see runEmbeddingIndex, index.ts, which does exactly that). */
+  upsertBatch(records: readonly EmbeddingRecord[]) {
+    if (!records.length) return;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const statement = this.db.prepare(`INSERT INTO embeddings (chunkId,documentId,contentHash,providerId,model,dimension,vector,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(chunkId) DO UPDATE SET documentId=excluded.documentId, contentHash=excluded.contentHash, providerId=excluded.providerId,
+          model=excluded.model, dimension=excluded.dimension, vector=excluded.vector, updatedAt=excluded.updatedAt`);
+      for (const record of records) {
+        statement.run(record.chunkId, record.documentId, record.contentHash, record.providerId, record.model, record.dimension,
+          toBuffer(record.vector), record.createdAt, record.updatedAt);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  upsert(record: EmbeddingRecord) { this.upsertBatch([record]); }
 
   remove(chunkId: string) { this.db.prepare('DELETE FROM embeddings WHERE chunkId=?').run(chunkId); }
 
@@ -96,20 +138,36 @@ export class EmbeddingStore {
     return Number(this.db.prepare('SELECT count(*) n FROM embeddings').get()!.n);
   }
 
-  /** Rows matching the given provider/model/dimension - the ones a semantic search or a
-   *  coverage/staleness computation may actually use "as current". Anything else in the
-   *  store is a stale leftover from a previous provider/model and is never silently treated
-   *  as compatible. */
+  /** Naive row count matching provider/model/dimension - does NOT validate vector
+   *  integrity or chunk/document/hash consistency (see validCount() for that). Kept for
+   *  cheap, approximate diagnostics only. */
   currentCount(providerId: string, model: string, dimension: number): number {
     return Number(this.db.prepare('SELECT count(*) n FROM embeddings WHERE providerId=? AND model=? AND dimension=?').get(providerId, model, dimension)!.n);
   }
 
-  /** All vectors matching the given provider/model/dimension, for brute-force semantic
-   *  search (see search.ts). Loaded fully into memory - see docs/architecture.md and the
-   *  benchmark for the measured cost of this at the tested sample size; this is a
-   *  deliberate, documented simplification for this stage, not a hidden limitation. */
-  currentVectors(providerId: string, model: string, dimension: number): { chunkId: string; documentId: string; vector: Float32Array }[] {
-    const rows = this.db.prepare('SELECT chunkId, documentId, vector FROM embeddings WHERE providerId=? AND model=? AND dimension=?').all(providerId, model, dimension) as { chunkId: string; documentId: string; vector: Uint8Array }[];
-    return rows.map(r => ({ chunkId: r.chunkId, documentId: r.documentId, vector: toFloat32Array(r.vector) }));
+  /** All rows matching provider/model/dimension, vectors included but NOT yet validated -
+   *  see search.ts and validCount(), which both run every row through
+   *  validateEmbeddingVector (and, where available, a chunk/document/hash consistency
+   *  check) before treating any of them as usable. */
+  currentRows(providerId: string, model: string, dimension: number): EmbeddingRow[] {
+    const rows = this.db.prepare('SELECT chunkId, documentId, contentHash, providerId, model, dimension, vector FROM embeddings WHERE providerId=? AND model=? AND dimension=?').all(providerId, model, dimension) as
+      { chunkId: string; documentId: string; contentHash: string; providerId: string; model: string; dimension: number; vector: Uint8Array }[];
+    return rows.map(r => ({ ...r, vector: toFloat32Array(r.vector, r.dimension) }));
+  }
+
+  /** The count that actually matters for coverage/status: rows matching provider/model/
+   *  dimension whose vector passes validateEmbeddingVector AND (when `isConsistent` is
+   *  given) whose chunk/document/contentHash relationship is still genuinely current. A
+   *  row that fails either check is neither "valid" nor silently "current" - it is exactly
+   *  as absent as if it were never written. */
+  validCount(providerId: string, model: string, dimension: number, isConsistent?: (chunkId: string, documentId: string, contentHash: string) => boolean): { valid: number; total: number } {
+    const rows = this.currentRows(providerId, model, dimension);
+    let valid = 0;
+    for (const row of rows) {
+      if (!validateEmbeddingVector(row.vector, dimension).valid) continue;
+      if (isConsistent && !isConsistent(row.chunkId, row.documentId, row.contentHash)) continue;
+      valid++;
+    }
+    return { valid, total: rows.length };
   }
 }

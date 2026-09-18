@@ -8,7 +8,7 @@ import { buildContext } from './context';
 import { validateAnswerGrounding } from './citations';
 import { getAnswerProvider } from './providers';
 import type { AnswerProvider } from './providers/types';
-import { hybridRetrieve } from './hybrid';
+import { chunkConsistencyChecker, hybridRetrieve } from './hybrid';
 import type { AnswerResult, FusedChunk, GroundingRejectionReason, RagContext, RagDiagnostics, RagResult, RagStatus, RetrievalDiagnostics, RetrievalMode, RetrievedChunk } from './types';
 import { parseAskInput } from './validation';
 
@@ -103,7 +103,7 @@ async function openEmbeddingContext(options: AskLibraryOptions, textStore: TextS
   try {
     const open = options.openEmbeddingStore ?? openEmbeddingStore;
     const store = await open();
-    const overview = computeEmbeddingOverview(store, provider, textStore.chunkCount());
+    const overview = computeEmbeddingOverview(store, provider, textStore.chunkCount(), chunkConsistencyChecker(textStore));
     return { provider, store, overview };
   } catch (error) {
     console.error('[rag] failed to open embedding store', error);

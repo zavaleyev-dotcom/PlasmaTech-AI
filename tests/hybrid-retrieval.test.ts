@@ -10,8 +10,11 @@ import { runEmbeddingIndex, computeEmbeddingOverview } from '../src/services/emb
 import { DeterministicEmbeddingProvider } from '../src/services/embeddings/providers/deterministic';
 import type { EmbeddingProvider } from '../src/services/embeddings/types';
 import { retrieveChunks } from '../src/services/rag/retrieve';
-import { fuseRankings, hybridRetrieve } from '../src/services/rag/hybrid';
+import { chunkConsistencyChecker, fuseRankings, hybridRetrieve } from '../src/services/rag/hybrid';
 import type { RetrievedChunk } from '../src/services/rag/types';
+import { createHash } from 'node:crypto';
+
+const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 
 async function fixture(fn: (root: string, indexFile: string, textStore: TextStore, embeddingStore: EmbeddingStore) => Promise<void>) {
   const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hybrid-test-')));
@@ -102,9 +105,10 @@ test('semanticSearch finds the closest vector by cosine similarity', async () =>
       store.upsert({ chunkId: id, documentId: `doc-${id}`, contentHash: 'h', providerId: provider.id, model: provider.model, dimension: provider.dimension, vector, createdAt: now, updatedAt: now });
     }
     const query = await provider.embedQuery('alpha text'); // identical to a's own embedded text
-    const hits = semanticSearch(store, provider.id, provider.model, provider.dimension, query, 5);
+    const { hits, candidateCount, invalidVectorCount, inconsistentCount } = semanticSearch(store, provider.id, provider.model, provider.dimension, query, 5);
     assert.equal(hits[0].chunkId, 'a');
     assert.ok(Math.abs(hits[0].score - 1) < 1e-5, `expected cosine similarity ~1, got ${hits[0].score}`);
+    assert.equal(candidateCount, 2); assert.equal(invalidVectorCount, 0); assert.equal(inconsistentCount, 0);
   } finally { store.close(); }
 });
 
@@ -112,7 +116,10 @@ test('semanticSearch returns nothing when the store has no vectors for the given
   const { semanticSearch } = await import('../src/services/embeddings/search');
   const store = new EmbeddingStore(':memory:', 'root');
   try {
-    assert.deepEqual(semanticSearch(store, 'deterministic', 'deterministic-8d', 8, new Float32Array(8), 5), []);
+    const provider = new DeterministicEmbeddingProvider({ dimension: 8 });
+    const outcome = semanticSearch(store, 'deterministic', 'deterministic-8d', 8, await provider.embedQuery('anything'), 5);
+    assert.deepEqual(outcome.hits, []);
+    assert.equal(outcome.candidateCount, 0);
   } finally { store.close(); }
 });
 
@@ -202,4 +209,114 @@ test('hybridRetrieve reports partial embedding coverage in diagnostics when only
   assert.equal(overview.status, 'partial');
   const result = await hybridRetrieve({ textStore, mode: 'hybrid', question: 'coating hardness deposition study', limit: 8, embeddingProvider: provider, embeddingStore, embeddingOverview: overview });
   assert.equal(result.diagnostics.embeddingCoverage, 0.5);
+}));
+
+// ---------- chunkConsistencyChecker: chunk/document/hash cross-verification ----------
+
+test('chunkConsistencyChecker accepts a genuinely matching record and rejects a stale contentHash, a wrong documentId, and an orphaned chunkId', () => fixture(async (root, indexFile, textStore) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a');
+  await runTextIndex({ root, indexFile, store: textStore, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating hardness consistency checker test content.' }] }) });
+  const row = textStore.db.prepare('SELECT id, documentId, text FROM chunks LIMIT 1').get() as { id: string; documentId: string; text: string };
+  const checker = chunkConsistencyChecker(textStore);
+  assert.equal(checker(row.id, row.documentId, sha256(row.text)), true, 'a genuinely matching record must be accepted');
+  assert.equal(checker(row.id, row.documentId, 'stale-hash-does-not-match'), false, 'a stale contentHash must be rejected');
+  assert.equal(checker(row.id, 'some-other-document-id', sha256(row.text)), false, 'a mismatched documentId must be rejected');
+  assert.equal(checker('chunk-id-that-does-not-exist', row.documentId, sha256(row.text)), false, 'an orphaned chunkId (no such chunk) must be rejected');
+}));
+
+test('a chunk from one document can never be hydrated with another document\'s metadata: an embedding whose documentId does not match its chunk\'s real document is excluded entirely, never surfaced as a hit', () => fixture(async (root, indexFile, textStore, embeddingStore) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a'); await writeFile(path.join(root, 'b.pdf'), 'b');
+  await runTextIndex({ root, indexFile, store: textStore, extract: async (data: Buffer) => ({ pageCount: 1, pages: [{ page: 1, text: `Coating hardness metadata isolation test ${data.toString()}.` }] }) });
+  const rows = textStore.db.prepare('SELECT id, documentId, text FROM chunks ORDER BY id').all() as { id: string; documentId: string; text: string }[];
+  assert.equal(rows.length, 2);
+  const [chunkA, chunkB] = rows;
+  assert.notEqual(chunkA.documentId, chunkB.documentId, 'sanity check: the two chunks really belong to different documents');
+  const provider = new DeterministicEmbeddingProvider({ dimension: 8 });
+  const vector = await provider.embedQuery(chunkA.text);
+  const now = new Date().toISOString();
+  // Deliberately mismatched: this record's own documentId field claims chunkA's vector
+  // belongs to chunkB's document. The consistency checker must catch this by cross-
+  // verifying against the chunk's REAL current documentId - never trusting this field.
+  embeddingStore.upsert({ chunkId: chunkA.id, documentId: chunkB.documentId, contentHash: sha256(chunkA.text), providerId: provider.id, model: provider.model, dimension: provider.dimension, vector, createdAt: now, updatedAt: now });
+  const { semanticSearch } = await import('../src/services/embeddings/search');
+  const query = await provider.embedQuery(chunkA.text);
+  const outcome = semanticSearch(embeddingStore, provider.id, provider.model, provider.dimension, query, 5, chunkConsistencyChecker(textStore));
+  assert.equal(outcome.hits.length, 0, 'the mismatched record must be excluded entirely, never surfaced as a hit that could be hydrated with the wrong document\'s metadata');
+  assert.equal(outcome.inconsistentCount, 1);
+}));
+
+// ---------- orphan handling: coverage, ranking, and diagnostics must all exclude orphans ----------
+
+test('coverage counts only genuinely valid embeddings: a genuine orphan (embedding for a chunkId that no longer exists) never inflates coverage, never displaces the one valid result, and never appears in ranking - while diagnostics still reflects it', () => fixture(async (root, indexFile, textStore, embeddingStore) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a');
+  await runTextIndex({ root, indexFile, store: textStore, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating hardness orphan coverage test content.' }] }) });
+  const provider = new DeterministicEmbeddingProvider({ dimension: 8 });
+  await runEmbeddingIndex({ textStore, embeddingStore, provider });
+  assert.equal(textStore.chunkCount(), 1);
+
+  // Inject a genuine orphan directly: an embedding for a chunkId that never existed in the
+  // text index at all (not stale, not mismatched - simply orphaned).
+  const orphanVector = await provider.embedQuery('orphan text that was never indexed');
+  const now = new Date().toISOString();
+  embeddingStore.upsert({ chunkId: 'chunk-that-never-existed', documentId: 'doc-that-never-existed', contentHash: 'irrelevant', providerId: provider.id, model: provider.model, dimension: provider.dimension, vector: orphanVector, createdAt: now, updatedAt: now });
+
+  const checker = chunkConsistencyChecker(textStore);
+  const overview = computeEmbeddingOverview(embeddingStore, provider, textStore.chunkCount(), checker);
+  assert.equal(overview.stats.totalChunks, 1);
+  assert.equal(overview.stats.embeddedChunks, 1, 'the orphan must never inflate embeddedChunks');
+  assert.ok(overview.stats.embeddedChunks <= overview.stats.totalChunks, 'coverage (embeddedChunks/totalChunks) must never exceed 100%');
+  assert.equal(overview.stats.staleChunks, 1, 'the orphan must be counted as stale in diagnostics, not silently dropped');
+
+  const { semanticSearch } = await import('../src/services/embeddings/search');
+  const query = await provider.embedQuery('coating hardness orphan coverage test content');
+  const outcome = semanticSearch(embeddingStore, provider.id, provider.model, provider.dimension, query, 5, checker);
+  assert.equal(outcome.hits.length, 1, 'the one valid embedding must still be returned, undisplaced by the orphan');
+  assert.notEqual(outcome.hits[0].chunkId, 'chunk-that-never-existed');
+  assert.equal(outcome.inconsistentCount, 1, 'the orphan must be counted as inconsistent in the outcome, not silently dropped');
+
+  const result = await hybridRetrieve({ textStore, mode: 'semantic', question: 'coating hardness orphan coverage test content', limit: 5, embeddingProvider: provider, embeddingStore });
+  assert.equal(result.chunks.length, 1);
+  assert.ok(result.chunks.every(c => c.chunkId !== 'chunk-that-never-existed'), 'the orphan must never appear in the final ranking');
+  assert.equal(result.diagnostics.inconsistentCandidateCount, 1, 'top-level diagnostics must reflect the orphan/stale count');
+}));
+
+// ---------- Codex regression: an entirely invalid semantic index must never look like a silent, unexplained empty result ----------
+
+test('hybridRetrieve (Codex regression): when every stored embedding is invalid (200 zero vectors), the semantic index is treated as unusable - hybrid falls back to FTS with an explicit, non-null fallbackReason, and coverage/status reflect zero usable embeddings', () => fixture(async (root, indexFile, textStore, embeddingStore) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a');
+  await runTextIndex({ root, indexFile, store: textStore, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating hardness invalid-index fallback regression test content.' }] }) });
+  const provider = new DeterministicEmbeddingProvider({ dimension: 8 });
+  const now = new Date().toISOString();
+  for (let i = 0; i < 200; i++) {
+    embeddingStore.upsert({
+      chunkId: `zero-${i}`, documentId: 'junk-doc', contentHash: 'irrelevant',
+      providerId: provider.id, model: provider.model, dimension: provider.dimension,
+      vector: new Float32Array(provider.dimension), createdAt: now, updatedAt: now,
+    });
+  }
+
+  const result = await hybridRetrieve({ textStore, mode: 'hybrid', question: 'coating hardness invalid-index fallback regression test content', limit: 8, embeddingProvider: provider, embeddingStore });
+  assert.equal(result.diagnostics.invalidVectorCount, 200);
+  assert.notEqual(result.diagnostics.fallbackReason, null, 'an all-invalid semantic index must never silently look like "no results" - a reason must always be reported');
+  assert.equal(result.mode, 'lexical', 'hybrid must fall back to FTS when the semantic index is entirely unusable');
+  assert.ok(result.chunks.length >= 1, 'the lexical fallback must still return the real, genuinely indexed chunk');
+
+  const overview = computeEmbeddingOverview(embeddingStore, provider, textStore.chunkCount(), chunkConsistencyChecker(textStore));
+  assert.equal(overview.stats.embeddedChunks, 0, 'coverage must be computed from USABLE embeddings, not raw stored rows - all 200 rows are invalid zero vectors');
+  assert.notEqual(overview.status, 'ready');
+  assert.notEqual(overview.status, 'partial');
+  assert.ok(overview.stats.embeddedChunks <= overview.stats.totalChunks, 'coverage must never exceed 100%');
+}));
+
+test('hybridRetrieve (Codex regression) in semantic-only mode also reports an explicit, non-null fallbackReason - never a bare, unexplained empty result - when the semantic index exists but is entirely invalid', () => fixture(async (root, indexFile, textStore, embeddingStore) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a');
+  await runTextIndex({ root, indexFile, store: textStore, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating hardness semantic-only invalid-index regression test content.' }] }) });
+  const provider = new DeterministicEmbeddingProvider({ dimension: 8 });
+  const now = new Date().toISOString();
+  for (let i = 0; i < 50; i++) {
+    embeddingStore.upsert({ chunkId: `zero-${i}`, documentId: 'junk-doc', contentHash: 'irrelevant', providerId: provider.id, model: provider.model, dimension: provider.dimension, vector: new Float32Array(provider.dimension), createdAt: now, updatedAt: now });
+  }
+  const result = await hybridRetrieve({ textStore, mode: 'semantic', question: 'coating hardness semantic-only invalid-index regression test content', limit: 8, embeddingProvider: provider, embeddingStore });
+  assert.notEqual(result.diagnostics.fallbackReason, null);
+  assert.equal(result.diagnostics.invalidVectorCount, 50);
 }));

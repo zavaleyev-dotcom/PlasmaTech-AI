@@ -1,4 +1,5 @@
 import type { EmbeddingStore } from './store';
+import { cosineSimilarity, topK, validateEmbeddingVector } from './vector';
 
 export interface SemanticHit {
   chunkId: string;
@@ -7,12 +8,19 @@ export interface SemanticHit {
   score: number;
 }
 
-function cosineSimilarity(a: Float32Array, b: Float32Array): number {
-  let dot = 0; let normA = 0; let normB = 0;
-  const length = Math.min(a.length, b.length);
-  for (let i = 0; i < length; i++) { dot += a[i] * b[i]; normA += a[i] * a[i]; normB += b[i] * b[i]; }
-  const denom = Math.sqrt(normA) * Math.sqrt(normB);
-  return denom === 0 ? 0 : dot / denom;
+export interface SemanticSearchOutcome {
+  hits: SemanticHit[];
+  /** How many stored rows (for this provider/model/dimension) had a valid vector AND
+   *  passed the consistency check, before top-K selection - i.e. how many were genuinely
+   *  eligible to be ranked at all. */
+  candidateCount: number;
+  /** Stored rows whose vector failed validateEmbeddingVector (corrupted BLOB, wrong
+   *  dimension, NaN/Infinity element, zero norm, ...) - never ranked, never candidates. */
+  invalidVectorCount: number;
+  /** Stored rows with a structurally valid vector that were excluded by the consistency
+   *  check (orphaned chunk, mismatched document link, or a stale content hash) - see
+   *  hybrid.ts's chunkConsistencyChecker. 0 when no consistency check was supplied. */
+  inconsistentCount: number;
 }
 
 /**
@@ -24,13 +32,39 @@ function cosineSimilarity(a: Float32Array, b: Float32Array): number {
  * benchmark script): it is the only vector-search approach that runs identically on the
  * target machines (Mac Intel and Windows) without compiling or shipping a native module or
  * running a separate server. Its cost is O(n) per query in both time and the memory needed
- * to hold all matching vectors at once; the benchmark measures this at the tested sample
- * size rather than assuming it scales to the full library.
+ * to hold all matching vectors at once; the benchmark measures this at increasing sample
+ * sizes rather than assuming it scales to the full library.
+ *
+ * Every candidate is validated (validateEmbeddingVector) and, if `isConsistent` is supplied,
+ * checked against it BEFORE ranking/top-K selection - a corrupted, orphaned, or stale row
+ * can never occupy a top-K slot and push out a genuinely valid result; top-K only ever
+ * chooses among rows that already passed both checks. Ranking itself uses a bounded
+ * top-K selection (vector.ts's topK) instead of sorting every candidate, since only the
+ * best `limit` are ever needed.
  */
-export function semanticSearch(store: EmbeddingStore, providerId: string, model: string, dimension: number, queryVector: Float32Array, limit: number): SemanticHit[] {
-  if (queryVector.length !== dimension) throw new Error('Query vector dimension does not match the embedding index dimension.');
-  const vectors = store.currentVectors(providerId, model, dimension);
-  const scored = vectors.map(v => ({ chunkId: v.chunkId, documentId: v.documentId, score: cosineSimilarity(queryVector, v.vector) }));
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, limit);
+export function semanticSearch(
+  store: EmbeddingStore, providerId: string, model: string, dimension: number,
+  queryVector: Float32Array, limit: number,
+  isConsistent?: (chunkId: string, documentId: string, contentHash: string) => boolean,
+): SemanticSearchOutcome {
+  const queryValidation = validateEmbeddingVector(queryVector, dimension);
+  if (!queryValidation.valid) throw new Error(`Invalid query vector (${queryValidation.reason}).`);
+
+  const rows = store.currentRows(providerId, model, dimension);
+  let invalidVectorCount = 0;
+  let inconsistentCount = 0;
+  const candidates: { chunkId: string; documentId: string; vector: Float32Array; norm: number }[] = [];
+  for (const row of rows) {
+    const validation = validateEmbeddingVector(row.vector, dimension);
+    if (!validation.valid) { invalidVectorCount++; continue; }
+    if (isConsistent && !isConsistent(row.chunkId, row.documentId, row.contentHash)) { inconsistentCount++; continue; }
+    candidates.push({ chunkId: row.chunkId, documentId: row.documentId, vector: validation.vector, norm: validation.norm });
+  }
+
+  const scored = candidates.map(c => ({
+    chunkId: c.chunkId, documentId: c.documentId,
+    score: cosineSimilarity(queryValidation.vector, queryValidation.norm, c.vector, c.norm),
+  }));
+  const hits = topK(scored, limit, (a, b) => b.score - a.score);
+  return { hits, candidateCount: candidates.length, invalidVectorCount, inconsistentCount };
 }

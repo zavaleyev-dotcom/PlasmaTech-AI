@@ -55,17 +55,32 @@ export type EmbeddingIndexStatus =
   | 'rebuilding'      // an indexing run is currently in progress
   | 'error';         // the embedding store could not be opened/read
 
+/** Every counter below has one unambiguous meaning and `processed` is always exactly
+ *  `reused + embedded + failed + skipped` once a run finishes (each chunk in `total`
+ *  contributes to exactly one of the four, exactly once - see runEmbeddingIndex, index.ts).
+ *  `orphanRemoved` is separate from all four: it counts embeddings deleted because their
+ *  chunk no longer exists at all, which only ever happens after a full (non-sample) pass. */
 export interface EmbeddingProgress {
   running: boolean;
   cancelled: boolean;
   stopRequested: boolean;
   pid: number;
+  /** Chunks discovered so far in this run (grows as the rowid cursor advances). */
   total: number;
+  /** Always reused + embedded + failed + skipped; never exceeds `total`. */
   processed: number;
+  /** Had a matching, valid, still-consistent stored embedding - not re-embedded. */
   reused: number;
+  /** A new (or corrected/re-embedded) vector was validated and durably stored. */
   embedded: number;
+  /** The provider call failed, the returned vector failed validation, or the storage
+   *  write failed for this chunk - see runEmbeddingIndex's three separately-handled steps. */
   failed: number;
+  /** The chunk's text was empty/whitespace-only - intentionally never sent to the provider. */
   skipped: number;
+  /** Embeddings deleted because their chunk no longer exists in the text index at all
+   *  (distinct from a chunk that still exists but changed - that is `embedded`, not this). */
+  orphanRemoved: number;
   startedAt: string;
   finishedAt: string | null;
   error: string | null;

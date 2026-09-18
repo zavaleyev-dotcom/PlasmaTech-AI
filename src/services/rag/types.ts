@@ -116,10 +116,21 @@ export interface RetrievalDiagnostics {
   totalMs: number;
   embeddingProviderId: string | null;
   embeddingModel: string | null;
-  /** Fraction (0..1) of the library's current chunks that have a current embedding, or null
-   *  if unknown/not configured. */
+  /** Fraction (0..1) of the library's current chunks that have a current, VALID, and
+   *  chunk/document/hash-consistent embedding (see EmbeddingStore.validCount), or null if
+   *  unknown/not configured. Orphaned, corrupted, and mismatched rows are never counted as
+   *  covered, even if they are still physically present in the embedding store. */
   embeddingCoverage: number | null;
+  /** Store-wide rows that do not currently count as valid coverage (wrong provider/model/
+   *  dimension, a corrupted vector, or an orphaned/mismatched/stale chunk relationship). */
   staleEmbeddingsCount: number | null;
+  /** Stored rows for this provider/model/dimension whose vector failed validateEmbeddingVector
+   *  during THIS query - excluded before ranking, never a candidate. */
+  invalidVectorCount: number;
+  /** Stored rows with a structurally valid vector that were excluded during THIS query
+   *  because their chunk no longer exists, points at a different document, or their content
+   *  hash no longer matches the chunk's current text (orphaned/mismatched/stale). */
+  inconsistentCandidateCount: number;
   fallbackReason: string | null;
 }
 

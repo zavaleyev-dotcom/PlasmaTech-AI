@@ -1,4 +1,5 @@
 import 'server-only';
+import { validateEmbeddingVector } from '../vector';
 import type { EmbeddingProvider } from '../types';
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -60,11 +61,40 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     catch { throw new Error('OpenAI вернул некорректный ответ.'); }
     const data = body.data;
     if (!Array.isArray(data) || data.length !== input.length) throw new Error('OpenAI вернул неполный результат.');
-    return data.map(item => {
-      const embedding = asRecord(item).embedding;
+    // Never assume data[i] corresponds to input[i] by array position alone - match by the
+    // "index" field the API actually returns, which is the only reliable correspondence
+    // (the API does not guarantee response order matches request order).
+    const byIndex = new Map<number, unknown>();
+    for (const item of data) {
+      const record = asRecord(item);
+      const index = record.index;
+      if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= input.length) {
+        throw new Error('OpenAI вернул некорректный индекс вектора.');
+      }
+      if (byIndex.has(index)) throw new Error('OpenAI вернул повторяющийся индекс вектора.');
+      byIndex.set(index, record.embedding);
+    }
+    if (byIndex.size !== input.length) throw new Error('OpenAI вернул неполный результат.');
+    const vectors: Float32Array[] = [];
+    for (let i = 0; i < input.length; i++) {
+      const embedding = byIndex.get(i);
       if (!Array.isArray(embedding)) throw new Error('OpenAI вернул некорректный вектор.');
-      return Float32Array.from(embedding as number[]);
-    });
+      // Validate every RAW element before Float32Array.from() ever runs: that constructor
+      // coerces via Number(...), so a string like "2" silently becomes 2 and null silently
+      // becomes 0 - exactly the kind of malformed upstream payload that must be rejected
+      // outright, never coerced into a number that then looks legitimate.
+      for (const value of embedding) {
+        if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error('OpenAI вернул вектор с недопустимым элементом.');
+      }
+      const vector = Float32Array.from(embedding as number[]);
+      // Re-validate AFTER the float64->float32 conversion: a magnitude beyond float32 range
+      // (e.g. 1e40) becomes Infinity, and one far below it (e.g. 1e-50) rounds to 0 - both
+      // are only detectable once the value has actually been narrowed to a Float32Array.
+      const validation = validateEmbeddingVector(vector, this.dimension);
+      if (!validation.valid) throw new Error('OpenAI вернул математически некорректный вектор.');
+      vectors.push(validation.vector);
+    }
+    return vectors;
   }
 
   async embedDocuments(texts: readonly string[]): Promise<Float32Array[]> {

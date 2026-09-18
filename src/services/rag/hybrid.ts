@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { EmbeddingOverview, EmbeddingProvider } from '@/services/embeddings/types';
 import type { EmbeddingStore } from '@/services/embeddings/store';
 import { semanticSearch } from '@/services/embeddings/search';
@@ -6,6 +7,28 @@ import { hydrateChunk } from './hydrate';
 import { retrieveChunks } from './retrieve';
 import { RRF_K, RRF_LEXICAL_WEIGHT, RRF_SEMANTIC_WEIGHT } from './types';
 import type { FusedChunk, RetrievalDiagnostics, RetrievalMode, RetrievedChunk } from './types';
+
+const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
+
+/** Builds the chunk/document/hash consistency check semanticSearch (embeddings/search.ts)
+ *  applies to every candidate BEFORE ranking/top-K, so an orphaned, mismatched, or stale
+ *  row can never occupy a slot a genuinely valid result should have had. A row is
+ *  consistent only if: its chunkId still exists in the text index; that chunk's actual
+ *  documentId matches the one recorded on the embedding (never trust the embedding's own
+ *  documentId field in isolation); and the chunk's CURRENT text still hashes to the
+ *  embedding's stored contentHash (otherwise the chunk's content changed since it was
+ *  embedded and the vector is stale). Hydration (hydrateChunk) is only ever called for
+ *  chunks that already passed this check, so it always resolves metadata through the
+ *  chunk's real, current chunk->document relationship - never through an independent,
+ *  unverified documentId carried on the embedding record. */
+export function chunkConsistencyChecker(textStore: TextStore): (chunkId: string, documentId: string, contentHash: string) => boolean {
+  return (chunkId, documentId, contentHash) => {
+    const row = textStore.db.prepare('SELECT documentId, text FROM chunks WHERE id=?').get(chunkId) as { documentId: string; text: string } | undefined;
+    if (!row) return false; // orphan: the chunk no longer exists at all
+    if (row.documentId !== documentId) return false; // the embedding's document link does not match reality
+    return sha256(row.text) === contentHash; // stale if the chunk's text has changed since embedding
+  };
+}
 
 /** Rank-based fusion (weighted Reciprocal Rank Fusion), never a direct sum of BM25 and
  *  cosine similarity - those live on incomparable scales. Each list contributes
@@ -56,17 +79,32 @@ export interface HybridRetrieveResult {
   diagnostics: RetrievalDiagnostics;
 }
 
-async function computeSemanticChunks(textStore: TextStore, provider: EmbeddingProvider, store: EmbeddingStore, question: string, limit: number): Promise<{ chunks: RetrievedChunk[]; ms: number; error: string | null }> {
+interface SemanticStep {
+  chunks: RetrievedChunk[]; ms: number; error: string | null;
+  invalidVectorCount: number; inconsistentCandidateCount: number;
+}
+
+async function computeSemanticChunks(textStore: TextStore, provider: EmbeddingProvider, store: EmbeddingStore, question: string, limit: number): Promise<SemanticStep> {
   const start = Date.now();
   try {
     const queryVector = await provider.embedQuery(question);
-    const hits = semanticSearch(store, provider.id, provider.model, provider.dimension, queryVector, limit);
-    const chunks = hits.map(hit => hydrateChunk(textStore, hit.chunkId, hit.documentId, hit.score)).filter((c): c is RetrievedChunk => c !== null);
-    return { chunks, ms: Date.now() - start, error: null };
+    const outcome = semanticSearch(store, provider.id, provider.model, provider.dimension, queryVector, limit, chunkConsistencyChecker(textStore));
+    const chunks = outcome.hits.map(hit => hydrateChunk(textStore, hit.chunkId, hit.documentId, hit.score)).filter((c): c is RetrievedChunk => c !== null);
+    // The index is not merely empty of matches - it exists (rows matched provider/model/
+    // dimension) but every single one failed validation or the consistency check, so there
+    // was nothing left to even rank. This must never surface as a silent, unexplained
+    // hits=0: it is reported the same way as any other semantic failure (fallbackReason set,
+    // safe degradation to lexical for 'hybrid'/'semantic' below), never left implicit.
+    const unusable = outcome.candidateCount === 0 && (outcome.invalidVectorCount > 0 || outcome.inconsistentCount > 0);
+    return {
+      chunks, ms: Date.now() - start,
+      error: unusable ? 'Семантический индекс повреждён, устарел или полностью рассинхронизирован с текстовым индексом: валидных векторов не найдено.' : null,
+      invalidVectorCount: outcome.invalidVectorCount, inconsistentCandidateCount: outcome.inconsistentCount,
+    };
   } catch (error) {
     // Never let a raw provider/store error (which may embed a URL, key, or stack detail)
     console.error('[rag] semantic search failed', error);
-    return { chunks: [], ms: Date.now() - start, error: 'Семантический поиск временно недоступен.' };
+    return { chunks: [], ms: Date.now() - start, error: 'Семантический поиск временно недоступен.', invalidVectorCount: 0, inconsistentCandidateCount: 0 };
   }
 }
 
@@ -80,7 +118,9 @@ async function computeSemanticChunks(textStore: TextStore, provider: EmbeddingPr
  * search call itself fails, 'hybrid' and 'semantic' both fall back to lexical-only rather
  * than throwing or returning nothing - diagnostics.fallbackReason always explains why, and
  * the result's `mode` reports what was ACTUALLY used, never silently pretending the request
- * was honored as asked.
+ * was honored as asked. Orphaned/corrupted/stale embedding rows are excluded from ranking
+ * entirely (see chunkConsistencyChecker/semanticSearch) - a query returning fewer semantic
+ * candidates than requested because some were excluded is not itself a fallback condition.
  *
  * Returns FusedChunk[], which is structurally a RetrievedChunk[] (buildContext/citations in
  * context.ts/citations.ts accept it completely unchanged) - swapping in this retrieval layer
@@ -111,9 +151,12 @@ export async function hybridRetrieve(options: HybridRetrieveOptions): Promise<Hy
 
   let semanticChunks: RetrievedChunk[] = [];
   let semanticMs = 0;
+  let invalidVectorCount = 0;
+  let inconsistentCandidateCount = 0;
   if ((requestedMode === 'semantic' || requestedMode === 'hybrid') && semanticReady && embeddingProvider && embeddingStore) {
     const result = await computeSemanticChunks(textStore, embeddingProvider, embeddingStore, question, limit);
     semanticChunks = result.chunks; semanticMs = result.ms;
+    invalidVectorCount = result.invalidVectorCount; inconsistentCandidateCount = result.inconsistentCandidateCount;
     if (result.error) {
       fallbackReason = result.error;
       if (requestedMode === 'semantic' && !lexicalChunks.length) {
@@ -137,6 +180,7 @@ export async function hybridRetrieve(options: HybridRetrieveOptions): Promise<Hy
     embeddingProviderId: embeddingProvider?.id ?? null, embeddingModel: embeddingProvider?.model ?? null,
     embeddingCoverage: embeddingOverview && embeddingOverview.stats.totalChunks > 0 ? embeddingOverview.stats.embeddedChunks / embeddingOverview.stats.totalChunks : null,
     staleEmbeddingsCount: embeddingOverview?.stats.staleChunks ?? null,
+    invalidVectorCount, inconsistentCandidateCount,
     fallbackReason,
   };
   return { mode: effectiveMode, chunks: fused, diagnostics };
