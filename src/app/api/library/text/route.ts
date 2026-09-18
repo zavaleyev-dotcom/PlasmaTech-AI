@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { openTextStore, startTextIndex } from '@/services/library-text';
-import { isLocalLibraryRequest } from '@/services/library-text/http';
+import { isLocalLibraryRequest, isLocalJsonLibraryRequest } from '@/services/library-text/http';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 const json = (value: unknown, status = 200) => NextResponse.json(value, { status, headers: { 'Cache-Control': 'no-store' } });
@@ -16,12 +16,12 @@ export async function GET(request: Request) {
   finally { store?.close(); }
 }
 export async function POST(request: Request) {
-  if (!isLocalLibraryRequest(request) || !request.headers.get('content-type')?.startsWith('application/json')) return json({ error: 'Недопустимый локальный запрос.' }, 403);
+  if (!isLocalJsonLibraryRequest(request)) return json({ error: 'Недопустимый локальный запрос.' }, 403);
   try { await startTextIndex(); return json({ started: true }, 202); }
   catch { return json({ error: 'Не удалось запустить индексирование.' }, 503); }
 }
 export async function DELETE(request: Request) {
-  if (!isLocalLibraryRequest(request) || !request.headers.get('content-type')?.startsWith('application/json')) return json({ error: 'Недопустимый локальный запрос.' }, 403);
+  if (!isLocalJsonLibraryRequest(request)) return json({ error: 'Недопустимый локальный запрос.' }, 403);
   let store;
   try { store = await openTextStore(); store.requestStop(); return json({ stopping: true }); }
   catch { return json({ error: 'Не удалось остановить индексирование.' }, 503); }

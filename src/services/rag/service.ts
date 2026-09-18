@@ -9,6 +9,8 @@ import { validateAnswerGrounding } from './citations';
 import { getAnswerProvider } from './providers';
 import type { AnswerProvider } from './providers/types';
 import { chunkConsistencyChecker, hybridRetrieve } from './hybrid';
+import type { VectorCache } from '@/services/embeddings/cache';
+import type { ConsistencyCache } from './consistency-cache';
 import type { AnswerResult, FusedChunk, GroundingRejectionReason, RagContext, RagDiagnostics, RagResult, RagStatus, RetrievalDiagnostics, RetrievalMode, RetrievedChunk } from './types';
 import { parseAskInput } from './validation';
 
@@ -29,6 +31,18 @@ export interface AskLibraryOptions {
   /** Injected for tests; defaults to the real on-disk store via openEmbeddingStore(). Only
    *  ever called when an embeddingProvider is configured. */
   openEmbeddingStore?: () => Promise<EmbeddingStore>;
+  /** STRICTLY OPT-IN, purely a performance layer (see hybrid.ts's HybridRetrieveOptions doc
+   *  comment): undefined means no cache at all - askLibrary never defaults this to the
+   *  shared process-wide singleton itself, precisely so every existing/future test that
+   *  doesn't mention caching keeps working unmodified. The real production entry point (the
+   *  Next.js route handler, src/app/api/library/ask/route.ts) is the one place that
+   *  explicitly passes the shared singleton - that is the only place caching actually
+   *  activates for real users. */
+  vectorCache?: VectorCache;
+  /** Same strictly opt-in contract as vectorCache above, for the chunk-consistency cache
+   *  (rag/consistency-cache.ts). Used both for the embedding-overview computation and for
+   *  every semantic query in this request. */
+  consistencyCache?: ConsistencyCache;
 }
 
 /** Fixed, generic message for every answer-provider failure. Deliberately never built from
@@ -103,7 +117,8 @@ async function openEmbeddingContext(options: AskLibraryOptions, textStore: TextS
   try {
     const open = options.openEmbeddingStore ?? openEmbeddingStore;
     const store = await open();
-    const overview = computeEmbeddingOverview(store, provider, textStore.chunkCount(), chunkConsistencyChecker(textStore));
+    const isConsistent = options.consistencyCache?.checker(textStore) ?? chunkConsistencyChecker(textStore);
+    const overview = computeEmbeddingOverview(store, provider, textStore.chunkCount(), isConsistent);
     return { provider, store, overview };
   } catch (error) {
     console.error('[rag] failed to open embedding store', error);
@@ -131,6 +146,7 @@ export async function askLibrary(input: unknown, options: AskLibraryOptions = {}
       const result = await hybridRetrieve({
         textStore: store, mode: requestedMode, question, limit,
         embeddingProvider: embedding.provider, embeddingStore: embedding.store, embeddingOverview: embedding.overview,
+        vectorCache: options.vectorCache, consistencyCache: options.consistencyCache,
       });
       chunks = result.chunks; retrieval = result.diagnostics;
     } catch (error) {

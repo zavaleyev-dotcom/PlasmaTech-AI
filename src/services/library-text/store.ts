@@ -5,6 +5,10 @@ import path from 'node:path';
 import type { ContentHit, TextChunk, TextDocument, TextOverview, TextProgress, TextStats } from './types';
 export class TextStore {
   readonly db: DatabaseSync;
+  /** The library identity this store was opened for - also used as part of a process-local
+   *  consistency cache's key (see rag/consistency-cache.ts) so a cache can never be reused
+   *  across two different libraries. */
+  readonly rootId: string;
   constructor(file: string, rootId: string) {
     if (file !== ':memory:') mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(file);
@@ -20,8 +24,24 @@ export class TextStore {
     const root = this.db.prepare('SELECT value FROM settings WHERE key=?').get('root');
     if (root && root.value !== rootId) { this.close(); throw new Error('Текстовый индекс относится к другой библиотеке.'); }
     this.db.prepare('INSERT OR IGNORE INTO settings VALUES (?,?)').run('root', rootId);
+    this.rootId = rootId;
   }
   close() { this.db.close(); }
+
+  /** Durable (persisted in `settings`, not merely in-memory) counter bumped by every write
+   *  to the `chunks` table (replace()/remove()) - the ONLY thing a process-local consistency
+   *  cache (rag/consistency-cache.ts) trusts to decide "is my snapshot of chunk text still
+   *  current". Durable rather than in-memory because indexing typically runs as a separate
+   *  process (scripts/index-library-text.ts) from whatever serves API requests. Reads as 0
+   *  if never written (a brand-new store and a cache that never loaded both start there). */
+  dataVersion(): number {
+    const row = this.db.prepare("SELECT value FROM settings WHERE key='dataVersion'").get() as { value: string } | undefined;
+    return row ? Number(row.value) : 0;
+  }
+
+  private bumpDataVersion() {
+    this.db.prepare("INSERT INTO settings (key,value) VALUES ('dataVersion','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)").run();
+  }
   progress(): TextProgress | null {
     const row = this.db.prepare("SELECT value FROM settings WHERE key='progress'").get();
     return row ? JSON.parse(row.value as string) : null;
@@ -53,10 +73,18 @@ export class TextStore {
       this.db.prepare('INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(doc.id, doc.relativePath, JSON.stringify(metadata), text, pageCount, characterCount, wordCount, status, error, extractedAt, modifiedDate, fileSize, hash, version, Buffer.byteLength(text));
       const statement = this.db.prepare('INSERT INTO chunks VALUES (?,?,?,?,?,?,?)');
       for (const chunk of chunks) statement.run(chunk.id, chunk.documentId, chunk.ordinal, chunk.pageStart, chunk.pageEnd, chunk.text, chunk.wordCount);
+      this.bumpDataVersion();
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
-  remove(id: string) { this.db.prepare('DELETE FROM documents WHERE id=?').run(id); }
+  remove(id: string) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('DELETE FROM documents WHERE id=?').run(id); // cascades to chunks
+      this.bumpDataVersion();
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
   chunkCount() { return Number(this.db.prepare('SELECT count(*) n FROM chunks').get()!.n); }
   stats(): TextStats {
     const row = this.db.prepare("SELECT count(*) documents, coalesce(sum(status='success'),0) successful, coalesce(sum(status='error'),0) errors, coalesce(sum(status IN ('skipped','no_text')),0) skipped, coalesce(sum(characterCount),0) characters, coalesce(sum(wordCount),0) words, coalesce(sum(textBytes),0) textBytes FROM documents").get()!;

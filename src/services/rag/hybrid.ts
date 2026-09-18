@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import type { EmbeddingOverview, EmbeddingProvider } from '@/services/embeddings/types';
 import type { EmbeddingStore } from '@/services/embeddings/store';
 import { semanticSearch } from '@/services/embeddings/search';
+import type { VectorCache } from '@/services/embeddings/cache';
+import type { ConsistencyCache } from './consistency-cache';
 import type { TextStore } from '@/services/library-text/store';
 import { hydrateChunk } from './hydrate';
 import { retrieveChunks } from './retrieve';
@@ -22,8 +24,16 @@ const sha256 = (value: string) => createHash('sha256').update(value).digest('hex
  *  chunk's real, current chunk->document relationship - never through an independent,
  *  unverified documentId carried on the embedding record. */
 export function chunkConsistencyChecker(textStore: TextStore): (chunkId: string, documentId: string, contentHash: string) => boolean {
+  // Prepared ONCE, outside the returned closure: this checker is called once per candidate
+  // row on every single semantic query (up to one call per stored embedding), so re-preparing
+  // the same SQL statement on every call - re-parsing/re-compiling identical SQL thousands of
+  // times per query - was, empirically, by far the single largest cost in the whole semantic
+  // retrieval path at 10k-scale (roughly 5x the cost of decoding all 10k vectors from SQLite
+  // combined). Reusing one prepared statement changes nothing about WHAT is checked, only
+  // how cheaply the same check can be repeated.
+  const statement = textStore.db.prepare('SELECT documentId, text FROM chunks WHERE id=?');
   return (chunkId, documentId, contentHash) => {
-    const row = textStore.db.prepare('SELECT documentId, text FROM chunks WHERE id=?').get(chunkId) as { documentId: string; text: string } | undefined;
+    const row = statement.get(chunkId) as { documentId: string; text: string } | undefined;
     if (!row) return false; // orphan: the chunk no longer exists at all
     if (row.documentId !== documentId) return false; // the embedding's document link does not match reality
     return sha256(row.text) === contentHash; // stale if the chunk's text has changed since embedding
@@ -71,6 +81,23 @@ export interface HybridRetrieveOptions {
   /** Precomputed once by the caller (askLibrary/service.ts) so diagnostics can report
    *  embedding coverage/staleness without an extra query per retrieval call. */
   embeddingOverview?: EmbeddingOverview | null;
+  /** Optional process-local vector cache (embeddings/cache.ts) - purely a performance layer,
+   *  never a behavioral dependency, and STRICTLY OPT-IN: omitted/undefined means no cache at
+   *  all, byte-for-byte the same behavior as before caching existed (this is what every
+   *  existing test does, and must keep doing safely). Real app usage (rag/service.ts) passes
+   *  the shared per-process singleton explicitly, since a fresh EmbeddingStore is opened per
+   *  request but the cache must persist across requests within the same server process to
+   *  pay off. A cache keyed only by rootId/provider/model/dimension (not by store-instance
+   *  identity, since that would defeat cross-request reuse against the same underlying file)
+   *  would otherwise silently collide between two DIFFERENT stores that happen to share a
+   *  rootId string (e.g. two independent tests both using "test") - opt-in avoids that by
+   *  construction: tests that want a cache always construct their OWN fresh instance. */
+  vectorCache?: VectorCache;
+  /** Optional process-local consistency cache (rag/consistency-cache.ts) - same strictly
+   *  opt-in contract as vectorCache above (see that doc comment): undefined means the
+   *  direct, uncached chunkConsistencyChecker(textStore) is used every time, byte-for-byte
+   *  the same as before this cache existed. */
+  consistencyCache?: ConsistencyCache;
 }
 
 export interface HybridRetrieveResult {
@@ -84,11 +111,12 @@ interface SemanticStep {
   invalidVectorCount: number; inconsistentCandidateCount: number;
 }
 
-async function computeSemanticChunks(textStore: TextStore, provider: EmbeddingProvider, store: EmbeddingStore, question: string, limit: number): Promise<SemanticStep> {
+async function computeSemanticChunks(textStore: TextStore, provider: EmbeddingProvider, store: EmbeddingStore, question: string, limit: number, cache: VectorCache | undefined, consistencyCache: ConsistencyCache | undefined): Promise<SemanticStep> {
   const start = Date.now();
   try {
+    const isConsistent = consistencyCache?.checker(textStore) ?? chunkConsistencyChecker(textStore);
     const queryVector = await provider.embedQuery(question);
-    const outcome = semanticSearch(store, provider.id, provider.model, provider.dimension, queryVector, limit, chunkConsistencyChecker(textStore));
+    const outcome = semanticSearch(store, provider.id, provider.model, provider.dimension, queryVector, limit, isConsistent, cache);
     const chunks = outcome.hits.map(hit => hydrateChunk(textStore, hit.chunkId, hit.documentId, hit.score)).filter((c): c is RetrievedChunk => c !== null);
     // The index is not merely empty of matches - it exists (rows matched provider/model/
     // dimension) but every single one failed validation or the consistency check, so there
@@ -127,7 +155,7 @@ async function computeSemanticChunks(textStore: TextStore, provider: EmbeddingPr
  * never touches context building, grounding validation, or the answer-provider abstraction.
  */
 export async function hybridRetrieve(options: HybridRetrieveOptions): Promise<HybridRetrieveResult> {
-  const { textStore, mode: requestedMode, question, limit, embeddingProvider, embeddingStore, embeddingOverview } = options;
+  const { textStore, mode: requestedMode, question, limit, embeddingProvider, embeddingStore, embeddingOverview, vectorCache, consistencyCache } = options;
   const totalStart = Date.now();
 
   const semanticReady = !!(embeddingProvider && embeddingStore
@@ -154,7 +182,7 @@ export async function hybridRetrieve(options: HybridRetrieveOptions): Promise<Hy
   let invalidVectorCount = 0;
   let inconsistentCandidateCount = 0;
   if ((requestedMode === 'semantic' || requestedMode === 'hybrid') && semanticReady && embeddingProvider && embeddingStore) {
-    const result = await computeSemanticChunks(textStore, embeddingProvider, embeddingStore, question, limit);
+    const result = await computeSemanticChunks(textStore, embeddingProvider, embeddingStore, question, limit, vectorCache, consistencyCache);
     semanticChunks = result.chunks; semanticMs = result.ms;
     invalidVectorCount = result.invalidVectorCount; inconsistentCandidateCount = result.inconsistentCandidateCount;
     if (result.error) {
@@ -174,6 +202,8 @@ export async function hybridRetrieve(options: HybridRetrieveOptions): Promise<Hy
   else fused = fuseRankings(lexicalChunks, semanticChunks, limit);
 
   const totalMs = Date.now() - totalStart;
+  const cacheDiag = vectorCache?.diagnostics() ?? null;
+  const consistencyCacheDiag = consistencyCache?.diagnostics() ?? null;
   const diagnostics: RetrievalDiagnostics = {
     mode: effectiveMode, ftsCandidates: lexicalChunks.length, semanticCandidates: semanticChunks.length,
     fusedCandidates: fused.length, ftsMs, semanticMs, totalMs,
@@ -182,6 +212,18 @@ export async function hybridRetrieve(options: HybridRetrieveOptions): Promise<Hy
     staleEmbeddingsCount: embeddingOverview?.stats.staleChunks ?? null,
     invalidVectorCount, inconsistentCandidateCount,
     fallbackReason,
+    cacheStatus: cacheDiag?.status ?? null,
+    cacheEntries: cacheDiag?.entries ?? null,
+    cacheApproxMiB: cacheDiag?.approxMiB ?? null,
+    cacheLoadMs: cacheDiag?.loadMs ?? null,
+    cacheHitCount: cacheDiag?.hitCount ?? null,
+    cacheFallbackCount: cacheDiag?.fallbackCount ?? null,
+    cacheInvalidationReason: cacheDiag?.invalidationReason ?? null,
+    consistencyCacheStatus: consistencyCacheDiag?.status ?? null,
+    consistencyCacheEntries: consistencyCacheDiag?.entries ?? null,
+    consistencyCacheLoadMs: consistencyCacheDiag?.loadMs ?? null,
+    consistencyCacheHitCount: consistencyCacheDiag?.hitCount ?? null,
+    consistencyCacheFallbackCount: consistencyCacheDiag?.fallbackCount ?? null,
   };
   return { mode: effectiveMode, chunks: fused, diagnostics };
 }

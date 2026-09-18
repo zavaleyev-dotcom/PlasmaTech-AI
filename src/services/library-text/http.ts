@@ -1,1 +1,1 @@
-export { isLocalLibraryRequest } from '../local-library/http';
+export { isLocalLibraryRequest, isLocalJsonLibraryRequest } from '../local-library/http';

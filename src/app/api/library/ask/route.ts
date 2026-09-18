@@ -1,13 +1,15 @@
 import { NextResponse } from 'next/server';
-import { isLocalLibraryRequest } from '@/services/local-library/http';
+import { isLocalJsonLibraryRequest } from '@/services/local-library/http';
 import { askLibrary } from '@/services/rag/service';
+import { processVectorCache } from '@/services/embeddings/cache';
+import { processConsistencyCache } from '@/services/rag/consistency-cache';
 import { RagValidationError } from '@/services/rag/types';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 const json = (value: unknown, status = 200) => NextResponse.json(value, { status, headers: { 'Cache-Control': 'no-store' } });
 const MAX_BODY_BYTES = 8192;
 export async function POST(request: Request) {
-  if (!isLocalLibraryRequest(request) || !request.headers.get('content-type')?.startsWith('application/json')) return json({ error: 'Недопустимый локальный запрос.' }, 403);
+  if (!isLocalJsonLibraryRequest(request)) return json({ error: 'Недопустимый локальный запрос.' }, 403);
   try {
     // Bound reads even when Content-Length is missing or dishonest.
     const reader = request.body?.getReader();
@@ -24,7 +26,12 @@ export async function POST(request: Request) {
     let input: unknown;
     try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
     catch { return json({ error: 'Неверный формат запроса.' }, 400); }
-    return json(await askLibrary(input));
+    // The shared, process-wide caches (embeddings/cache.ts, rag/consistency-cache.ts) are
+    // only ever wired in HERE - the one real production entry point, never inside
+    // askLibrary's own defaults - so that every test calling askLibrary() directly (which
+    // never mentions caching) keeps behaving exactly as it did before these caches existed.
+    // Purely a performance layer either way.
+    return json(await askLibrary(input, { vectorCache: processVectorCache, consistencyCache: processConsistencyCache }));
   } catch (error) {
     if (error instanceof RagValidationError) return json({ error: error.message }, 400);
     return json({ error: 'Не удалось обработать вопрос.' }, 503);

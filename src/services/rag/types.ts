@@ -132,6 +132,25 @@ export interface RetrievalDiagnostics {
    *  hash no longer matches the chunk's current text (orphaned/mismatched/stale). */
   inconsistentCandidateCount: number;
   fallbackReason: string | null;
+  /** Diagnostics for the optional process-local vector cache (embeddings/cache.ts) - purely
+   *  informational: null whenever no cache was used for this call (disabled, or explicitly
+   *  opted out via `vectorCache: null`). Never shown to an end user - dev-diagnostics only,
+   *  gated the same way as the rest of RetrievalDiagnostics (see rag/service.ts). */
+  cacheStatus: 'cold' | 'loading' | 'ready' | 'stale' | 'invalid' | 'disabled' | null;
+  cacheEntries: number | null;
+  cacheApproxMiB: number | null;
+  cacheLoadMs: number | null;
+  cacheHitCount: number | null;
+  cacheFallbackCount: number | null;
+  cacheInvalidationReason: string | null;
+  /** Diagnostics for the optional process-local chunk-consistency cache
+   *  (rag/consistency-cache.ts) - same never-shown-to-users, dev-diagnostics-only contract
+   *  as the vector-cache fields above. Null whenever no consistency cache was used. */
+  consistencyCacheStatus: 'cold' | 'loading' | 'ready' | 'stale' | 'invalid' | 'disabled' | null;
+  consistencyCacheEntries: number | null;
+  consistencyCacheLoadMs: number | null;
+  consistencyCacheHitCount: number | null;
+  consistencyCacheFallbackCount: number | null;
 }
 
 export interface RagDiagnostics {

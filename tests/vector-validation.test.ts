@@ -65,3 +65,15 @@ test('topK returns everything, sorted, when there are fewer items than k', () =>
   const items = [{ id: 'a', score: 1 }, { id: 'b', score: 3 }, { id: 'c', score: 2 }];
   assert.deepEqual(topK(items, 10, (a, b) => b.score - a.score).map(i => i.id), ['b', 'c', 'a']);
 });
+
+test('topK breaks ties deterministically (stable: first-encountered tied item stays first) and is reproducible across repeated calls on the same input', () => {
+  const items = Array.from({ length: 200 }, (_, i) => ({ id: i, score: i % 5 === 0 ? 1 : Math.sin(i * 3.1) }));
+  const first = topK(items, 20, (a, b) => b.score - a.score);
+  const second = topK(items, 20, (a, b) => b.score - a.score);
+  assert.deepEqual(first.map(i => i.id), second.map(i => i.id), 'repeated calls on identical input must produce an identical order');
+  // A stable full sort (Array.prototype.sort is stable since ES2019) is the reference for
+  // "deterministic tie-break": ties (score===1, several ids) must appear in the SAME
+  // relative order as their original array position, exactly like a stable full sort would.
+  const stableFullSort = [...items].sort((a, b) => b.score - a.score).slice(0, 20);
+  assert.deepEqual(first.map(i => i.id), stableFullSort.map(i => i.id));
+});

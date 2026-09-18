@@ -39,6 +39,10 @@ export interface EmbeddingRow {
  *  the same way library-text's TextStore already does. */
 export class EmbeddingStore {
   readonly db: DatabaseSync;
+  /** The library identity this store was opened for - also used as part of an in-memory
+   *  vector cache's key (see embeddings/cache.ts) so a cache can never be reused across two
+   *  different libraries even if they happened to share a provider/model/dimension. */
+  readonly rootId: string;
 
   constructor(file: string, rootId: string) {
     if (file !== ':memory:') mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -55,6 +59,24 @@ export class EmbeddingStore {
     const root = this.db.prepare('SELECT value FROM settings WHERE key=?').get('root');
     if (root && root.value !== rootId) { this.close(); throw new Error('Индекс эмбеддингов относится к другой библиотеке.'); }
     this.db.prepare('INSERT OR IGNORE INTO settings VALUES (?,?)').run('root', rootId);
+    this.rootId = rootId;
+  }
+
+  /** A durable (persisted in the store's own `settings` table, not merely in-memory) counter
+   *  bumped by every write (upsertBatch/remove). This is the ONLY thing an in-memory vector
+   *  cache (embeddings/cache.ts) trusts to decide "is my loaded snapshot still current" -
+   *  durable rather than per-instance in-memory because a fresh EmbeddingStore instance is
+   *  opened per request (see rag/service.ts) while indexing itself typically runs as a
+   *  separate process (scripts/index-embeddings.ts) - an in-memory-only counter would never
+   *  observe writes made by that other process. Absent entirely (never written yet) reads
+   *  as 0, so a brand-new store and a cache that has never loaded anything both start there. */
+  dataVersion(): number {
+    const row = this.db.prepare("SELECT value FROM settings WHERE key='dataVersion'").get() as { value: string } | undefined;
+    return row ? Number(row.value) : 0;
+  }
+
+  private bumpDataVersion() {
+    this.db.prepare("INSERT INTO settings (key,value) VALUES ('dataVersion','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)").run();
   }
 
   close() { this.db.close(); }
@@ -120,13 +142,21 @@ export class EmbeddingStore {
         statement.run(record.chunkId, record.documentId, record.contentHash, record.providerId, record.model, record.dimension,
           toBuffer(record.vector), record.createdAt, record.updatedAt);
       }
+      this.bumpDataVersion();
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
   upsert(record: EmbeddingRecord) { this.upsertBatch([record]); }
 
-  remove(chunkId: string) { this.db.prepare('DELETE FROM embeddings WHERE chunkId=?').run(chunkId); }
+  remove(chunkId: string) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('DELETE FROM embeddings WHERE chunkId=?').run(chunkId);
+      this.bumpDataVersion();
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
 
   /** Every chunkId currently stored - used by the indexer to find orphans (embeddings for
    *  chunks that no longer exist in the text index) without loading any vectors. */
