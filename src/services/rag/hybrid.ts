@@ -170,10 +170,12 @@ export async function hybridRetrieve(options: HybridRetrieveOptions): Promise<Hy
 
   let lexicalChunks: RetrievedChunk[] = [];
   let ftsMs = 0;
+  let ftsRankingDegraded = false;
   const needsLexicalNow = requestedMode === 'lexical' || requestedMode === 'hybrid' || fallbackReason !== null;
   if (needsLexicalNow) {
     const start = Date.now();
-    lexicalChunks = retrieveChunks(textStore, question, limit);
+    const lexicalResult = retrieveChunks(textStore, question, limit);
+    lexicalChunks = lexicalResult.chunks; ftsRankingDegraded = lexicalResult.rankingDegraded;
     ftsMs = Date.now() - start;
   }
 
@@ -189,7 +191,8 @@ export async function hybridRetrieve(options: HybridRetrieveOptions): Promise<Hy
       fallbackReason = result.error;
       if (requestedMode === 'semantic' && !lexicalChunks.length) {
         const start = Date.now();
-        lexicalChunks = retrieveChunks(textStore, question, limit);
+        const lexicalResult = retrieveChunks(textStore, question, limit);
+        lexicalChunks = lexicalResult.chunks; ftsRankingDegraded ||= lexicalResult.rankingDegraded;
         ftsMs += Date.now() - start;
       }
     }
@@ -211,7 +214,7 @@ export async function hybridRetrieve(options: HybridRetrieveOptions): Promise<Hy
     embeddingCoverage: embeddingOverview && embeddingOverview.stats.totalChunks > 0 ? embeddingOverview.stats.embeddedChunks / embeddingOverview.stats.totalChunks : null,
     staleEmbeddingsCount: embeddingOverview?.stats.staleChunks ?? null,
     invalidVectorCount, inconsistentCandidateCount,
-    fallbackReason,
+    fallbackReason, ftsRankingDegraded,
     cacheStatus: cacheDiag?.status ?? null,
     cacheEntries: cacheDiag?.entries ?? null,
     cacheApproxMiB: cacheDiag?.approxMiB ?? null,

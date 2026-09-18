@@ -132,6 +132,11 @@ export interface RetrievalDiagnostics {
    *  hash no longer matches the chunk's current text (orphaned/mismatched/stale). */
   inconsistentCandidateCount: number;
   fallbackReason: string | null;
+  /** True if the lexical/FTS query (the strict search, or any per-term fallback search) had
+   *  to rank by natural order instead of bm25 relevance because it was too broad (see
+   *  TextStore.search()'s own `rankingDegraded` and the safe candidate-budget guard it
+   *  applies) - never hidden: these results are not fully relevance-ranked. */
+  ftsRankingDegraded: boolean;
   /** Diagnostics for the optional process-local vector cache (embeddings/cache.ts) - purely
    *  informational: null whenever no cache was used for this call (disabled, or explicitly
    *  opted out via `vectorCache: null`). Never shown to an end user - dev-diagnostics only,

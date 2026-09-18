@@ -178,7 +178,7 @@ test('hybridRetrieve in semantic mode returns a result via vectors even when lex
   // with only one vector in the store, brute-force search returns it regardless of how
   // (ir)relevant its cosine similarity to the query actually is.
   const stopwordOnlyQuestion = 'что и как это';
-  assert.equal(retrieveChunks(textStore, stopwordOnlyQuestion, 8).length, 0, 'sanity check: lexical really finds nothing for this question');
+  assert.equal(retrieveChunks(textStore, stopwordOnlyQuestion, 8).chunks.length, 0, 'sanity check: lexical really finds nothing for this question');
   const result = await hybridRetrieve({ textStore, mode: 'semantic', question: stopwordOnlyQuestion, limit: 8, embeddingProvider: provider, embeddingStore });
   assert.equal(result.mode, 'semantic');
   assert.equal(result.chunks.length, 1);

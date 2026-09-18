@@ -3,6 +3,23 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import path from 'node:path';
 import type { ContentHit, TextChunk, TextDocument, TextOverview, TextProgress, TextStats } from './types';
+
+/** Above this SUM of individual per-term corpus-wide match counts, search() ranks by natural
+ *  rowid order instead of bm25() (see search() below for the measured reasoning). Chosen from
+ *  real-corpus measurement (docs/architecture.md): a single term with ~23-25k matches (out of
+ *  ~55k total chunks) still ranks in well under 150ms, while combinations summing to ~40k+
+ *  measured in the 300ms+ range - this sits safely below that. */
+const RANK_CANDIDATE_BUDGET = 25_000;
+
+/** Hard ceiling on how deep search() will ever attempt bm25-ranked pagination - beyond this,
+ *  ranking degrades to rowid order the same way an overly broad query does (see
+ *  `rankingDegraded` above). Reaching row `offset+20` in bm25 order costs roughly
+ *  proportional to `offset` regardless of query selectivity (bm25 order is not index-backed),
+ *  measured in the multiple-second range at offset=10000 on this corpus; RAG retrieval
+ *  (rag/retrieve.ts) never requests anything beyond offset=0, so this only ever bounds the
+ *  standalone lexical-search API/UI's own pagination depth. */
+const MAX_SEARCH_OFFSET = 500;
+
 export class TextStore {
   readonly db: DatabaseSync;
   /** The library identity this store was opened for - also used as part of a process-local
@@ -95,15 +112,54 @@ export class TextStore {
     if (progress?.running) { try { process.kill(progress.pid, 0); } catch { progress.running = false; progress.error = 'Предыдущий процесс остановлен. Запустите обновление для продолжения.'; } }
     return { progress, stats: this.stats(), errors: this.db.prepare("SELECT relativePath,json_extract(metadata,'$.filename') filename,status,error FROM documents WHERE status!='success' ORDER BY relativePath").all() as unknown as TextOverview['errors'] };
   }
-  search(query: string, offset = 0) {
+  search(query: string, offset = 0): { total: number; hits: ContentHit[]; rankingDegraded: boolean } {
     if (query.length > 500) throw new Error('Запрос длиннее 500 символов.');
     // Quotes express phrases; all other input is literal Unicode words, never FTS syntax.
-    const terms = [...query.matchAll(/"([^"]+)"|([\p{L}\p{N}_-]+)/gu)].map(m => m[1] ?? m[2]).filter(t => /[\p{L}\p{N}]/u.test(t));
-    if (!terms.length || terms.length > 30) return { hits: [] as ContentHit[], total: 0 };
+    const rawTerms = [...query.matchAll(/"([^"]+)"|([\p{L}\p{N}_-]+)/gu)].map(m => m[1] ?? m[2]).filter(t => /[\p{L}\p{N}]/u.test(t));
+    // A repeated token (accidental or pasted noise) adds nothing to selectivity but doubles
+    // the work of finding/scoring it - drop duplicates before building the query at all.
+    const terms = [...new Set(rawTerms)];
+    if (!terms.length || terms.length > 30) return { hits: [], total: 0, rankingDegraded: false };
     const match = terms.map(t => `"${t.replaceAll('"', '""')}"`).join(' AND ');
     const total = Number(this.db.prepare('SELECT count(*) n FROM content_search WHERE content_search MATCH ?').get(match)!.n);
-    const rows = this.db.prepare("SELECT d.metadata, c.id chunkId,c.pageStart,c.pageEnd,snippet(content_search,0,'','',' … ',48) snippet FROM content_search JOIN chunks c ON c.rowid=content_search.rowid JOIN documents d ON d.id=c.documentId WHERE content_search MATCH ? ORDER BY bm25(content_search),c.id LIMIT 20 OFFSET ?").all(match, Math.max(0, Math.min(10000, offset)));
+
+    // Safe candidate budget: measured against the real corpus, bm25()/snippet() ranking cost
+    // is proportional to the SUM of every individual term's OWN corpus-wide match count, not
+    // to the final AND-intersection size ("total" above) - a query ANDing several
+    // individually common terms can cost 10x+ more to RANK than its actual (possibly tiny)
+    // result set would suggest, because SQLite FTS5 has no efficient top-k-by-bm25
+    // short-circuit: it must score every row any involved term matches before it can sort.
+    // Each term's own frequency is itself cheap to check (a plain count(*) MATCH, a few ms
+    // even for the single most frequent term in the whole corpus) - reusing `total` when
+    // there is only one term avoids a redundant second query for the overwhelmingly common
+    // single-keyword case.
+    let candidateBudget = terms.length === 1 ? total : 0;
+    if (terms.length > 1) {
+      for (const term of terms) {
+        const single = `"${term.replaceAll('"', '""')}"`;
+        candidateBudget += Number(this.db.prepare('SELECT count(*) n FROM content_search WHERE content_search MATCH ?').get(single)!.n);
+        if (candidateBudget > RANK_CANDIDATE_BUDGET) break;
+      }
+    }
+    const cappedOffset = Math.max(0, Math.min(MAX_SEARCH_OFFSET, offset));
+    // Deep pagination has the SAME root cause even for an otherwise cheap term: bm25 order is
+    // not index-backed, so reaching row `offset+20` in ranked order still costs roughly
+    // proportional to `offset` regardless of how selective the query itself is (measured:
+    // the same single moderately-common term went from ~100ms at offset=0 to multiple
+    // seconds at offset=10000). A shallower cap (below) already bounds the worst case; this
+    // flag additionally prefers the fast fallback once still-deep pagination meets a
+    // non-trivial candidate set, rather than assuming a small `total` always stays cheap.
+    const deepOffset = cappedOffset > 0 && total > 1000;
+    const rankingDegraded = candidateBudget > RANK_CANDIDATE_BUDGET || deepOffset;
+
+    // Degraded path: natural rowid order instead of bm25 - proven, by measurement, to stay in
+    // the low single-digit milliseconds regardless of how many rows match (no bm25/snippet
+    // ranking cost scales with candidate count in this ordering), at the cost of NOT
+    // returning true relevance-ranked results. Never hidden: callers get `rankingDegraded`
+    // explicit in the result rather than a silently-reordered "top" result.
+    const orderBy = rankingDegraded ? 'content_search.rowid' : 'bm25(content_search), c.id';
+    const rows = this.db.prepare(`SELECT d.metadata, c.id chunkId,c.pageStart,c.pageEnd,snippet(content_search,0,'','',' … ',48) snippet FROM content_search JOIN chunks c ON c.rowid=content_search.rowid JOIN documents d ON d.id=c.documentId WHERE content_search MATCH ? ORDER BY ${orderBy} LIMIT 20 OFFSET ?`).all(match, cappedOffset);
     const hits = rows.map(({ metadata, ...row }) => ({ ...JSON.parse(metadata as string), ...row })) as ContentHit[];
-    return { total, hits };
+    return { total, hits, rankingDegraded };
   }
 }

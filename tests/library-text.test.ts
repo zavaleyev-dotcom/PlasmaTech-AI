@@ -82,6 +82,74 @@ test('lexical search handles phrases, Cyrillic, punctuation and untrusted search
   for (const q of ['"', '*', 'x OR 1=1', "';DROP TABLE documents;--"]) assert.doesNotThrow(() => store.search(q));
   assert.equal(store.stats().documents, 1); assert.throws(() => store.search('x'.repeat(501)));
 }));
+
+// ---------- FTS latency guards: candidate-budget cap, degraded-ranking diagnostics, offset cap ----------
+
+/** Bulk-inserts `count` synthetic chunks directly (bypassing the normal PDF pipeline, like
+ *  other tests in this file already do for speed) under one real document, each containing
+ *  `commonWord` plus a unique filler word - so a MATCH for `commonWord` genuinely returns
+ *  `count` candidates through the real FTS5 index and its triggers, without needing to
+ *  extract/chunk actual PDF text for that many rows. */
+function bulkInsertChunks(store: TextStore, documentId: string, count: number, commonWord: string) {
+  store.db.exec('BEGIN IMMEDIATE');
+  try {
+    const statement = store.db.prepare('INSERT INTO chunks (id, documentId, ordinal, pageStart, pageEnd, text, wordCount) VALUES (?,?,?,?,?,?,?)');
+    for (let i = 0; i < count; i++) {
+      statement.run(`bulk-${i}`, documentId, i + 1000, 1, 1, `${commonWord} filler unique${i} content for synthetic chunk ${i}.`, 6);
+    }
+    store.db.exec('COMMIT');
+  } catch (error) { store.db.exec('ROLLBACK'); throw error; }
+}
+
+test('search() applies a safe candidate-budget cap: an overly broad term ranks by natural order (rankingDegraded=true) instead of paying full bm25 cost, while a normal/rare term keeps real relevance ranking', () => fixture(async (root, indexFile, store) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'A single real document establishing one real documentId for the bulk-insert fixture.' }] }) });
+  const documentId = store.records()[0].id;
+  bulkInsertChunks(store, documentId, 26_000, 'universalword');
+  store.db.prepare("INSERT INTO chunks (id, documentId, ordinal, pageStart, pageEnd, text, wordCount) VALUES ('rare-chunk',?,99999,1,1,'A genuinely rare distinctivetermxyz appears only here.',7)").run(documentId);
+
+  const broad = store.search('universalword');
+  assert.equal(broad.total, 26_000);
+  assert.equal(broad.rankingDegraded, true, 'a term matching most of the corpus must degrade to fast, natural-order ranking');
+  assert.equal(broad.hits.length, 20, 'the degraded path must still return a full, deterministic page of results');
+
+  const rare = store.search('distinctivetermxyz');
+  assert.equal(rare.total, 1);
+  assert.equal(rare.rankingDegraded, false, 'a genuinely rare term must keep real bm25 relevance ranking');
+  assert.equal(rare.hits[0].chunkId, 'rare-chunk');
+}));
+
+test('search() deduplicates repeated tokens in a query - "coating coating coating" behaves identically to "coating"', () => fixture(async (root, indexFile, store) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a'); await writeFile(path.join(root, 'b.pdf'), 'b');
+  await runTextIndex({ root, indexFile, store, extract: async (data: Buffer) => ({ pageCount: 1, pages: [{ page: 1, text: `Coating hardness deposition study document ${data.toString()}.` }] }) });
+  const single = store.search('coating');
+  const repeated = store.search('coating coating coating coating coating');
+  assert.equal(repeated.total, single.total);
+  assert.deepEqual(repeated.hits.map(h => h.chunkId), single.hits.map(h => h.chunkId));
+}));
+
+test('search() caps pagination depth: a large offset on a non-trivial result set degrades to fast, natural-order ranking rather than paying unbounded bm25-sort cost', () => fixture(async (root, indexFile, store) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'A single real document establishing one real documentId for the bulk-insert fixture.' }] }) });
+  const documentId = store.records()[0].id;
+  bulkInsertChunks(store, documentId, 2000, 'paginationword');
+
+  const shallow = store.search('paginationword', 0);
+  assert.equal(shallow.rankingDegraded, false, 'offset=0 on a moderate result set must keep real ranking');
+
+  const deep = store.search('paginationword', 100_000); // way beyond MAX_SEARCH_OFFSET
+  assert.equal(deep.rankingDegraded, true, 'a deep offset on a non-trivial result set must degrade rather than pay unbounded pagination cost');
+  assert.ok(deep.hits.length <= 20);
+}));
+
+test('search() rejects malformed/adversarial FTS syntax safely regardless of the new candidate-budget logic (no crash, no injection)', () => fixture(async (root, indexFile, store) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating hardness malformed-syntax regression test.' }] }) });
+  for (const q of ['"', '*', 'x OR 1=1', "';DROP TABLE documents;--", '(((', '???', '!!!']) {
+    assert.doesNotThrow(() => store.search(q));
+  }
+  assert.equal(store.stats().documents, 1, 'no adversarial query may have damaged the index');
+}));
 test('cancellation preserves completed documents, allows resume and excludes aborted documents', () => fixture(async (root, indexFile, store) => {
   for (let i = 0; i < 4; i++) await writeFile(path.join(root, `${i}.pdf`), 'test');
   let calls = 0;
