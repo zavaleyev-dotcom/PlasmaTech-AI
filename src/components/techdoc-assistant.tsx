@@ -11,6 +11,7 @@ import {
   buildTechnologicalCard, buildRouteCard, buildInstructionView, buildBriefRecipe,
   type TechnicalProcessDocument, type ProcessStep, type StepType, type QualityCheck,
 } from '@/services/workspace/techdoc-assistant';
+import { DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, type DocumentType, type ExportFormat } from '@/services/workspace/techdoc-export-types';
 
 type ViewMode = 'instruction' | 'techcard' | 'routecard' | 'recipe';
 
@@ -124,6 +125,78 @@ function QualityCheckRow({ qc, onChange, onRemove }: { qc: QualityCheck; onChang
       </label>
     </div>
   </div>;
+}
+
+type ExportState = 'ready' | 'generating' | 'completed' | 'error';
+
+/** Parses the `filename*=UTF-8''...` (falling back to `filename="..."`) part of a
+ *  Content-Disposition header - the export API always sends one of these two forms. */
+function filenameFromContentDisposition(value: string | null, fallback: string): string {
+  if (!value) return fallback;
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(value);
+  if (star) { try { return decodeURIComponent(star[1]); } catch { /* fall through */ } }
+  const plain = /filename="([^"]+)"/i.exec(value);
+  return plain ? plain[1] : fallback;
+}
+
+function ExportBlock({ doc }: { doc: TechnicalProcessDocument }) {
+  const [documentType, setDocumentType] = useState<DocumentType>('instruction');
+  const [format, setFormat] = useState<ExportFormat>('docx');
+  const [state, setState] = useState<ExportState>('ready');
+  const [message, setMessage] = useState('');
+
+  async function generate() {
+    setState('generating');
+    setMessage('');
+    try {
+      const response = await fetch('/api/workspace/techdoc/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document: doc, documentType, format }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.error ?? 'Не удалось сформировать файл.');
+      }
+      const blob = await response.blob();
+      const filename = filenameFromContentDisposition(response.headers.get('Content-Disposition'), `document.${format}`);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setState('completed');
+      setMessage(`Файл сформирован: ${filename}`);
+    } catch (err) {
+      setState('error');
+      setMessage(err instanceof Error ? err.message : 'Не удалось сформировать файл.');
+    }
+  }
+
+  return <section className="content-card">
+    <h2>Экспорт документа</h2>
+    <p className="muted small">Файл формируется локально, на сервере приложения, из тех же данных, что и предпросмотр выше - без LLM и без внешних сервисов.</p>
+    <div className="content-grid mt-3">
+      <label className="text-sm">Вид документа
+        <select className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={documentType} onChange={e => setDocumentType(e.target.value as DocumentType)}>
+          {DOCUMENT_TYPES.map(t => <option key={t} value={t}>{DOCUMENT_TYPE_LABELS[t]}</option>)}
+        </select>
+      </label>
+      <label className="text-sm">Формат
+        <select className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={format} onChange={e => setFormat(e.target.value as ExportFormat)}>
+          {EXPORT_FORMATS.map(f => <option key={f} value={f}>{f.toUpperCase()}</option>)}
+        </select>
+      </label>
+    </div>
+    <button type="button" className="button primary mt-3" disabled={state === 'generating'} onClick={generate}>
+      {state === 'generating' ? 'Формирование…' : 'Сформировать файл'}
+    </button>
+    {state === 'completed' && <p role="status" className="mt-2">{message}</p>}
+    {state === 'error' && <p role="alert" className="mt-2">{message}</p>}
+  </section>;
 }
 
 export function TechDocAssistant() {
@@ -303,11 +376,13 @@ export function TechDocAssistant() {
           <tbody>{buildTechnologicalCard(doc).map(r => <tr key={r.number}><td>{r.number}</td><td>{r.operation}</td><td>{r.duration}</td><td>{r.temperature}</td><td>{r.pressure}</td><td>{r.gases}</td><td>{r.sourcePower}</td><td>{r.bias}</td><td>{r.control}</td><td>{r.note}</td></tr>)}</tbody>
         </table>}
         {view === 'routecard' && <table className="w-full text-sm">
-          <thead><tr><th>№</th><th>Этап</th><th>Оборудование</th><th>Вход</th><th>Операция</th><th>Выход</th><th>Контроль</th></tr></thead>
-          <tbody>{buildRouteCard(doc).map(r => <tr key={r.number}><td>{r.number}</td><td>{r.stage}</td><td>{r.equipment}</td><td>{r.input}</td><td>{r.operation}</td><td>{r.output}</td><td>{r.control}</td></tr>)}</tbody>
+          <thead><tr><th>№</th><th>Этап</th><th>Оборудование</th><th>Вход</th><th>Операция</th><th>Выход</th><th>Контроль</th><th>Примечание</th></tr></thead>
+          <tbody>{buildRouteCard(doc).map(r => <tr key={r.number}><td>{r.number}</td><td>{r.stage}</td><td>{r.equipment}</td><td>{r.input}</td><td>{r.operation}</td><td>{r.output}</td><td>{r.control}</td><td>{r.note}</td></tr>)}</tbody>
         </table>}
       </div>
     </section>
+
+    <ExportBlock doc={doc} />
 
     <p className="muted small">TechDoc Assistant не заменяет решение технолога: параметры процесса, нормативы и допуски определяет специалист. Не заданные значения отображаются как «не задано» и никогда не подставляются автоматически.</p>
   </div>;

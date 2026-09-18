@@ -11,9 +11,12 @@
     "test": "node --conditions=react-server --import tsx --test tests/*.test.ts"
   },
   "dependencies": {
+    "dejavu-fonts-ttf": "^2.37.3",
+    "docx": "^9.7.1",
     "lucide-react": "^0.468.0",
     "next": "^16.0.0",
     "pdf-parse": "^2.4.5",
+    "pdfkit": "^0.20.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "server-only": "^0.0.1"
@@ -21,6 +24,7 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4.0.0",
     "@types/node": "^22.0.0",
+    "@types/pdfkit": "^0.17.6",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "eslint": "^9.0.0",

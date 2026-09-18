@@ -483,7 +483,7 @@ export function buildTechnologicalCard(doc: TechnicalProcessDocument): TechCardR
 }
 
 export interface RouteCardRow {
-  number: number; stage: string; equipment: string; input: string; operation: string; output: string; control: string;
+  number: number; stage: string; equipment: string; input: string; operation: string; output: string; control: string; note: string;
 }
 
 export function buildRouteCard(doc: TechnicalProcessDocument): RouteCardRow[] {
@@ -496,6 +496,7 @@ export function buildRouteCard(doc: TechnicalProcessDocument): RouteCardRow[] {
     operation: step.enabled ? step.name : `${step.name} (отключён)`,
     output: index === doc.steps.length - 1 ? 'Готовое изделие' : `на операцию №${doc.steps[index + 1].order}`,
     control: step.type === 'quality_control' ? 'см. раздел «Контроль качества»' : fmtStr(step.acceptanceCriteria, true),
+    note: fmtStr(step.notes, true),
   }));
 }
 
@@ -540,8 +541,8 @@ export function buildExport(doc: TechnicalProcessDocument): TechDocExport {
         techCard.map(r => [String(r.number), r.operation, r.duration, r.temperature, r.pressure, r.gases, r.sourcePower, r.bias, r.control, r.note]),
       ),
       routeCard: toMarkdownTable(
-        ['№', 'Этап', 'Оборудование', 'Вход', 'Операция', 'Выход', 'Контроль'],
-        routeCard.map(r => [String(r.number), r.stage, r.equipment, r.input, r.operation, r.output, r.control]),
+        ['№', 'Этап', 'Оборудование', 'Вход', 'Операция', 'Выход', 'Контроль', 'Примечание'],
+        routeCard.map(r => [String(r.number), r.stage, r.equipment, r.input, r.operation, r.output, r.control, r.note]),
       ),
       briefRecipe: buildBriefRecipe(doc),
     },
