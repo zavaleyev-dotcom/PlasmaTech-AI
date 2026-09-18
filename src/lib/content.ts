@@ -4,7 +4,7 @@ export const navigation = [
   { href: '/expertise', label: 'Экспертиза', icon: 'layers' },
   { href: '/projects', label: 'Проекты', icon: 'folder' },
   { href: '/workspace', label: 'AI Workspace', icon: 'sparkles' },
-  { href: '/library', label: 'Библиотека', icon: 'book' },
+  { href: '/library', label: 'База знаний', icon: 'book' },
   { href: '/my-library', label: 'Моя библиотека', icon: 'book' },
   { href: '/contacts', label: 'Контакты', icon: 'mail' },
 ] as const;
