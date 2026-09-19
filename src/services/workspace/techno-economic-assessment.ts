@@ -258,7 +258,12 @@ export interface RoiResult { percent: number; formula: string }
 /** ROI % = (annual benefit − annual operating cost) / CAPEX × 100 - exactly the formula
  *  requested for this module. This is a simplified, transparent convention chosen for
  *  engineering comparison, NOT a substitute for a formal accounting/investment ROI - see the
- *  UI's disclaimer and "как рассчитано" block, which states this explicitly. */
+ *  UI's disclaimer and "как рассчитано" block, which states this explicitly.
+ *
+ *  `annualOperatingCost` must be an amount NOT already reflected in `annualBenefit` - callers
+ *  computing `annualBenefit` from this module's own `calculateEconomicEffect` (a current-vs-new
+ *  DELTA, i.e. already net of the new system's operating cost) must pass 0 here, or OPEX gets
+ *  subtracted twice (see runAssessment). */
 export function calculateRoi(annualBenefit: number, annualOperatingCost: number, capex: number): RoiResult {
   assertValid(annualOperatingCost, 'Годовые эксплуатационные затраты', { allowZero: true });
   const capexValue = assertValid(capex, 'CAPEX');
@@ -321,7 +326,17 @@ export function runAssessment(input: AssessmentInput): AssessmentResult {
       : input.economicEffect,
   );
   const payback = calculatePayback(capex.total, economicEffect.annualSavings);
-  const roi = calculateRoi(economicEffect.annualSavings, opex.annualTotal, capex.total);
+  // economicEffect.annualSavings is already a NET figure (current cost minus new cost /
+  // current unit cost minus new unit cost) - the new system's own OPEX is already reflected
+  // in it. Passing opex.annualTotal here too (Codex-reported regression) double-subtracted
+  // it, e.g. a 1,000,000 CAPEX / 500,000 annual-savings / 2-year-payback investment reported
+  // -70% ROI instead of the correct +50% - contradicting its own payback figure.
+  const roi = calculateRoi(economicEffect.annualSavings, 0, capex.total);
+  // calculateRoi's generic formula string would otherwise print "(savings − 0.00) / CAPEX",
+  // which reads as if OPEX were mistakenly zeroed out rather than intentionally not
+  // subtracted twice - state the real reason explicitly (presentation issue found alongside
+  // the ROI fix above).
+  roi.formula = `ROI % = годовой эффект / CAPEX × 100 (эффект уже чистый, доп. вычитание OPEX не требуется) = ${economicEffect.annualSavings.toFixed(2)} / ${capex.total.toFixed(2)} × 100`;
   const breakEven = input.breakEven ? calculateBreakEven(input.breakEven) : null;
   return { capex, opex, capacity, unitCost, economicEffect, payback, roi, breakEven };
 }

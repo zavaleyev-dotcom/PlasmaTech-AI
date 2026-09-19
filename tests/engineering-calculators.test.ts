@@ -73,3 +73,17 @@ test('calculateMeanFreePath: invalid pressure/temperature is rejected, never sil
   assert.throws(() => calculateMeanFreePath({ pressure: 1, pressureUnit: 'pa', temperatureC: -273.15, gas: 'argon' }), /[Тт]емперат/);
   assert.throws(() => calculateMeanFreePath({ pressure: 1, pressureUnit: 'pa', temperatureC: -300, gas: 'argon' }), /[Тт]емперат/);
 });
+
+// ---------- runtime validation of enum/union inputs (Codex regression) ----------
+
+test('solveDeposition (Codex regression): an unexpected unit/solveFor value is rejected with a clear message, never silently computed as NaN', () => {
+  assert.throws(() => solveDeposition({ solveFor: 'time', thickness: 1000, thicknessUnit: 'nm', rate: 10, rateUnit: 'bogus_unit' as never, timeUnit: 'min' }), /[Ее]диница скорости/);
+  assert.throws(() => solveDeposition({ solveFor: 'time', thickness: 1000, thicknessUnit: 'bogus_unit' as never, rate: 10, rateUnit: 'nm_per_min', timeUnit: 'min' }), /[Ее]диница толщины/);
+  assert.throws(() => solveDeposition({ solveFor: 'time', thickness: 1000, thicknessUnit: 'nm', rate: 10, rateUnit: 'nm_per_min', timeUnit: 'bogus_unit' as never }), /[Ее]диница времени/);
+  assert.throws(() => solveDeposition({ solveFor: 'bogus' as never, thickness: 1000, thicknessUnit: 'nm', rate: 10, rateUnit: 'nm_per_min', timeUnit: 'min' }), /[Ии]скомая величина/);
+});
+
+test('calculateMeanFreePath (Codex regression): an unexpected pressure unit or gas preset is rejected with a clear message, never silently computed as NaN', () => {
+  assert.throws(() => calculateMeanFreePath({ pressure: 1, pressureUnit: 'bogus' as never, temperatureC: 20, gas: 'argon' }), /[Ее]диница давления/);
+  assert.throws(() => calculateMeanFreePath({ pressure: 1, pressureUnit: 'pa', temperatureC: 20, gas: 'bogus_gas' as never }), /Газ/);
+});

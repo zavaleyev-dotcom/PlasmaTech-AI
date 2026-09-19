@@ -7,7 +7,7 @@ import {
   exportTechDoc, parseTechnicalProcessDocument, parseDocumentType, parseExportFormat,
 } from '../src/services/workspace/techdoc-export';
 import {
-  createDocumentFromPreset, updateStep, createQualityCheck, toggleStepEnabled,
+  createDocumentFromPreset, updateStep, createQualityCheck, toggleStepEnabled, addMagnetron, updateMagnetron, updateGasLine,
   buildTechnologicalCard, buildRouteCard, buildBriefRecipe,
   type TechnicalProcessDocument,
 } from '../src/services/workspace/techdoc-assistant';
@@ -87,6 +87,20 @@ test('blank optional fields render as "не задано" (prose) or "—" (tabl
   const allCells = cardVm.tables[0].rows.flat().join('|');
   assert.ok(allCells.includes('—'));
   assert.ok(!allCells.includes('undefined'));
+});
+
+test('instruction completeness (Codex regression): document-level sources (magnetrons/arc/ICP/ion) and the gas system actually appear in the exported instruction, not just per-step free text', () => {
+  let doc = sampleDoc();
+  doc = { ...doc, sources: addMagnetron(doc.sources) };
+  doc = { ...doc, sources: updateMagnetron(doc.sources, doc.sources.magnetrons[0].id, { material: 'Ti', powerW: 3000, mode: 'DC' }) };
+  doc = { ...doc, sources: { ...doc.sources, icpRf: { enabled: true, powerW: 500, biasV: -80 } } };
+  doc = { ...doc, gasSystem: updateGasLine(doc.gasSystem, doc.gasSystem[0].id, { gas: 'Ar', flow: 40, enabled: true }) };
+  const vm = buildDocumentViewModel(doc, 'instruction');
+  const allText = vm.sections.map(s => s.paragraphs.join(' ')).join('\n');
+  assert.ok(allText.includes('Ti'), 'magnetron material must appear in the exported instruction');
+  assert.ok(allText.includes('3000'), 'magnetron power must appear in the exported instruction');
+  assert.ok(allText.includes('-80'), 'ICP/RF bias must appear in the exported instruction');
+  assert.ok(allText.includes('Ar'), 'configured gas must appear in the exported instruction');
 });
 
 // ---------- quality checks ----------

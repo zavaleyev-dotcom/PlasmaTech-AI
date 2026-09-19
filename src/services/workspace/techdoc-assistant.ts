@@ -107,7 +107,9 @@ export function removeStep(steps: ProcessStep[], order: number): ProcessStep[] {
 export function duplicateStep(steps: ProcessStep[], order: number): ProcessStep[] {
   const index = steps.findIndex(step => step.order === order);
   if (index === -1) throw new Error(`Этап №${order} не найден.`);
-  const copy: ProcessStep = { ...steps[index], gasUsage: steps[index].gasUsage.map(g => ({ ...g })), calculatedFields: [] };
+  // Duplicating is itself an explicit user action, regardless of whether the ORIGINAL step
+  // came from a preset - the copy must never keep claiming origin: 'preset' (Codex regression).
+  const copy: ProcessStep = { ...steps[index], gasUsage: steps[index].gasUsage.map(g => ({ ...g })), origin: 'user', calculatedFields: [] };
   const next = [...steps.slice(0, index + 1), copy, ...steps.slice(index + 1)];
   return renumber(next);
 }
@@ -273,6 +275,21 @@ export interface Traceability { version: number; createdAt: string; updatedAt: s
 
 export function touchDocument(doc: TechnicalProcessDocument): TechnicalProcessDocument {
   return { ...doc, traceability: { ...doc.traceability, version: doc.traceability.version + 1, updatedAt: new Date().toISOString() } };
+}
+
+/** Attempts to restore a document previously saved to the browser's own localStorage (see the
+ *  "Экспорт документа" module's "Сохранить структуру" control) - returns `null` on anything
+ *  that doesn't parse as JSON or doesn't pass the same validation a fresh edit would, so a
+ *  corrupted/incompatible save never crashes the page or silently loads a half-broken document. */
+export function tryRestoreDocument(rawJson: string | null | undefined): TechnicalProcessDocument | null {
+  if (!rawJson) return null;
+  try {
+    const parsed = JSON.parse(rawJson) as TechnicalProcessDocument;
+    validateDocument(parsed);
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 // ---------- TechnicalProcessDocument (top level) ----------
@@ -444,6 +461,19 @@ export function buildInstructionView(doc: TechnicalProcessDocument): string {
     if (step.notes) lines.push(`- Примечание: ${step.notes}`);
   }
   lines.push('');
+  lines.push('## D. Источники');
+  const src = doc.sources;
+  if (src.magnetrons.length === 0) lines.push(`- Магнетроны: ${NOT_SET}`);
+  for (const m of src.magnetrons) lines.push(`- Магнетрон (${m.enabled ? 'включён' : 'отключён'}): материал — ${fmtStr(m.material)}, мощность — ${fmtNum(m.powerW, ' Вт')}, режим — ${fmtStr(m.mode)}`);
+  if (src.arcSources.length === 0) lines.push(`- Arc-источники: ${NOT_SET}`);
+  for (const a of src.arcSources) lines.push(`- Arc-источник (${a.enabled ? 'включён' : 'отключён'}${a.filtered ? ', фильтрованный' : ''}): материал катода — ${fmtStr(a.cathodeMaterial)}, ток дуги — ${fmtNum(a.arcCurrentA, ' А')}`);
+  lines.push(`- ICP/RF: ${src.icpRf.enabled ? `включён, мощность — ${fmtNum(src.icpRf.powerW, ' Вт')}, bias — ${fmtNum(src.icpRf.biasV, ' В')}` : 'не используется'}`);
+  lines.push(`- Ion source: ${src.ionSource.enabled ? `включён, напряжение — ${fmtNum(src.ionSource.voltageV, ' В')}, ток — ${fmtNum(src.ionSource.currentA, ' А')}, мощность — ${fmtNum(src.ionSource.powerW, ' Вт')}` : 'не используется'}`);
+  lines.push('');
+  lines.push('## E. Газовая система');
+  if (doc.gasSystem.length === 0) lines.push(NOT_SET);
+  for (const line of doc.gasSystem) lines.push(`- Линия (${line.enabled ? 'включена' : 'отключена'}): газ — ${fmtStr(line.gas)}, расход — ${fmtNum(line.flow, ` ${line.unit}`)}`);
+  lines.push('');
   lines.push('## F. Контроль качества');
   if (doc.qualityChecks.length === 0) lines.push(NOT_SET);
   for (const qc of doc.qualityChecks) {
@@ -486,15 +516,28 @@ export interface RouteCardRow {
   number: number; stage: string; equipment: string; input: string; operation: string; output: string; control: string; note: string;
 }
 
+/** A disabled step is skipped in the real process, so it must never be shown as the thing
+ *  handing input to (or receiving output from) its neighbors - input/output always reference
+ *  the nearest ENABLED step, not just the adjacent array index (Codex regression: previously a
+ *  disabled step still appeared as a legitimate hand-off point in the chain). */
 export function buildRouteCard(doc: TechnicalProcessDocument): RouteCardRow[] {
   const equipment = fmtStr(doc.general.equipment, true);
-  return doc.steps.map((step, index) => ({
+  const steps = doc.steps;
+  function nearestEnabledBefore(index: number): string {
+    for (let i = index - 1; i >= 0; i--) if (steps[i].enabled) return `результат операции №${steps[i].order}`;
+    return 'Исходное изделие';
+  }
+  function nearestEnabledAfter(index: number): string {
+    for (let i = index + 1; i < steps.length; i++) if (steps[i].enabled) return `на операцию №${steps[i].order}`;
+    return 'Готовое изделие';
+  }
+  return steps.map((step, index) => ({
     number: step.order,
     stage: STEP_TYPE_LABELS[step.type],
     equipment,
-    input: index === 0 ? 'Исходное изделие' : `результат операции №${doc.steps[index - 1].order}`,
+    input: nearestEnabledBefore(index),
     operation: step.enabled ? step.name : `${step.name} (отключён)`,
-    output: index === doc.steps.length - 1 ? 'Готовое изделие' : `на операцию №${doc.steps[index + 1].order}`,
+    output: nearestEnabledAfter(index),
     control: step.type === 'quality_control' ? 'см. раздел «Контроль качества»' : fmtStr(step.acceptanceCriteria, true),
     note: fmtStr(step.notes, true),
   }));

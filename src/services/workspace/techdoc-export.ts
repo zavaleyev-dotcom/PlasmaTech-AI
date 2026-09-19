@@ -118,6 +118,24 @@ function buildQualityChecks(doc: TechnicalProcessDocument): ViewModelQualityChec
   }));
 }
 
+/** Document-LEVEL source/gas-system configuration (magnetrons, arc sources, ICP/RF, ion
+ *  source, gas lines) - distinct from each step's own gasUsage/sourceConfiguration free text.
+ *  Previously this never appeared anywhere in the printed instruction (Codex regression: a
+ *  configured magnetron material/power or gas line was silently absent from the document). */
+function sourceAndGasSummary(doc: TechnicalProcessDocument): string[] {
+  const src = doc.sources;
+  const lines: string[] = [];
+  if (src.magnetrons.length === 0) lines.push(`Магнетроны: ${NOT_SET}`);
+  for (const m of src.magnetrons) lines.push(`Магнетрон (${m.enabled ? 'включён' : 'отключён'}): материал — ${show(m.material)}, мощность — ${showNum(m.powerW, ' Вт')}, режим — ${show(m.mode)}`);
+  if (src.arcSources.length === 0) lines.push(`Arc-источники: ${NOT_SET}`);
+  for (const a of src.arcSources) lines.push(`Arc-источник (${a.enabled ? 'включён' : 'отключён'}${a.filtered ? ', фильтрованный' : ''}): материал катода — ${show(a.cathodeMaterial)}, ток дуги — ${showNum(a.arcCurrentA, ' А')}`);
+  lines.push(`ICP/RF: ${src.icpRf.enabled ? `включён, мощность — ${showNum(src.icpRf.powerW, ' Вт')}, bias — ${showNum(src.icpRf.biasV, ' В')}` : 'не используется'}`);
+  lines.push(`Ion source: ${src.ionSource.enabled ? `включён, напряжение — ${showNum(src.ionSource.voltageV, ' В')}, ток — ${showNum(src.ionSource.currentA, ' А')}, мощность — ${showNum(src.ionSource.powerW, ' Вт')}` : 'не используется'}`);
+  if (doc.gasSystem.length === 0) lines.push(`Газовая система: ${NOT_SET}`);
+  for (const line of doc.gasSystem) lines.push(`Газовая линия (${line.enabled ? 'включена' : 'отключена'}): газ — ${show(line.gas)}, расход — ${showNum(line.flow, ` ${line.unit}`)}`);
+  return lines;
+}
+
 function stepParagraph(step: TechnicalProcessDocument['steps'][number]): string {
   const gases = step.gasUsage.length > 0
     ? step.gasUsage.map(g => `${g.gas || NOT_SET}${g.flowSccm !== undefined ? ` (${g.flowSccm} см³/мин)` : ''}`).join(', ')
@@ -196,7 +214,7 @@ export function buildDocumentViewModel(doc: TechnicalProcessDocument, documentTy
     { heading: '6. Последовательность операций', paragraphs: doc.steps.length > 0
       ? doc.steps.map(s => `№${s.order}. ${s.name}${!s.enabled ? ' (отключён)' : ''}`)
       : [NOT_SET] },
-    { heading: '7. Параметры процесса', paragraphs: doc.steps.length > 0 ? doc.steps.map(stepParagraph) : [NOT_SET] },
+    { heading: '7. Параметры процесса', paragraphs: [...sourceAndGasSummary(doc), ...(doc.steps.length > 0 ? doc.steps.map(stepParagraph) : [NOT_SET])] },
     { heading: '8. Контроль качества', paragraphs: qualityChecks.length > 0 ? [`Определено параметров контроля: ${qualityChecks.length}. См. таблицу ниже.`] : [NOT_SET] },
     { heading: '9. Требования безопасности', paragraphs: warnings.length > 0 ? warnings : [NOT_SET] },
   ];

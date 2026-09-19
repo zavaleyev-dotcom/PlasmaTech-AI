@@ -91,6 +91,16 @@ test('computeBreakdown / computeOverallScore: matches the documented, testable f
   assert.ok(Math.abs(overall - manual) < 1e-9);
 });
 
+test('computeBreakdown (Codex regression): a valid negative required temperature never produces a negative or out-of-range score', () => {
+  const req = baseRequirement({ purpose: 'plasma_cleaning', technology: 'icp_rf_plasma', maxProcessTempC: -20,
+    sources: { magnetronCount: 0, arcSourceCount: 0, icpRf: true, substrateBias: false, ionSource: false, combinedModeRequired: false } });
+  const config = EQUIPMENT_CONFIGURATIONS.find(c => c.id === 'plasma-cleaning-system')!;
+  const breakdown = computeBreakdown(req, config);
+  assert.ok(breakdown.temperature >= 0 && breakdown.temperature <= 100, `temperature score must stay within [0,100], got ${breakdown.temperature}`);
+  const overall = computeOverallScore(breakdown);
+  assert.ok(overall >= 0 && overall <= 100, `overall score must stay within [0,100], got ${overall}`);
+});
+
 test('computeBreakdown: gas score blends MFC availability with spare gas-line capacity, exactly as documented', () => {
   const req = baseRequirement({ gasSystem: { gasLines: 4, processGases: ['Ar'], mfcRequired: true } });
   const config = EQUIPMENT_CONFIGURATIONS.find(c => c.id === 'icp-rie-etcher')!;

@@ -1,8 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
-  createBlankDocument, createDocumentFromPreset, validateDocument, touchDocument,
+  createBlankDocument, createDocumentFromPreset, validateDocument, touchDocument, tryRestoreDocument,
   PROCESS_PRESETS, STEP_TYPES, STEP_TYPE_LABELS, QUALITY_CHECK_CATEGORIES,
   addStep, removeStep, duplicateStep, moveStep, toggleStepEnabled, updateStep, calculateStepDurationFromDeposition,
   addGasLine, removeGasLine, updateGasLine,
@@ -14,6 +14,10 @@ import {
 import { DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, type DocumentType, type ExportFormat } from '@/services/workspace/techdoc-export-types';
 
 type ViewMode = 'instruction' | 'techcard' | 'routecard' | 'recipe';
+
+/** This browser's own localStorage only - never sent to a server, never shared across devices
+ *  or browsers. See the honest wording in save()'s notice below. */
+const STORAGE_KEY = 'techdoc-assistant:document';
 
 function num(v: string): number | undefined { return v.trim() === '' ? undefined : Number(v); }
 
@@ -210,6 +214,18 @@ export function TechDocAssistant() {
     setDoc(prev => ({ ...prev, steps: updater(prev.steps) }));
   }
 
+  useEffect(() => {
+    const initial = setTimeout(() => {
+      try {
+        const restored = tryRestoreDocument(localStorage.getItem(STORAGE_KEY));
+        if (restored) setDoc(restored);
+      } catch {
+        // localStorage itself unavailable (e.g. private browsing) - keep the blank document
+      }
+    }, 0);
+    return () => clearTimeout(initial);
+  }, []);
+
   function save() {
     setSavedNotice('');
     try {
@@ -217,7 +233,12 @@ export function TechDocAssistant() {
       const touched = touchDocument(doc);
       setDoc(touched);
       setError('');
-      setSavedNotice(`Структура сохранена. Версия документа: ${touched.traceability.version}.`);
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(touched));
+        setSavedNotice(`Структура сохранена в этом браузере (версия ${touched.traceability.version}). Данные хранятся только локально (localStorage) - не передаются на сервер и недоступны на других устройствах или в другом браузере.`);
+      } catch {
+        setSavedNotice(`Версия документа обновлена (${touched.traceability.version}), но локальное сохранение в браузере сейчас недоступно (хранилище заблокировано или переполнено) - изменения сохранятся только до перезагрузки страницы.`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Не удалось сохранить структуру.');
     }

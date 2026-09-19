@@ -186,7 +186,30 @@ test('runAssessment: computes the whole pipeline consistently end to end for one
   assert.equal(result.unitCost.withoutDepreciation, result.opex.annualTotal / result.capacity.unitsPerYear);
   assert.equal(result.economicEffect.annualSavings, 2_600_000);
   assert.equal(result.payback.years, result.capex.total / result.economicEffect.annualSavings);
-  assert.equal(result.roi.percent, ((2_600_000 - 2_400_000) / 5_300_000) * 100);
+  // ROI must use the NET annual savings alone - annualSavings already reflects the new
+  // system's OPEX (it is current cost minus new cost), so OPEX must not be subtracted again.
+  assert.equal(result.roi.percent, (2_600_000 / 5_300_000) * 100);
+});
+
+test('runAssessment (Codex regression): ROI no longer double-subtracts OPEX - a 2-year-payback investment must show a positive, payback-consistent ROI, not a large negative one', () => {
+  const result = runAssessment({
+    capex: { equipment: 1_000_000 },
+    opex: { period: 'year', electricity: 1_200_000 },
+    capacity: { shiftsPerDay: 2, hoursPerShift: 8, workingDaysPerYear: 250, utilizationPercent: 80, cycleTimeMinutes: 20, unitsPerCycle: 1 },
+    economicEffect: { mode: 'total_external_cost', currentAnnualCost: 1_700_000, newAnnualCost: 1_200_000 },
+  });
+  assert.equal(result.economicEffect.annualSavings, 500_000);
+  assert.equal(result.opex.annualTotal, 1_200_000); // a large absolute OPEX, unrelated in scale to the savings delta
+  assert.equal(result.payback.years, 2);
+  // Before the fix this computed ((500_000 - 1_200_000) / 1_000_000) * 100 = -70%, contradicting
+  // a genuinely good (2-year payback) investment. ROI must instead be consistent with payback:
+  // a positive rate of return whose reciprocal-ish relationship matches years-to-payback.
+  assert.equal(result.roi.percent, 50);
+  assert.ok(result.roi.percent > 0, 'a profitable, fast-payback investment must never show a large negative ROI');
+  // presentation issue found alongside the fix: the "как рассчитано" text must not show a
+  // confusing "− 0.00" that reads as if OPEX were mistakenly zeroed out.
+  assert.ok(!result.roi.formula.includes('− 0.00') && !result.roi.formula.includes('- 0.00'), 'the ROI formula text must not display a misleading "minus 0.00 OPEX"');
+  assert.ok(result.roi.formula.includes('не требуется'), 'the formula text must explain why OPEX is not subtracted again');
 });
 
 test('scenario analysis (Codex regression): three manually-adjusted parameter sets (optimistic/base/conservative) produce three genuinely different, reproducible results from the SAME calculation engine - never random', () => {

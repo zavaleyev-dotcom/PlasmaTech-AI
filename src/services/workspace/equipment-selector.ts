@@ -319,7 +319,12 @@ function scoreGas(req: EquipmentRequirement, config: EquipmentConfiguration): nu
 }
 
 function scoreTemperature(req: EquipmentRequirement, config: EquipmentConfiguration): number {
-  return Math.min(100, (config.maxProcessTempC / req.maxProcessTempC) * 100);
+  // req.maxProcessTempC may legitimately be negative (validateRequirement allows -50..1500,
+  // e.g. a cryo/cold plasma-cleaning requirement) - dividing by a negative number flips the
+  // sign of the ratio, which previously produced scores like -1000% (Codex regression: a
+  // valid negative required temperature broke the whole overall percentage). A score is
+  // always a percentage match, so it must stay within [0, 100] regardless of the raw ratio.
+  return Math.max(0, Math.min(100, (config.maxProcessTempC / req.maxProcessTempC) * 100));
 }
 
 function scoreAutomation(req: EquipmentRequirement, config: EquipmentConfiguration): number {

@@ -6,7 +6,7 @@ import {
   createDefaultGasLines, addGasLine, updateGasLine,
   addMagnetron, updateMagnetron, addArcSource, updateArcSource,
   buildInstructionView, buildTechnologicalCard, buildRouteCard, buildBriefRecipe, buildExport,
-  createQualityCheck, touchDocument,
+  createQualityCheck, touchDocument, tryRestoreDocument,
   type TechnicalProcessDocument,
 } from '../src/services/workspace/techdoc-assistant';
 
@@ -165,6 +165,16 @@ test('recipe builder: add, reorder, duplicate, disable and remove steps keep ord
   assert.deepEqual(steps.map(s => s.order), [1, 2, 3]);
 });
 
+test('provenance after copy (Codex regression): duplicating a preset-sourced step marks the copy as user-created, never as still coming from the preset', () => {
+  const doc = createDocumentFromPreset('magnetron-pvd');
+  assert.equal(doc.steps[0].origin, 'preset');
+  const withCopy = duplicateStep(doc.steps, 1);
+  assert.equal(withCopy[0].origin, 'preset', 'the original step keeps its real preset origin');
+  assert.equal(withCopy[1].origin, 'user', 'the duplicate is an explicit user action and must say so');
+  // every OTHER step must be untouched by the copy
+  for (let i = 2; i < withCopy.length; i++) assert.equal(withCopy[i].origin, 'preset');
+});
+
 // ---------- document views ----------
 
 test('technological card output: shows "—" for every unset field, and real values for what was entered', () => {
@@ -193,13 +203,49 @@ test('route card output: input/output are positional references, equipment reuse
   assert.equal(qcRow.control, 'см. раздел «Контроль качества»');
 });
 
+test('route card (Codex regression): disabled steps are skipped in the input/output chain - neighbors reference the nearest ENABLED step, never a step that was actually skipped', () => {
+  const doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  const withDisabled = { ...doc, steps: toggleStepEnabled(doc.steps, 2) }; // disable step 2 ("Откачка")
+  const route = buildRouteCard(withDisabled);
+  assert.equal(route[0].output, 'на операцию №3', 'step 1 must hand off to the next ENABLED step (3), not the disabled step 2');
+  assert.equal(route[2].input, 'результат операции №1', 'step 3 must receive from the nearest ENABLED predecessor (1), not the disabled step 2');
+  assert.ok(route[1].operation.includes('отключён'));
+});
+
+test('route card (Codex regression): disabling the very first or very last step still resolves to "Исходное изделие" / "Готовое изделие" for their neighbors', () => {
+  const doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  let steps = toggleStepEnabled(doc.steps, 1);
+  steps = toggleStepEnabled(steps, steps.length);
+  const route = buildRouteCard({ ...doc, steps });
+  assert.equal(route[1].input, 'Исходное изделие');
+  assert.equal(route[route.length - 2].output, 'Готовое изделие');
+});
+
 test('instruction output: is built from the same document data, includes all sections, and never fabricates a value', () => {
   const doc = withName(createDocumentFromPreset('pecvd'));
   const instruction = buildInstructionView(doc);
   assert.ok(instruction.includes('Технологическая инструкция'));
-  assert.ok(instruction.includes('B. Исходные данные'));
+  // "includes all sections" must actually check every section (Codex: this used to check only
+  // one of five headers, so a section could silently disappear without failing the test).
+  for (const heading of ['A. Общие сведения', 'B. Исходные данные', 'C. Последовательность технологических операций', 'D. Источники', 'E. Газовая система', 'F. Контроль качества', 'G. Требования безопасности']) {
+    assert.ok(instruction.includes(heading), `missing section: ${heading}`);
+  }
   assert.ok(instruction.includes('не задано'));
   assert.ok(!instruction.includes('undefined'));
+});
+
+test('instruction completeness (Codex regression): document-level sources (magnetrons/arc/ICP/ion) and the gas system actually appear in the printed instruction, not just per-step free text', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, sources: addMagnetron(doc.sources) };
+  doc = { ...doc, sources: updateMagnetron(doc.sources, doc.sources.magnetrons[0].id, { material: 'Ti', powerW: 3000, mode: 'DC' }) };
+  doc = { ...doc, sources: { ...doc.sources, icpRf: { enabled: true, powerW: 500, biasV: -80 } } };
+  doc = { ...doc, gasSystem: updateGasLine(doc.gasSystem, doc.gasSystem[0].id, { gas: 'Ar', flow: 40, enabled: true }) };
+  const instruction = buildInstructionView(doc);
+  assert.ok(instruction.includes('Ti'), 'magnetron material must appear in the instruction');
+  assert.ok(instruction.includes('3000'), 'magnetron power must appear in the instruction');
+  assert.ok(instruction.includes('-80'), 'ICP/RF bias must appear in the instruction');
+  assert.ok(instruction.includes('Ar'), 'configured gas must appear in the instruction');
+  assert.ok(instruction.includes('40'), 'configured gas flow must appear in the instruction');
 });
 
 test('all four views (instruction, tech card, route card, brief recipe) are derived from one document with no manual duplication of literals', () => {
@@ -240,6 +286,23 @@ test('traceability: version increments and updatedAt changes on touch, while cre
   assert.equal(touched.traceability.version, doc.traceability.version + 1);
   assert.equal(touched.traceability.createdAt, doc.traceability.createdAt);
   assert.equal(touched.traceability.source, doc.traceability.source);
+});
+
+// ---------- honest local (browser) persistence (Codex regression) ----------
+
+test('tryRestoreDocument (Codex regression): restores a validly-saved document exactly, so a page reload after "Сохранить структуру" genuinely gets the saved data back', () => {
+  const doc = withName(createDocumentFromPreset('pecvd'));
+  const restored = tryRestoreDocument(JSON.stringify(doc));
+  assert.deepEqual(restored, doc);
+});
+
+test('tryRestoreDocument (Codex regression): never crashes or loads bad data - missing, malformed, non-JSON, or failing-validation input all fall back to null', () => {
+  assert.equal(tryRestoreDocument(null), null);
+  assert.equal(tryRestoreDocument(undefined), null);
+  assert.equal(tryRestoreDocument(''), null);
+  assert.equal(tryRestoreDocument('not json at all'), null);
+  assert.equal(tryRestoreDocument(JSON.stringify({ general: { processName: '' } })), null, 'a saved document that fails validateDocument (e.g. empty process name) must not be loaded silently');
+  assert.equal(tryRestoreDocument(JSON.stringify({ general: { processName: '   ' } })), null, 'whitespace-only process name must also be rejected, matching validateDocument');
 });
 
 // ---------- calculated values only after an explicit action ----------

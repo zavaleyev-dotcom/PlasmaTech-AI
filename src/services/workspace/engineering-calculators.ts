@@ -7,10 +7,14 @@
 
 // ---------- deposition thickness / rate / time (d = v * t) ----------
 
-export type ThicknessUnit = 'nm' | 'um';
-export type RateUnit = 'nm_per_min' | 'nm_per_s' | 'um_per_h';
-export type TimeUnit = 's' | 'min' | 'h';
-export type DepositionSolveFor = 'thickness' | 'rate' | 'time';
+export const THICKNESS_UNITS = ['nm', 'um'] as const;
+export type ThicknessUnit = typeof THICKNESS_UNITS[number];
+export const RATE_UNITS = ['nm_per_min', 'nm_per_s', 'um_per_h'] as const;
+export type RateUnit = typeof RATE_UNITS[number];
+export const TIME_UNITS = ['s', 'min', 'h'] as const;
+export type TimeUnit = typeof TIME_UNITS[number];
+export const DEPOSITION_SOLVE_FOR_OPTIONS = ['thickness', 'rate', 'time'] as const;
+export type DepositionSolveFor = typeof DEPOSITION_SOLVE_FOR_OPTIONS[number];
 
 export interface DepositionInput {
   solveFor: DepositionSolveFor;
@@ -47,10 +51,24 @@ function requirePositiveFinite(value: number | undefined, label: string): number
   return value;
 }
 
+/** Runtime guard for the string-literal unit/preset fields (solveFor, thicknessUnit,
+ *  rateUnit, timeUnit, pressureUnit, gas). TypeScript enforces these at compile time for
+ *  callers written in TS, but nothing stopped an unexpected runtime value (e.g. a stray
+ *  string) from reaching the arithmetic and silently producing NaN instead of a clear error
+ *  (Codex regression - see the "runtime validation" test). */
+function assertOneOf<T extends string>(value: T, allowed: readonly T[], label: string): T {
+  if (!allowed.includes(value)) throw new Error(`${label}: недопустимое значение. Допустимо: ${allowed.join(', ')}.`);
+  return value;
+}
+
 /** Solves thickness = rate * time for whichever ONE of the three the caller asks for,
  *  requiring the other two as real, validated (positive, finite) numbers - never silently
  *  substitutes a default or ignores what was actually typed. */
 export function solveDeposition(input: DepositionInput): DepositionResult {
+  assertOneOf(input.solveFor, DEPOSITION_SOLVE_FOR_OPTIONS, 'Искомая величина');
+  assertOneOf(input.thicknessUnit, THICKNESS_UNITS, 'Единица толщины');
+  assertOneOf(input.rateUnit, RATE_UNITS, 'Единица скорости');
+  assertOneOf(input.timeUnit, TIME_UNITS, 'Единица времени');
   if (input.solveFor === 'thickness') {
     const rateNmMin = requirePositiveFinite(input.rate, 'Скорость осаждения') * RATE_TO_NM_PER_MIN[input.rateUnit];
     const timeMin = requirePositiveFinite(input.time, 'Время осаждения') * TIME_TO_MIN[input.timeUnit];
@@ -78,8 +96,10 @@ export function depositionUnitLabel(unit: ThicknessUnit | RateUnit | TimeUnit): 
 
 // ---------- mean free path in vacuum (kinetic theory of gases) ----------
 
-export type PressureUnit = 'pa' | 'mbar' | 'torr';
-export type GasPreset = 'argon' | 'nitrogen' | 'custom';
+export const PRESSURE_UNITS = ['pa', 'mbar', 'torr'] as const;
+export type PressureUnit = typeof PRESSURE_UNITS[number];
+export const GAS_PRESETS = ['argon', 'nitrogen', 'custom'] as const;
+export type GasPreset = typeof GAS_PRESETS[number];
 
 export interface MeanFreePathInput {
   pressure: number;
@@ -108,6 +128,8 @@ const BOLTZMANN_J_PER_K = 1.380649e-23;
  *  well-established, independently verifiable physical relationship (see e.g. any vacuum
  *  technology reference), computed exactly, not approximated or looked up from a table. */
 export function calculateMeanFreePath(input: MeanFreePathInput): MeanFreePathResult {
+  assertOneOf(input.pressureUnit, PRESSURE_UNITS, 'Единица давления');
+  assertOneOf(input.gas, GAS_PRESETS, 'Газ');
   const pressurePa = requirePositiveFinite(input.pressure, 'Давление');
   const temperatureK = input.temperatureC + 273.15;
   if (!Number.isFinite(temperatureK) || temperatureK <= 0) throw new Error('Температура: значение должно быть выше абсолютного нуля (-273.15 °C).');
