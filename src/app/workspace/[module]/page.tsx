@@ -2,11 +2,11 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { SciFinderSearch } from '@/components/scifinder/search';
-import { WorkspaceModule } from '@/components/workspace-module';
 import { EngineeringCalculators } from '@/components/engineering-calculators';
 import { TechnoEconomicAssessment } from '@/components/techno-economic-assessment';
 import { EquipmentSelector } from '@/components/equipment-selector';
 import { TechDocAssistant } from '@/components/techdoc-assistant';
+import { ScientificWriter } from '@/components/scientific-writer';
 import { getWorkspaceModule, workspaceModules } from '@/modules/workspace/registry';
 
 type Props = { params: Promise<{ module: string }> };
@@ -34,7 +34,7 @@ export default async function ModulePage({ params }: Props) {
             : workspaceModule.id === 'assessment' ? 'AI WORKSPACE / TECHNO-ECONOMIC ASSESSMENT'
             : workspaceModule.id === 'equipment' ? 'AI WORKSPACE / EQUIPMENT SELECTOR'
             : workspaceModule.id === 'techdoc' ? 'AI WORKSPACE / TECHDOC ASSISTANT'
-            : 'AI WORKSPACE / DEMO'}
+            : 'AI WORKSPACE / SCIENTIFIC WRITER'}
         </div>
         <h1>{workspaceModule.tool.name}</h1>
         <p>{workspaceModule.tool.description}</p>
@@ -44,7 +44,7 @@ export default async function ModulePage({ params }: Props) {
         : workspaceModule.id === 'assessment' ? <TechnoEconomicAssessment />
         : workspaceModule.id === 'equipment' ? <EquipmentSelector />
         : workspaceModule.id === 'techdoc' ? <TechDocAssistant />
-        : <WorkspaceModule key={workspaceModule.id} tool={workspaceModule.tool} example={workspaceModule.example} />}
+        : <ScientificWriter />}
     </div>
   );
 }
