@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DOCUMENT_TYPES, WRITER_MODES, DOCUMENT_STRUCTURES, PROTECTED_TECHNICAL_TERMS,
   validateInput, buildEvidenceReport, buildLocalScaffold, buildGenerationPrompt,
-  checkPreservation, summarizeChanges, NOT_ENOUGH_DATA,
+  checkPreservation, summarizeChanges, checkNoInventedNumbers, checkNoFabricatedScholarlyArtifacts, buildSafetyWarnings, NOT_ENOUGH_DATA,
   type ScientificWriterInput,
 } from '../src/services/workspace/scientific-writer';
 
@@ -166,4 +166,39 @@ test('validateInput accepts RU/EN Unicode, chemical formulas, and numeric/unit t
   assert.doesNotThrow(() => validateInput(input));
   const evidence = buildEvidenceReport(input);
   assert.equal(evidence.fields.find(f => f.key === 'results')!.value, input.results);
+});
+
+// ---------- invented-number safeguard (item 5/6) ----------
+
+test('checkNoInventedNumbers: flags a generated number that traces back to nothing the user supplied', () => {
+  const input = draftInput({ results: 'Твёрдость возросла до 2400 HV.' });
+  const clean = checkNoInventedNumbers(input, 'Итоговая твёрдость составила 2400 HV, что подтверждает гипотезу.');
+  assert.equal(clean.ok, true);
+  const withInvented = checkNoInventedNumbers(input, 'Итоговая твёрдость составила 5000 HV.');
+  assert.equal(withInvented.ok, false);
+  assert.ok(withInvented.invented.includes('5000'));
+});
+
+test('checkNoInventedNumbers: small structural numbers (list/section numbering) are excluded to avoid false positives', () => {
+  const input = draftInput({ results: 'Результат зафиксирован.' });
+  const check = checkNoInventedNumbers(input, '1. Введение. 2. Материалы и методы.');
+  assert.equal(check.ok, true);
+});
+
+// ---------- scholarly-artifact safeguard (item 5) ----------
+
+test('checkNoFabricatedScholarlyArtifacts: flags a DOI-like string, an author-year citation marker, and a references heading', () => {
+  assert.equal(checkNoFabricatedScholarlyArtifacts('Plain text with no citations at all.').ok, true);
+  assert.equal(checkNoFabricatedScholarlyArtifacts('See doi:10.1000/xyz123 for details.').doiFound, true);
+  assert.equal(checkNoFabricatedScholarlyArtifacts('As shown previously (Smith, 2019).').citationMarkersFound, true);
+  assert.equal(checkNoFabricatedScholarlyArtifacts('Conclusion.\n\nReferences\n[1] ...').referenceSectionFound, true);
+});
+
+// ---------- combined safety warnings ----------
+
+test('buildSafetyWarnings: returns an empty array only when every safeguard passes, and a populated array otherwise', () => {
+  const input = draftInput({ results: 'Твёрдость 2400 HV.' });
+  assert.deepEqual(buildSafetyWarnings(input, 'Твёрдость составила 2400 HV.', null), []);
+  const withProblem = buildSafetyWarnings(input, 'Твёрдость составила 9999 HV (doi:10.1000/fake).', null);
+  assert.ok(withProblem.length >= 2);
 });

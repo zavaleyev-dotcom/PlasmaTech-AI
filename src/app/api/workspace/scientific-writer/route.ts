@@ -1,8 +1,8 @@
 import {
-  validateInput, buildEvidenceReport, buildGenerationPrompt, checkPreservation, summarizeChanges,
+  validateInput, buildEvidenceReport, buildGenerationPrompt, checkPreservation, summarizeChanges, buildSafetyWarnings,
   WRITER_MODES, type ScientificWriterInput, type WriterMode,
 } from '@/services/workspace/scientific-writer';
-import { getWriterProvider } from '@/services/workspace/scientific-writer-provider';
+import { getWriterProvider, WriterProviderError, type WriterProvider } from '@/services/workspace/scientific-writer-provider';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -37,6 +37,47 @@ export async function GET(request: Request) {
   return json({ configured: provider.configured(), providerId: provider.id });
 }
 
+export interface GenerateResponse { status: number; body: Record<string, unknown> }
+
+/** The whole "given a parsed request body and a provider, produce a response" pipeline as one
+ *  pure(ish), dependency-injectable async function - the real POST handler calls it with the
+ *  real getWriterProvider(); tests call it with a stub WriterProvider to exercise every
+ *  provider outcome (timeout/401/429/5xx/malformed/empty/success) without ever needing a real
+ *  network call or a real API key. Mirrors the same DI pattern askLibrary() already uses for
+ *  its AnswerProvider (src/services/rag/service.ts). */
+export async function handleGenerate(raw: unknown, provider: WriterProvider): Promise<GenerateResponse> {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { status: 400, body: { error: 'Неверный формат запроса.' } };
+
+  let input: ScientificWriterInput;
+  try {
+    input = parseInput(raw as Record<string, unknown>);
+    validateInput(input);
+  } catch (error) {
+    return { status: 400, body: { error: error instanceof Error ? error.message : 'Некорректные данные.', code: 'invalid_request' } };
+  }
+
+  const evidence = buildEvidenceReport(input);
+  if (!provider.configured()) return { status: 503, body: { error: 'Генерация текста не настроена: добавьте OPENAI_API_KEY.', code: 'not_configured' } };
+
+  try {
+    const prompt = buildGenerationPrompt(input, evidence);
+    const result = await provider.generate(prompt);
+    const isRewriteLike = REWRITE_LIKE_MODES.includes(input.mode);
+    const preservation = isRewriteLike && input.sourceText ? checkPreservation(input.sourceText, result.text) : null;
+    const changes = isRewriteLike && input.sourceText ? summarizeChanges(input.sourceText, result.text) : null;
+    const warnings = buildSafetyWarnings(input, result.text, preservation);
+    return { status: 200, body: { generatedText: result.text, evidence, preservation, changes, warnings, providerId: provider.id } };
+  } catch (error) {
+    // Never forward the raw provider response or a stack trace - only our own safe message
+    // strings, tagged with `error.kind` so the client can distinguish a transient outage
+    // ('unavailable', worth retrying) from a non-transient failure ('error', e.g. bad
+    // credentials or a malformed/empty response - retrying the same request won't help).
+    const kind = error instanceof WriterProviderError ? error.kind : 'error';
+    const message = error instanceof Error ? error.message : 'Не удалось сформировать текст.';
+    return { status: kind === 'not_configured' ? 503 : 502, body: { error: message, code: kind } };
+  }
+}
+
 export async function POST(request: Request) {
   if (!isLocalJsonRequest(request)) return json({ error: 'Недопустимый локальный запрос.' }, 403);
 
@@ -52,35 +93,12 @@ export async function POST(request: Request) {
     chunks.push(value);
   }
 
-  let body: unknown;
-  try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  let raw: unknown;
+  try { raw = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
   catch { return json({ error: 'Неверный формат запроса (ожидался JSON).' }, 400); }
 
-  if (body === null || typeof body !== 'object' || Array.isArray(body)) return json({ error: 'Неверный формат запроса.' }, 400);
-  const raw = body as Record<string, unknown>;
-
-  let input: ScientificWriterInput;
-  try {
-    input = parseInput(raw);
-    validateInput(input);
-  } catch (error) {
-    return json({ error: error instanceof Error ? error.message : 'Некорректные данные.' }, 400);
-  }
-
-  const evidence = buildEvidenceReport(input);
-  const provider = getWriterProvider();
-  if (!provider.configured()) return json({ error: 'Генерация текста не настроена: добавьте OPENAI_API_KEY.', code: 'not_configured' }, 503);
-
-  try {
-    const prompt = buildGenerationPrompt(input, evidence);
-    const result = await provider.generate(prompt);
-    const isRewriteLike = REWRITE_LIKE_MODES.includes(input.mode);
-    const preservation = isRewriteLike && input.sourceText ? checkPreservation(input.sourceText, result.text) : null;
-    const changes = isRewriteLike && input.sourceText ? summarizeChanges(input.sourceText, result.text) : null;
-    return json({ generatedText: result.text, evidence, preservation, changes, providerId: provider.id });
-  } catch (error) {
-    return json({ error: error instanceof Error ? error.message : 'Не удалось сформировать текст.' }, 502);
-  }
+  const { status, body } = await handleGenerate(raw, getWriterProvider());
+  return json(body, status);
 }
 
 const MAX_SHORT = 500;

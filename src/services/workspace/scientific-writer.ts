@@ -291,3 +291,59 @@ export function summarizeChanges(original: string, edited: string): string[] {
   if (changes.length === 0) changes.push('Существенных изменений не обнаружено.');
   return changes;
 }
+
+/** Numbers that commonly appear as structural artifacts (list/section numbering, ordinal
+ *  references) rather than invented data - excluded from the invented-number check to keep it
+ *  useful instead of noisy. Everything else is a real claim and must trace back to the user. */
+const STRUCTURAL_NUMBER_EXCLUSIONS = new Set(Array.from({ length: 21 }, (_, i) => String(i)));
+
+export interface InventedNumberCheck { invented: string[]; ok: boolean }
+
+/** Checks that every number in the GENERATED text traces back to something the user actually
+ *  supplied (across all input fields, including sourceText) - catches a model inventing a new
+ *  experimental figure from nothing, which checkPreservation alone (original -> edited survival)
+ *  cannot: for `draft` mode there is no "original" to compare against at all. */
+export function checkNoInventedNumbers(input: ScientificWriterInput, generatedText: string): InventedNumberCheck {
+  const suppliedText = [
+    input.title, input.researchField, input.goal, input.researchObject, input.methods,
+    input.results, input.conclusions, input.keywords, input.sourceText, input.additionalRequirements,
+  ].filter((v): v is string => !!v).join('\n');
+  const suppliedNumbers = new Set(suppliedText.match(NUMBER_RE) ?? []);
+  const generatedNumbers = Array.from(new Set(generatedText.match(NUMBER_RE) ?? []));
+  const invented = generatedNumbers.filter(n => !suppliedNumbers.has(n) && !STRUCTURAL_NUMBER_EXCLUSIONS.has(n));
+  return { invented, ok: invented.length === 0 };
+}
+
+const DOI_RE = /\b10\.\d{4,9}\/\S+/;
+const CITATION_MARKER_RE = /\[\d+\]|\bet al\.?\b|\([A-ZА-Я][a-zа-я]+(?:\s+(?:and|&)\s+[A-ZА-Я][a-zа-я]+|\s+et al\.?)?,?\s*\d{4}\)/;
+const REFERENCE_SECTION_RE = /\b(references|bibliography|литература|библиография|список\s+литературы)\b/i;
+
+export interface ScholarlyArtifactCheck { doiFound: boolean; citationMarkersFound: boolean; referenceSectionFound: boolean; ok: boolean }
+
+/** This app never gives the model any real bibliography to cite, so ANY DOI-like string,
+ *  author-year citation marker, or "References"/"Bibliography" heading appearing in generated
+ *  text is necessarily fabricated - a deterministic pattern check, not a trust assumption. */
+export function checkNoFabricatedScholarlyArtifacts(generatedText: string): ScholarlyArtifactCheck {
+  const doiFound = DOI_RE.test(generatedText);
+  const citationMarkersFound = CITATION_MARKER_RE.test(generatedText);
+  const referenceSectionFound = REFERENCE_SECTION_RE.test(generatedText);
+  return { doiFound, citationMarkersFound, referenceSectionFound, ok: !doiFound && !citationMarkersFound && !referenceSectionFound };
+}
+
+/** Combines every post-generation safeguard into one human-readable list. An empty array means
+ *  every check passed - the route/UI must never present a result as clean without actually
+ *  running this. */
+export function buildSafetyWarnings(input: ScientificWriterInput, generatedText: string, preservation: PreservationCheck | null): string[] {
+  const warnings: string[] = [];
+  if (preservation && !preservation.ok) {
+    if (preservation.missingNumbers.length) warnings.push(`Возможна потеря числовых значений: ${preservation.missingNumbers.join(', ')}.`);
+    if (preservation.missingTerms.length) warnings.push(`Возможна потеря защищённых терминов: ${preservation.missingTerms.join(', ')}.`);
+  }
+  const inventedNumbers = checkNoInventedNumbers(input, generatedText);
+  if (!inventedNumbers.ok) warnings.push(`Обнаружены числа, не подтверждённые пользователем: ${inventedNumbers.invented.join(', ')}. Проверьте перед использованием.`);
+  const scholarly = checkNoFabricatedScholarlyArtifacts(generatedText);
+  if (scholarly.doiFound) warnings.push('Обнаружен DOI-подобный текст - система никогда не предоставляет реальные DOI, проверьте и удалите.');
+  if (scholarly.citationMarkersFound) warnings.push('Обнаружены признаки цитирования (например, "[1]" или "(Автор, год)") - такие ссылки не подтверждены и не должны использоваться без проверки.');
+  if (scholarly.referenceSectionFound) warnings.push('Обнаружен раздел со списком литературы - система не предоставляет реальные источники, этот раздел не должен использоваться без проверки.');
+  return warnings;
+}

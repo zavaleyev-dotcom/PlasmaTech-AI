@@ -36,13 +36,14 @@ function toInput(form: FormState): ScientificWriterInput {
   };
 }
 
-type GenerationState = 'idle' | 'loading' | 'done' | 'error' | 'not_configured';
+type GenerationState = 'idle' | 'loading' | 'done' | 'not_configured' | 'unavailable' | 'error';
 
 interface GenerationResult {
   generatedText: string;
   evidence: EvidenceReport;
   preservation: PreservationCheck | null;
   changes: string[] | null;
+  warnings: string[];
 }
 
 export function ScientificWriter() {
@@ -71,6 +72,30 @@ export function ScientificWriter() {
     setValidationError(''); setState('idle'); setErrorMessage(''); setScaffold(null); setEvidencePreview(null); setResult(null);
   }
 
+  async function generate(input: ScientificWriterInput) {
+    setState('loading');
+    try {
+      const response = await fetch('/api/workspace/scientific-writer', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        // code distinguishes WHY it failed: not_configured (nothing to retry), unavailable
+        // (transient - network/timeout/rate-limit/upstream outage, worth retrying), error (a
+        // response came back but was rejected - e.g. bad credentials - retrying won't help
+        // without a real fix). Never show the raw error/stack - only our own safe message.
+        setErrorMessage(body.error ?? 'Не удалось сформировать текст.');
+        setState(body.code === 'not_configured' ? 'not_configured' : body.code === 'unavailable' ? 'unavailable' : 'error');
+        return;
+      }
+      setResult({ generatedText: body.generatedText, evidence: body.evidence, preservation: body.preservation, changes: body.changes, warnings: body.warnings ?? [] });
+      setState('done');
+    } catch {
+      setErrorMessage('Не удалось связаться с сервером.');
+      setState('unavailable');
+    }
+  }
+
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     setValidationError(''); setErrorMessage(''); setResult(null); setScaffold(null); setEvidencePreview(null);
@@ -88,22 +113,13 @@ export function ScientificWriter() {
       setEvidencePreview(evidence);
     }
 
-    setState('loading');
-    try {
-      const response = await fetch('/api/workspace/scientific-writer', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
-      });
-      const body = await response.json();
-      if (!response.ok) {
-        if (body.code === 'not_configured') { setState('not_configured'); return; }
-        throw new Error(body.error ?? 'Не удалось сформировать текст.');
-      }
-      setResult({ generatedText: body.generatedText, evidence: body.evidence, preservation: body.preservation, changes: body.changes });
-      setState('done');
-    } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : 'Не удалось сформировать текст.');
-      setState('error');
-    }
+    await generate(input);
+  }
+
+  async function retry() {
+    setErrorMessage('');
+    const input = toInput(form);
+    await generate(input);
   }
 
   async function copyResult() {
@@ -178,10 +194,21 @@ export function ScientificWriter() {
     {state === 'not_configured' && <section className="content-card">
       <p role="alert">ИИ-генерация недоступна: OPENAI_API_KEY не настроен на сервере. Ниже показана только локальная структура, собранная из введённых вами данных - это не текст, сгенерированный ИИ.</p>
     </section>}
-    {state === 'error' && <section className="content-card"><p role="alert">{errorMessage}</p></section>}
+    {state === 'unavailable' && <section className="content-card">
+      <p role="alert">ИИ-провайдер временно недоступен (сеть, тайм-аут или ограничение запросов): {errorMessage}</p>
+      <button type="button" className="button secondary mt-2" onClick={retry}>Повторить</button>
+    </section>}
+    {state === 'error' && <section className="content-card">
+      <p role="alert">Ошибка генерации: {errorMessage}</p>
+      <button type="button" className="button secondary mt-2" onClick={retry}>Повторить</button>
+    </section>}
 
     {result && <section className="content-card" aria-live="polite">
       <h2>Результат (сгенерировано ИИ)</h2>
+      {result.warnings.length > 0 && <div role="alert" className="content-card">
+        <h3>Предупреждения проверки</h3>
+        <ul className="list-disc">{result.warnings.map(w => <li key={w}>{w}</li>)}</ul>
+      </div>}
       <pre style={{ whiteSpace: 'pre-wrap' }}>{result.generatedText}</pre>
       <h3 className="mt-3">Использованные данные</h3>
       <p className="muted small">Предоставлено: {result.evidence.provided.join(', ') || '—'}</p>

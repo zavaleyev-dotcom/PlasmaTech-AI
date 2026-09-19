@@ -1,6 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { GET as writerGET, POST as writerPOST } from '../src/app/api/workspace/scientific-writer/route';
+import { GET as writerGET, POST as writerPOST, handleGenerate } from '../src/app/api/workspace/scientific-writer/route';
+import { WriterProviderError, type WriterProvider } from '../src/services/workspace/scientific-writer-provider';
+
+function stubProvider(overrides: Partial<WriterProvider> = {}): WriterProvider {
+  return {
+    id: 'stub',
+    configured: () => true,
+    generate: async () => ({ text: 'Stub generated text.' }),
+    ...overrides,
+  };
+}
 
 function postRequest(body: unknown, headers: Record<string, string> = {}) {
   return new Request('http://localhost/api/workspace/scientific-writer', {
@@ -92,4 +102,64 @@ test('server-side parsing never spreads untrusted properties into the request (p
 test('rejects a rewrite-mode request missing the required sourceText, server-side', async () => {
   const response = await writerPOST(postRequest({ documentType: 'article', mode: 'rewrite', targetLanguage: 'en' }));
   assert.equal(response.status, 400);
+});
+
+// ---------- handleGenerate with a stub provider (item 9): every outcome, end to end ----------
+
+test('handleGenerate: a successful generation returns 200 with the text, evidence, and an empty warnings array when nothing is wrong', async () => {
+  const { status, body } = await handleGenerate(validDraftBody, stubProvider({ generate: async () => ({ text: 'Abstract: coatings were studied.' }) }));
+  assert.equal(status, 200);
+  assert.equal(body.generatedText, 'Abstract: coatings were studied.');
+  assert.deepEqual(body.warnings, []);
+  assert.ok(body.evidence);
+});
+
+test('handleGenerate: citation/DOI safeguard - a fabricated DOI or reference list in the AI output surfaces as a warning, never silently shown as clean', async () => {
+  const withDoi = await handleGenerate(validDraftBody, stubProvider({ generate: async () => ({ text: 'See doi:10.1234/abcd.5678 for details.' }) }));
+  assert.equal(withDoi.status, 200);
+  assert.ok((withDoi.body.warnings as string[]).some(w => w.includes('DOI')));
+
+  const withReferences = await handleGenerate(validDraftBody, stubProvider({ generate: async () => ({ text: 'Conclusion.\n\nReferences\n[1] Smith et al.' }) }));
+  assert.ok((withReferences.body.warnings as string[]).length > 0);
+});
+
+test('handleGenerate: preservation safeguard - a rewrite that drops a number or protected term surfaces a warning', async () => {
+  const rewriteBody = { documentType: 'article', mode: 'rewrite', targetLanguage: 'en', sourceText: 'The PVD coating thickness was 350 nm.' };
+  const { status, body } = await handleGenerate(rewriteBody, stubProvider({ generate: async () => ({ text: 'The coating was thick.' }) }));
+  assert.equal(status, 200);
+  const warnings = body.warnings as string[];
+  assert.ok(warnings.some(w => w.includes('350')));
+  assert.ok(warnings.some(w => w.includes('PVD')));
+  assert.equal((body.preservation as { ok: boolean }).ok, false);
+});
+
+test('handleGenerate: invented-number safeguard - a draft that states a number the user never gave surfaces a warning', async () => {
+  const { body } = await handleGenerate(validDraftBody, stubProvider({ generate: async () => ({ text: 'Hardness reached 9999 HV under these conditions.' }) }));
+  assert.ok((body.warnings as string[]).some(w => w.includes('9999')));
+});
+
+test('handleGenerate: provider not configured returns 503 with code not_configured, never fabricating text', async () => {
+  const { status, body } = await handleGenerate(validDraftBody, stubProvider({ configured: () => false, generate: async () => { throw new WriterProviderError('nope', 'not_configured'); } }));
+  assert.equal(status, 503);
+  assert.equal(body.code, 'not_configured');
+  assert.ok(!('generatedText' in body));
+});
+
+test('handleGenerate: provider unavailable (timeout/429/5xx) returns 502 with code unavailable', async () => {
+  const { status, body } = await handleGenerate(validDraftBody, stubProvider({ generate: async () => { throw new WriterProviderError('OpenAI не ответил вовремя.', 'unavailable'); } }));
+  assert.equal(status, 502);
+  assert.equal(body.code, 'unavailable');
+});
+
+test('handleGenerate: provider error (401/malformed/empty) returns 502 with code error', async () => {
+  const { status, body } = await handleGenerate(validDraftBody, stubProvider({ generate: async () => { throw new WriterProviderError('OpenAI отклонил доступ.', 'error'); } }));
+  assert.equal(status, 502);
+  assert.equal(body.code, 'error');
+});
+
+test('handleGenerate: a non-object body is rejected with 400 rather than crashing', async () => {
+  const { status } = await handleGenerate('just a string', stubProvider());
+  assert.equal(status, 400);
+  const { status: arrayStatus } = await handleGenerate([1, 2, 3], stubProvider());
+  assert.equal(arrayStatus, 400);
 });

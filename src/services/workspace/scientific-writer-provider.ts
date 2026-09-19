@@ -17,6 +17,22 @@ export interface WriterProvider {
   generate(request: WriterGenerationRequest): Promise<WriterGenerationResult>;
 }
 
+/** Distinguishes WHY generation failed, so the route/UI can react correctly instead of treating
+ *  every failure the same way: 'not_configured' (no key - nothing to retry), 'unavailable'
+ *  (network/timeout/rate-limit/upstream outage - transient, retrying later may help), 'error'
+ *  (a response came back but was rejected/unusable - e.g. bad credentials, malformed or empty
+ *  content - retrying the same request won't help without a real fix). */
+export type WriterProviderErrorKind = 'not_configured' | 'unavailable' | 'error';
+
+export class WriterProviderError extends Error {
+  readonly kind: WriterProviderErrorKind;
+  constructor(message: string, kind: WriterProviderErrorKind) {
+    super(message);
+    this.name = 'WriterProviderError';
+    this.kind = kind;
+  }
+}
+
 export class OpenAIWriterProvider implements WriterProvider {
   readonly id = 'openai' as const;
 
@@ -32,7 +48,7 @@ export class OpenAIWriterProvider implements WriterProvider {
   }
 
   async generate({ system, user }: WriterGenerationRequest): Promise<WriterGenerationResult> {
-    if (!this.apiKey) throw new Error('Генерация текста не настроена: не задан OPENAI_API_KEY.');
+    if (!this.apiKey) throw new WriterProviderError('Генерация текста не настроена: не задан OPENAI_API_KEY.', 'not_configured');
 
     let response: Response;
     try {
@@ -47,25 +63,28 @@ export class OpenAIWriterProvider implements WriterProvider {
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (error) {
-      if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) throw new Error('OpenAI не ответил вовремя.');
-      throw new Error('Не удалось связаться с OpenAI.');
+      if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) throw new WriterProviderError('OpenAI не ответил вовремя.', 'unavailable');
+      throw new WriterProviderError('Не удалось связаться с OpenAI.', 'unavailable');
     }
 
     if (!response.ok) {
-      if (response.status === 401 || response.status === 403) throw new Error('OpenAI отклонил доступ - проверьте OPENAI_API_KEY.');
-      if (response.status === 429) throw new Error('OpenAI: превышен лимит запросов, попробуйте позже.');
-      throw new Error('OpenAI вернул ошибку при генерации текста.');
+      // 401/403: the credential itself is bad - not transient, retrying won't help without a fix.
+      if (response.status === 401 || response.status === 403) throw new WriterProviderError('OpenAI отклонил доступ - проверьте OPENAI_API_KEY.', 'error');
+      // 429 and any 5xx: rate limit / upstream outage - both are transient, worth retrying later.
+      if (response.status === 429) throw new WriterProviderError('OpenAI: превышен лимит запросов, попробуйте позже.', 'unavailable');
+      if (response.status >= 500) throw new WriterProviderError('OpenAI временно недоступен, попробуйте позже.', 'unavailable');
+      throw new WriterProviderError('OpenAI вернул ошибку при генерации текста.', 'error');
     }
 
     const contentType = response.headers.get('content-type') ?? '';
-    if (!/^application\/json\b/i.test(contentType)) throw new Error('OpenAI вернул неожиданный формат ответа.');
+    if (!/^application\/json\b/i.test(contentType)) throw new WriterProviderError('OpenAI вернул неожиданный формат ответа.', 'error');
 
     let body: unknown;
     try { body = await response.json(); }
-    catch { throw new Error('Не удалось разобрать ответ OpenAI.'); }
+    catch { throw new WriterProviderError('Не удалось разобрать ответ OpenAI.', 'error'); }
 
     const text = (body as { choices?: { message?: { content?: unknown } }[] })?.choices?.[0]?.message?.content;
-    if (typeof text !== 'string' || !text.trim()) throw new Error('OpenAI вернул пустой ответ.');
+    if (typeof text !== 'string' || !text.trim()) throw new WriterProviderError('OpenAI вернул пустой ответ.', 'error');
     return { text };
   }
 }
@@ -74,7 +93,7 @@ export const unconfiguredWriterProvider: WriterProvider = {
   id: 'unconfigured',
   configured: () => false,
   async generate(): Promise<WriterGenerationResult> {
-    throw new Error('Генерация текста не настроена: не задан OPENAI_API_KEY.');
+    throw new WriterProviderError('Генерация текста не настроена: не задан OPENAI_API_KEY.', 'not_configured');
   },
 };
 
