@@ -7,6 +7,7 @@ import {
   type ScientificWriterInput, type DocumentType, type WriterMode, type Language,
   type EvidenceReport, type ScaffoldSection, type PreservationCheck,
 } from '@/services/workspace/scientific-writer';
+import { SimilarityCheck } from './anti-plagiarism';
 
 const REWRITE_LIKE_MODES: readonly WriterMode[] = ['rewrite', 'edit', 'translate_ru_en', 'translate_en_ru'];
 
@@ -239,6 +240,8 @@ export function ScientificWriter() {
       </div>)}
       {evidencePreview && <p className="muted small mt-3">Не задано: {evidencePreview.missing.join(', ') || '—'}</p>}
     </section>}
+
+    <SimilarityCheck />
 
     <p className="muted small">Scientific Writer не заменяет проверку научных фактов: любые утверждения, цифры, цитаты и ссылки должны быть проверены автором перед публикацией. Система никогда не придумывает цитаты, DOI, авторов, журналы или экспериментальные результаты.</p>
   </div>;
