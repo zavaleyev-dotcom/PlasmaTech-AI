@@ -29,3 +29,21 @@ export function getWorkspaceModuleHref(id: WorkspaceModuleId) {
   if (!definition) throw new Error(`Unknown workspace module: ${id}`);
   return `/workspace/${definition.slug}`;
 }
+
+/** Single source of truth for "is this a real, working module or still a canned-example demo" -
+ *  UI code (navigation, tool grid, mode badges) must derive this from the registry rather than
+ *  hardcoding per-module-id checks, or a newly-shipped module stays mislabeled "demo" forever. */
+export function isWorkspaceModuleLive(id: WorkspaceModuleId): boolean {
+  return workspaceModules.find(module => module.id === id)?.mode === 'live';
+}
+
+/** The global shell's small technical status badge for the current route - pure function (no
+ *  React/Next import) so it stays unit-testable, and so a newly-shipped module is never left
+ *  mislabeled "DEMO" once its registry entry says `mode: 'live'`. */
+export function moduleBadge(pathname: string): string {
+  if (pathname === '/workspace/scifinder') return 'SCIENTIFIC SEARCH';
+  if (pathname === '/my-library') return 'LOCAL LIBRARY';
+  if (!pathname.startsWith('/workspace/')) return 'DEMO';
+  const slug = pathname.slice('/workspace/'.length);
+  return getWorkspaceModule(slug)?.mode === 'live' ? 'LIVE' : 'DEMO';
+}

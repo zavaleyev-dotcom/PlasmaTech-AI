@@ -1,14 +1,16 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   formatCurrency, runAssessment,
   type AssessmentInput, type AssessmentResult, type Currency, type EconomicEffectMode, type OpexPeriod,
 } from '@/services/workspace/techno-economic-assessment';
+import { consumePendingEquipmentHandoff, type EquipmentTeaHandoffRecord } from '@/services/workspace/equipment-tea-handoff';
 
 // ---------- raw (string) form state - converted to numbers only at calculation time ----------
 
 interface FormState {
+  title: string;
   capex: Record<'equipment' | 'delivery' | 'customsLogistics' | 'installation' | 'commissioning' | 'training' | 'infrastructure' | 'tooling' | 'otherOneTime', string>;
   opexPeriod: OpexPeriod;
   opex: Record<'electricity' | 'processGases' | 'consumables' | 'targetsCathodes' | 'reagents' | 'maintenance' | 'repairs' | 'labor' | 'facilities' | 'disposal' | 'otherOperating', string>;
@@ -21,6 +23,7 @@ interface FormState {
 
 function defaultForm(): FormState {
   return {
+    title: '',
     capex: { equipment: '', delivery: '', customsLogistics: '', installation: '', commissioning: '', training: '', infrastructure: '', tooling: '', otherOneTime: '' },
     opexPeriod: 'year',
     opex: { electricity: '', processGases: '', consumables: '', targetsCathodes: '', reagents: '', maintenance: '', repairs: '', labor: '', facilities: '', disposal: '', otherOperating: '' },
@@ -30,6 +33,18 @@ function defaultForm(): FormState {
     currentUnitCost: '', newUnitCost: '',
     currentAnnualCost: '', newAnnualCost: '',
   };
+}
+
+// ---------- 3-scenario analysis (Base / Conservative / Optimistic) - same engine, same form
+// shape as Variant A/B above; the user must explicitly set each scenario's own numbers, nothing
+// is auto-derived or invented between scenarios. ----------
+
+export const SCENARIO_KEYS = ['base', 'conservative', 'optimistic'] as const;
+export type ScenarioKey = typeof SCENARIO_KEYS[number];
+export const SCENARIO_LABELS: Record<ScenarioKey, string> = { base: 'Базовый', conservative: 'Консервативный', optimistic: 'Оптимистичный' };
+
+export function defaultScenarioForms(): Record<ScenarioKey, FormState> {
+  return { base: defaultForm(), conservative: defaultForm(), optimistic: defaultForm() };
 }
 
 const num = (v: string): number | undefined => (v.trim() === '' ? undefined : Number(v));
@@ -65,6 +80,35 @@ function NumberField({ label, value, onChange, min }: { label: string; value: st
   return <label className="text-sm">{label}
     <input type="number" step="any" min={min} className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={value} onChange={e => onChange(e.target.value)} />
   </label>;
+}
+
+function TitleField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return <label className="text-sm">Что оцениваем (название/описание, необязательно)
+    <input type="text" maxLength={200} className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={value} onChange={e => onChange(e.target.value)} />
+  </label>;
+}
+
+function ImportedFromEquipmentSelector({ record, onDismiss }: { record: EquipmentTeaHandoffRecord; onDismiss: () => void }) {
+  const { handoff } = record;
+  return <section className="content-card">
+    <div className="flex justify-between items-start gap-2">
+      <h3>Импортировано из Equipment Selector</h3>
+      <button type="button" className="button secondary" onClick={onDismiss}>Скрыть</button>
+    </div>
+    <p className="muted small">Источник: Equipment Selector, конфигурация «{handoff.configurationName}». {handoff.note}</p>
+    <ul className="list-disc mt-2 text-sm">
+      <li>Процессы: {handoff.supportedPurposes.join(', ') || '—'}</li>
+      <li>Технологии: {handoff.supportedTechnologies.join(', ') || '—'}</li>
+      <li>Макс. размер: {handoff.maxChamberSizeMm} мм</li>
+      <li>Макс. температура: {handoff.maxProcessTempC}°C</li>
+      <li>Источники: {handoff.sourcesSummary}</li>
+      <li>Газовые линии (макс.): {handoff.maxGasLines}</li>
+      <li>Производительность: {handoff.throughputClasses.join(', ') || '—'}</li>
+      <li>Автоматизация: {handoff.automationLevels.join(', ') || '—'}</li>
+      <li>Cleanroom: {handoff.cleanroomSupport.join(', ') || '—'}</li>
+    </ul>
+    <p className="muted small mt-2">Это справочная информация о выбранном оборудовании - поле «Что оцениваем» в Варианте A заполнено автоматически, его можно изменить. Финансовые поля ниже нужно заполнить вручную.</p>
+  </section>;
 }
 
 function CapexSection({ value, onChange }: { value: FormState['capex']; onChange: (next: FormState['capex']) => void }) {
@@ -191,13 +235,41 @@ export function TechnoEconomicAssessment() {
   const [resultA, setResultA] = useState<AssessmentResult | null>(null);
   const [resultB, setResultB] = useState<AssessmentResult | null>(null);
   const [error, setError] = useState('');
+  const [importedHandoff, setImportedHandoff] = useState<EquipmentTeaHandoffRecord | null>(null);
+  const [scenariosEnabled, setScenariosEnabled] = useState(false);
+  const [scenarioForms, setScenarioForms] = useState<Record<ScenarioKey, FormState>>(defaultScenarioForms());
+  const [scenarioResults, setScenarioResults] = useState<Record<ScenarioKey, AssessmentResult | null>>({ base: null, conservative: null, optimistic: null });
+
+  function updateScenarioForm(key: ScenarioKey, patch: Partial<FormState>) {
+    setScenarioForms(prev => ({ ...prev, [key]: { ...prev[key], ...patch } }));
+  }
+
+  // Picks up a pending handoff from Equipment Selector ("Передать в Техно-экономическую
+  // оценку") since the last time this module was open - consumed once per mount, never
+  // re-applied on remount, and never overwrites financial fields (only the descriptive title).
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const record = consumePendingEquipmentHandoff();
+      if (record) {
+        setImportedHandoff(record);
+        setFormA(prev => ({ ...prev, title: record.handoff.configurationName }));
+      }
+    }, 0);
+    return () => clearTimeout(t);
+  }, []);
 
   function calculate(e: React.FormEvent) {
     e.preventDefault();
     setError(''); setResultA(null); setResultB(null);
+    setScenarioResults({ base: null, conservative: null, optimistic: null });
     try {
       setResultA(runAssessment(toAssessmentInput(formA)));
       if (compareB) setResultB(runAssessment(toAssessmentInput(formB)));
+      if (scenariosEnabled) {
+        const next = { base: null, conservative: null, optimistic: null } as Record<ScenarioKey, AssessmentResult | null>;
+        for (const key of SCENARIO_KEYS) next[key] = runAssessment(toAssessmentInput(scenarioForms[key]));
+        setScenarioResults(next);
+      }
     } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось выполнить расчёт.'); }
   }
 
@@ -215,8 +287,25 @@ export function TechnoEconomicAssessment() {
     ];
   }, [resultA, resultB, currency]);
 
+  const scenarioComparisonRows = useMemo(() => {
+    const results = SCENARIO_KEYS.map(key => scenarioResults[key]);
+    if (results.some(r => r === null)) return null;
+    const rs = results as AssessmentResult[];
+    const money = (v: number) => formatCurrency(v, currency);
+    return [
+      ['CAPEX', ...rs.map(r => money(r.capex.total))],
+      ['OPEX / год', ...rs.map(r => money(r.opex.annualTotal))],
+      ['Выпуск / год', ...rs.map(r => r.capacity.unitsPerYear.toFixed(0))],
+      ['Себестоимость / ед.', ...rs.map(r => money(r.unitCost.withoutDepreciation))],
+      ['Годовая экономия', ...rs.map(r => money(r.economicEffect.annualSavings))],
+      ['Окупаемость, лет', ...rs.map(r => r.payback.years?.toFixed(2) ?? '—')],
+      ['ROI, %', ...rs.map(r => r.roi.percent.toFixed(1))],
+    ];
+  }, [scenarioResults, currency]);
+
   return <div>
     <p className="muted small mb-4">Реальный локальный расчёт по прозрачным формулам - без внешних API и без LLM. Ниже можно раскрыть «Как рассчитано» для каждой формулы.</p>
+    {importedHandoff && <ImportedFromEquipmentSelector record={importedHandoff} onDismiss={() => setImportedHandoff(null)} />}
     <form onSubmit={calculate} className="flex flex-col gap-6">
       <label className="text-sm">Валюта отображения (без автоматической конвертации)
         <select className="rounded-md border border-[#dce0e5] p-3 mt-1" value={currency} onChange={e => setCurrency(e.target.value as Currency)}>
@@ -225,6 +314,7 @@ export function TechnoEconomicAssessment() {
       </label>
 
       <h2 className="mt-2">Вариант A</h2>
+      <TitleField value={formA.title} onChange={v => setFormA({ ...formA, title: v })} />
       <CapexSection value={formA.capex} onChange={v => setFormA({ ...formA, capex: v })} />
       <OpexSection period={formA.opexPeriod} value={formA.opex} onPeriodChange={p => setFormA({ ...formA, opexPeriod: p })} onChange={v => setFormA({ ...formA, opex: v })} />
       <CapacitySection value={formA.capacity} onChange={v => setFormA({ ...formA, capacity: v })} depreciationYears={formA.depreciationYears} onDepreciationChange={v => setFormA({ ...formA, depreciationYears: v })} />
@@ -239,6 +329,7 @@ export function TechnoEconomicAssessment() {
       </label>
       {compareB && <>
         <h2>Вариант B</h2>
+        <TitleField value={formB.title} onChange={v => setFormB({ ...formB, title: v })} />
         <CapexSection value={formB.capex} onChange={v => setFormB({ ...formB, capex: v })} />
         <OpexSection period={formB.opexPeriod} value={formB.opex} onPeriodChange={p => setFormB({ ...formB, opexPeriod: p })} onChange={v => setFormB({ ...formB, opex: v })} />
         <CapacitySection value={formB.capacity} onChange={v => setFormB({ ...formB, capacity: v })} depreciationYears={formB.depreciationYears} onDepreciationChange={v => setFormB({ ...formB, depreciationYears: v })} />
@@ -249,18 +340,36 @@ export function TechnoEconomicAssessment() {
         />
       </>}
 
+      <label className="flex items-center gap-2 text-sm">
+        <input type="checkbox" checked={scenariosEnabled} onChange={e => setScenariosEnabled(e.target.checked)} /> G. Сравнить 3 сценария (Базовый / Консервативный / Оптимистичный)
+      </label>
+      <p className="muted small">Каждый сценарий считается тем же самым движком расчёта - разница только в значениях, которые вы вводите сами. Платформа не придумывает оптимистичные или консервативные допущения автоматически.</p>
+      {scenariosEnabled && SCENARIO_KEYS.map(key => <div key={key} className="flex flex-col gap-6">
+        <h2>{SCENARIO_LABELS[key]}</h2>
+        <TitleField value={scenarioForms[key].title} onChange={v => updateScenarioForm(key, { title: v })} />
+        <CapexSection value={scenarioForms[key].capex} onChange={v => updateScenarioForm(key, { capex: v })} />
+        <OpexSection period={scenarioForms[key].opexPeriod} value={scenarioForms[key].opex} onPeriodChange={p => updateScenarioForm(key, { opexPeriod: p })} onChange={v => updateScenarioForm(key, { opex: v })} />
+        <CapacitySection value={scenarioForms[key].capacity} onChange={v => updateScenarioForm(key, { capacity: v })} depreciationYears={scenarioForms[key].depreciationYears} onDepreciationChange={v => updateScenarioForm(key, { depreciationYears: v })} />
+        <EconomicEffectSection
+          mode={scenarioForms[key].effectMode} onModeChange={m => updateScenarioForm(key, { effectMode: m })}
+          currentUnitCost={scenarioForms[key].currentUnitCost} newUnitCost={scenarioForms[key].newUnitCost}
+          currentAnnualCost={scenarioForms[key].currentAnnualCost} newAnnualCost={scenarioForms[key].newAnnualCost}
+          onChange={(field, v) => updateScenarioForm(key, { [field]: v })}
+        />
+      </div>)}
+
       <button className="button primary self-start">Рассчитать</button>
       {error && <p role="alert">{error}</p>}
     </form>
 
     {resultA && <section className="mt-6" aria-live="polite">
-      <h2>E. Результаты{compareB ? ' - Вариант A' : ''}</h2>
+      <h2>E. Результаты{compareB ? ' - Вариант A' : ''}{formA.title ? `: ${formA.title}` : ''}</h2>
       <ResultCards result={resultA} currency={currency} />
       <FormulasDisclosure result={resultA} />
     </section>}
 
     {resultB && <section className="mt-6" aria-live="polite">
-      <h2>Результаты - Вариант B</h2>
+      <h2>Результаты - Вариант B{formB.title ? `: ${formB.title}` : ''}</h2>
       <ResultCards result={resultB} currency={currency} />
       <FormulasDisclosure result={resultB} />
     </section>}
@@ -269,6 +378,20 @@ export function TechnoEconomicAssessment() {
       <h2>Сравнение вариантов</h2>
       <table className="w-full text-sm"><thead><tr><th className="text-left">Показатель</th><th className="text-left">Вариант A</th><th className="text-left">Вариант B</th></tr></thead>
         <tbody>{comparisonRows.map(([label, a, b]) => <tr key={label}><td>{label}</td><td>{a}</td><td>{b}</td></tr>)}</tbody>
+      </table>
+      <p className="muted small mt-2">Сравнение носит информационный характер - платформа не выбирает «победителя» автоматически.</p>
+    </section>}
+
+    {scenariosEnabled && SCENARIO_KEYS.map(key => scenarioResults[key] && <section className="mt-6" key={key} aria-live="polite">
+      <h2>Результаты - {SCENARIO_LABELS[key]}{scenarioForms[key].title ? `: ${scenarioForms[key].title}` : ''}</h2>
+      <ResultCards result={scenarioResults[key]!} currency={currency} />
+      <FormulasDisclosure result={scenarioResults[key]!} />
+    </section>)}
+
+    {scenarioComparisonRows && <section className="mt-6">
+      <h2>Сравнение сценариев</h2>
+      <table className="w-full text-sm"><thead><tr><th className="text-left">Показатель</th>{SCENARIO_KEYS.map(key => <th key={key} className="text-left">{SCENARIO_LABELS[key]}</th>)}</tr></thead>
+        <tbody>{scenarioComparisonRows.map(([label, ...values]) => <tr key={label}><td>{label}</td>{values.map((v, i) => <td key={i}>{v}</td>)}</tr>)}</tbody>
       </table>
       <p className="muted small mt-2">Сравнение носит информационный характер - платформа не выбирает «победителя» автоматически.</p>
     </section>}

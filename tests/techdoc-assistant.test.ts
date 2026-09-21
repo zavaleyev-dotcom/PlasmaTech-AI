@@ -323,6 +323,44 @@ test('calculateStepDurationFromDeposition: only sets a step\'s duration when exp
   assert.equal(other.durationMin, undefined);
 });
 
+// ---------- invalid duration-calculator input: clear errors, never a silently invented value ----------
+// Regression for the full-functional-audit finding: the UI call site did not catch this throw,
+// crashing the page. The fix is UI-side (a try/catch around the call in StepCard); these tests
+// pin down the exact, human-readable error messages that catch block now surfaces to the user.
+
+test('calculateStepDurationFromDeposition: zero/negative/non-finite thickness or rate throws a clear, field-named message - never silently computes a duration', () => {
+  const doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  const invalidThicknesses = [0, -5, NaN, Infinity];
+  for (const thickness of invalidThicknesses) {
+    assert.throws(
+      () => calculateStepDurationFromDeposition(doc.steps, 6, thickness, 'nm', 10, 'nm_per_min'),
+      /Толщина покрытия: введите положительное число\./,
+      `thickness=${thickness} must throw a clear validation message`,
+    );
+  }
+  const invalidRates = [0, -1, NaN, Infinity];
+  for (const rate of invalidRates) {
+    assert.throws(
+      () => calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', rate, 'nm_per_min'),
+      /Скорость осаждения: введите положительное число\./,
+      `rate=${rate} must throw a clear validation message`,
+    );
+  }
+});
+
+test('calculateStepDurationFromDeposition: an empty input field (Number(\'\') === 0, the exact case the UI can produce) is rejected the same way, not treated as zero-duration', () => {
+  const doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  assert.throws(() => calculateStepDurationFromDeposition(doc.steps, 6, Number(''), 'nm', 10, 'nm_per_min'), /Толщина покрытия/);
+  assert.throws(() => calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', Number(''), 'nm_per_min'), /Скорость осаждения/);
+});
+
+test('calculateStepDurationFromDeposition: an invalid call never mutates the original steps array (the caller\'s existing state stays intact after the throw)', () => {
+  const doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  const before = JSON.stringify(doc.steps);
+  assert.throws(() => calculateStepDurationFromDeposition(doc.steps, 6, 0, 'nm', 10, 'nm_per_min'));
+  assert.equal(JSON.stringify(doc.steps), before, 'the input steps array must be unchanged after a rejected calculation');
+});
+
 test('no silent parameter substitution: an untouched preset document round-trips through every view with every field genuinely absent', () => {
   const doc = withName(createDocumentFromPreset('icp-rie-etching'));
   const exported = buildExport(doc);

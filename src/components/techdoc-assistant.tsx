@@ -25,6 +25,7 @@ function StepCard({ step, total, onChange }: { step: ProcessStep; total: number;
   const [calcOpen, setCalcOpen] = useState(false);
   const [thickness, setThickness] = useState('1000');
   const [rate, setRate] = useState('10');
+  const [calcError, setCalcError] = useState('');
 
   function patch(p: Partial<ProcessStep>) { onChange(steps => updateStep(steps, step.order, p)); }
 
@@ -102,10 +103,19 @@ function StepCard({ step, total, onChange }: { step: ProcessStep; total: number;
         <label className="text-sm">Толщина, нм<input type="number" className="rounded-md border border-[#dce0e5] p-2 mt-1 block" value={thickness} onChange={e => setThickness(e.target.value)} /></label>
         <label className="text-sm">Скорость, нм/мин<input type="number" className="rounded-md border border-[#dce0e5] p-2 mt-1 block" value={rate} onChange={e => setRate(e.target.value)} /></label>
         <button type="button" className="button primary" onClick={() => {
-          onChange(steps => calculateStepDurationFromDeposition(steps, step.order, Number(thickness), 'nm', Number(rate), 'nm_per_min'));
-          setCalcOpen(false);
+          setCalcError('');
+          // Invalid/zero/negative/non-finite thickness or rate must produce a clear, user-facing
+          // validation message here - never an uncaught exception that breaks the page, and
+          // never a silently invented duration.
+          try {
+            onChange(steps => calculateStepDurationFromDeposition(steps, step.order, Number(thickness), 'nm', Number(rate), 'nm_per_min'));
+            setCalcOpen(false);
+          } catch (err) {
+            setCalcError(err instanceof Error ? err.message : 'Не удалось рассчитать длительность.');
+          }
         }}>Применить к длительности</button>
       </div>}
+      {calcError && <p role="alert" className="text-sm mt-1">{calcError}</p>}
       {step.calculatedFields.length > 0 && <p className="muted small mt-2">Вычислено системой: {step.calculatedFields.join(', ')}</p>}
     </div>
   </article>;

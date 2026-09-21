@@ -7,6 +7,7 @@ import {
   PURPOSES, TECHNOLOGIES, SUBSTRATE_TYPES, MATERIAL_CLASSES, THROUGHPUT_CLASSES, AUTOMATION_LEVELS, CLEANROOM_CLASSES, LABELS,
   type EquipmentRequirement, type MatchResult, type ComparisonRow, type TechnoEconomicHandoff,
 } from '@/services/workspace/equipment-selector';
+import { queueEquipmentHandoff } from '@/services/workspace/equipment-tea-handoff';
 
 interface FormState {
   purpose: string; technology: string; substrateType: string; maxSizeMm: string;
@@ -281,7 +282,7 @@ export function EquipmentSelector() {
       <p className="muted small">Платформа не выбирает «победителя» автоматически - решение принимает пользователь.</p>
       <div className="content-grid mt-3">
         {results.map(r => <div key={r.config.id} className="flex flex-col gap-2">
-          <ResultCard result={r} onHandoff={config => setHandoff(buildTechnoEconomicHandoff(config))} />
+          <ResultCard result={r} onHandoff={config => { const built = buildTechnoEconomicHandoff(config); setHandoff(built); queueEquipmentHandoff(built); }} />
           <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={compareIds.includes(r.config.id)} onChange={() => toggleCompare(r.config.id)} disabled={!compareIds.includes(r.config.id) && compareIds.length >= 3} />
             Добавить к сравнению
@@ -304,6 +305,7 @@ export function EquipmentSelector() {
 
     {handoff && <section className="content-card">
       <h2>Передача в Техно-экономическую оценку</h2>
+      <p className="muted small">Технические параметры этой конфигурации переданы в Техно-экономическую оценку - откройте её ниже, они уже будут там (с пометкой источника).</p>
       <p className="muted small">{handoff.note}</p>
       <ul className="list-disc mt-3">
         <li>Конфигурация: {handoff.configurationName}</li>
