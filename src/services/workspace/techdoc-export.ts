@@ -6,9 +6,6 @@
  *  (prose) or "—" (table cell), exactly like the existing on-screen preview. */
 
 import 'server-only';
-import path from 'node:path';
-import { Document, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, Packer, PageBreak, AlignmentType, VerticalAlign } from 'docx';
-import PDFDocument from 'pdfkit';
 import {
   validateDocument, buildTechnologicalCard, buildRouteCard, buildBriefRecipe, STEP_TYPES,
   type TechnicalProcessDocument, type GeneralInfo, type InitialData, type ProcessStep, type GasUsage,
@@ -18,31 +15,17 @@ import {
   DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, FILENAME_SEGMENT,
   type DocumentType, type ExportFormat,
 } from './techdoc-export-types';
+import { renderGenericDocx, renderGenericPdf, sanitizeFilenameSegment, type GenericDocumentViewModel } from './document-export';
 
-export { DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, type DocumentType, type ExportFormat };
+export { DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, sanitizeFilenameSegment, type DocumentType, type ExportFormat };
 
 const NOT_SET = 'не задано';
-const DASH = '—';
 
 function show(value: string | undefined): string {
   return value !== undefined && value.trim() !== '' ? value : NOT_SET;
 }
 function showNum(value: number | undefined, unit: string): string {
   return value === undefined ? NOT_SET : `${value}${unit}`;
-}
-
-/** Strips slashes, backslashes, colons, control characters and any other character that is
- *  unsafe in a filename or an HTTP header value, collapses whitespace, and bounds the length -
- *  used for BOTH the process-name segment and as a defense-in-depth pass on the whole name. */
-export function sanitizeFilenameSegment(value: string, fallback: string): string {
-  const cleaned = value
-    .replace(/[\x00-\x1f\x7f]/g, '')
-    .replace(/[\\/:*?"<>|]/g, '_')
-    .replace(/\.\./g, '_')
-    .trim()
-    .replace(/\s+/g, '-')
-    .slice(0, 60);
-  return cleaned.length > 0 ? cleaned : fallback;
 }
 
 export function buildExportFilename(doc: TechnicalProcessDocument, documentType: DocumentType, format: ExportFormat): string {
@@ -227,206 +210,37 @@ export function buildDocumentViewModel(doc: TechnicalProcessDocument, documentTy
   };
 }
 
-// ---------- DOCX renderer ----------
+// ---------- generic-renderer mapping: this ViewModel -> document-export.ts's shared shape ----------
 
-const DOCX_FONT = 'Times New Roman'; // ships with every Word install and renders Cyrillic natively
-const BODY_SIZE = 22; // half-points -> 11pt
-const SMALL_SIZE = 18; // 9pt, for table cells
-
-function textParagraph(text: string, opts: { bold?: boolean; size?: number } = {}): Paragraph {
-  return new Paragraph({ children: [new TextRun({ text, font: DOCX_FONT, size: opts.size ?? BODY_SIZE, bold: opts.bold })], spacing: { after: 100 } });
-}
-
-function metadataParagraph(item: ViewModelMetadataItem): Paragraph {
-  return new Paragraph({
-    children: [
-      new TextRun({ text: `${item.label}: `, font: DOCX_FONT, size: BODY_SIZE, bold: true }),
-      new TextRun({ text: item.value, font: DOCX_FONT, size: BODY_SIZE }),
-    ],
-    spacing: { after: 40 },
-  });
-}
-
-function docxTable(table: ViewModelTable): Table {
-  const columnWidth = Math.floor(100 / table.columns.length);
-  const headerRow = new TableRow({
-    tableHeader: true,
-    children: table.columns.map(col => new TableCell({
-      width: { size: columnWidth, type: WidthType.PERCENTAGE },
-      verticalAlign: VerticalAlign.CENTER,
-      shading: { fill: 'E2E2E2' },
-      children: [new Paragraph({ children: [new TextRun({ text: col, font: DOCX_FONT, size: SMALL_SIZE, bold: true })] })],
-    })),
-  });
-  const bodyRows = (table.rows.length > 0 ? table.rows : [table.columns.map(() => DASH)]).map(row => new TableRow({
-    children: row.map(cell => new TableCell({
-      width: { size: columnWidth, type: WidthType.PERCENTAGE },
-      children: [new Paragraph({ children: [new TextRun({ text: cell, font: DOCX_FONT, size: SMALL_SIZE })] })],
-    })),
-  }));
-  return new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows: [headerRow, ...bodyRows] });
-}
-
-export async function renderDocx(viewModel: DocumentViewModel): Promise<Buffer> {
-  const children: (Paragraph | Table)[] = [];
-  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.title, font: DOCX_FONT, size: 32, bold: true })], heading: HeadingLevel.TITLE, alignment: AlignmentType.LEFT, spacing: { after: 200 } }));
-  children.push(...viewModel.metadata.map(metadataParagraph));
-  if (viewModel.documentType === 'instruction') children.push(new Paragraph({ children: [new PageBreak()] }));
-
-  for (const section of viewModel.sections) {
-    children.push(new Paragraph({ children: [new TextRun({ text: section.heading, font: DOCX_FONT, size: 26, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
-    children.push(...section.paragraphs.map(p => textParagraph(p)));
-  }
-
-  for (const table of viewModel.tables) {
-    children.push(new Paragraph({ children: [new TextRun({ text: table.heading, font: DOCX_FONT, size: 26, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
-    children.push(docxTable(table));
-  }
-
-  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.traceabilityHeading, font: DOCX_FONT, size: 26, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 300, after: 100 } }));
+/** Maps TechDoc's own (richer) DocumentViewModel onto the generic shape the shared renderer
+ *  (document-export.ts) actually consumes - `warnings`/`qualityChecks` are NOT included here
+ *  because renderGenericDocx/Pdf never read them either; both already get folded into
+ *  `sections`/`tables` at buildDocumentViewModel() time. */
+function toGenericViewModel(viewModel: DocumentViewModel): GenericDocumentViewModel {
   const t = viewModel.traceability;
-  children.push(textParagraph(`Процесс: ${t.processName}`));
-  children.push(textParagraph(`Версия: ${t.version}`));
-  children.push(textParagraph(`Создан: ${t.createdAt}`));
-  children.push(textParagraph(`Обновлён: ${t.updatedAt}`));
-  children.push(textParagraph(`Источник: ${t.source}`));
-  children.push(textParagraph(t.calculatedFieldsNote));
-  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.footer, font: DOCX_FONT, size: 18, italics: true })], spacing: { before: 300 } }));
-
-  // Wide, many-column tables (technological/route card) get more room to stay readable in landscape.
-  const landscape = viewModel.documentType === 'technologicalCard' || viewModel.documentType === 'routeCard';
-  const [width, height] = landscape ? [16838, 11906] : [11906, 16838];
-  const document = new Document({
-    sections: [{
-      properties: { page: { size: { width, height }, margin: { top: 1134, bottom: 1134, left: 1417, right: 1417 } } },
-      children,
-    }],
-  });
-  return Packer.toBuffer(document);
+  return {
+    title: viewModel.title,
+    metadata: viewModel.metadata,
+    sections: viewModel.sections,
+    tables: viewModel.tables,
+    traceability: [
+      { label: 'Процесс', value: t.processName },
+      { label: 'Версия', value: t.version },
+      { label: 'Создан', value: t.createdAt },
+      { label: 'Обновлён', value: t.updatedAt },
+      { label: 'Источник', value: t.source },
+      { label: 'Примечание', value: t.calculatedFieldsNote },
+    ],
+    traceabilityHeading: viewModel.traceabilityHeading,
+    footer: viewModel.footer,
+  };
 }
 
-// ---------- PDF renderer ----------
-
-// Built from `process.cwd()` as a plain runtime path string, never via `require.resolve(...)` -
-// under Turbopack's route-handler bundling, `require.resolve` (even resolving the package's own
-// package.json, a "known" module type) does not return a real filesystem path at all: it
-// returns Turbopack's internal numeric module id, which then blows up `path.dirname`/`fs`
-// calls at request time ("path argument must be of type string. Received type number").
-// `process.cwd()` is always the project root for `next dev`/`next build`/`next start`, so this
-// stays correct without asking either bundler to trace or load the .ttf as a module.
-const PDF_FONT_REGULAR = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans.ttf');
-const PDF_FONT_BOLD = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans-Bold.ttf');
-const PDF_MARGIN = 56;
-
-export async function renderPdf(viewModel: DocumentViewModel): Promise<Buffer> {
-  // Wide, many-column tables (technological/route card) get more room to stay readable in landscape.
-  const landscape = viewModel.documentType === 'technologicalCard' || viewModel.documentType === 'routeCard';
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = new PDFDocument({ size: 'A4', layout: landscape ? 'landscape' : 'portrait', margin: PDF_MARGIN, bufferPages: true });
-      doc.registerFont('Body', PDF_FONT_REGULAR);
-      doc.registerFont('Bold', PDF_FONT_BOLD);
-      doc.font('Body');
-
-      const chunks: Buffer[] = [];
-      doc.on('data', chunk => chunks.push(chunk));
-      doc.on('end', () => {
-        const pages = doc.bufferedPageRange();
-        for (let i = 0; i < pages.count; i++) {
-          doc.switchToPage(pages.start + i);
-          doc.font('Body').fontSize(8).fillColor('#666666')
-            .text(`Страница ${i + 1} из ${pages.count}`, PDF_MARGIN, doc.page.height - PDF_MARGIN + 20, { width: doc.page.width - PDF_MARGIN * 2, align: 'center' });
-        }
-        resolve(Buffer.concat(chunks));
-      });
-      doc.on('error', reject);
-
-      const contentWidth = doc.page.width - PDF_MARGIN * 2;
-
-      doc.font('Bold').fontSize(16).fillColor('#000000').text(viewModel.title, { width: contentWidth });
-      doc.moveDown(0.5);
-      doc.font('Body').fontSize(10);
-      for (const item of viewModel.metadata) {
-        doc.font('Bold').text(`${item.label}: `, { continued: true, width: contentWidth }).font('Body').text(item.value);
-      }
-      doc.moveDown(0.5);
-      if (viewModel.documentType === 'instruction') doc.addPage();
-
-      for (const section of viewModel.sections) {
-        ensureSpace(doc, 40);
-        doc.font('Bold').fontSize(13).text(section.heading, { width: contentWidth });
-        doc.moveDown(0.3);
-        doc.font('Body').fontSize(10);
-        for (const paragraph of section.paragraphs) {
-          ensureSpace(doc, 14);
-          doc.text(paragraph, { width: contentWidth, align: 'left' });
-          doc.moveDown(0.2);
-        }
-        doc.moveDown(0.4);
-      }
-
-      for (const table of viewModel.tables) {
-        ensureSpace(doc, 40);
-        doc.font('Bold').fontSize(13).text(table.heading, { width: contentWidth });
-        doc.moveDown(0.3);
-        drawTable(doc, table, contentWidth);
-        doc.moveDown(0.4);
-      }
-
-      ensureSpace(doc, 60);
-      doc.font('Bold').fontSize(13).text(viewModel.traceabilityHeading, { width: contentWidth });
-      doc.moveDown(0.3);
-      doc.font('Body').fontSize(10);
-      const t = viewModel.traceability;
-      for (const line of [`Процесс: ${t.processName}`, `Версия: ${t.version}`, `Создан: ${t.createdAt}`, `Обновлён: ${t.updatedAt}`, `Источник: ${t.source}`, t.calculatedFieldsNote]) {
-        doc.text(line, { width: contentWidth });
-      }
-      doc.moveDown(0.5);
-      doc.font('Body').fontSize(8).fillColor('#666666').text(viewModel.footer, { width: contentWidth });
-
-      doc.end();
-    } catch (error) {
-      reject(error instanceof Error ? error : new Error('Не удалось сформировать PDF.'));
-    }
-  });
-}
-
-function ensureSpace(doc: PDFKit.PDFDocument, minHeight: number): void {
-  if (doc.y + minHeight > doc.page.height - PDF_MARGIN) doc.addPage();
-}
-
-function drawTable(doc: PDFKit.PDFDocument, table: ViewModelTable, contentWidth: number): void {
-  const columnWidth = contentWidth / table.columns.length;
-  const rows = table.rows.length > 0 ? table.rows : [table.columns.map(() => DASH)];
-
-  function drawHeader(): void {
-    const startY = doc.y;
-    doc.font('Bold').fontSize(8);
-    const rowHeight = Math.max(...table.columns.map(col => doc.heightOfString(col, { width: columnWidth - 6 }))) + 8;
-    doc.rect(PDF_MARGIN, startY, contentWidth, rowHeight).fill('#E2E2E2');
-    doc.fillColor('#000000');
-    table.columns.forEach((col, i) => {
-      doc.text(col, PDF_MARGIN + i * columnWidth + 3, startY + 4, { width: columnWidth - 6 });
-    });
-    doc.y = startY + rowHeight;
-  }
-
-  drawHeader();
-  doc.font('Body').fontSize(8);
-
-  for (const row of rows) {
-    const rowHeight = Math.max(...row.map(cell => doc.heightOfString(cell || DASH, { width: columnWidth - 6 }))) + 8;
-    if (doc.y + rowHeight > doc.page.height - PDF_MARGIN) {
-      doc.addPage();
-      drawHeader();
-      doc.font('Body').fontSize(8);
-    }
-    const startY = doc.y;
-    row.forEach((cell, i) => {
-      doc.text(cell || DASH, PDF_MARGIN + i * columnWidth + 3, startY + 4, { width: columnWidth - 6 });
-    });
-    doc.y = startY + rowHeight;
-  }
+function renderOptionsFor(documentType: DocumentType) {
+  return {
+    layout: (documentType === 'technologicalCard' || documentType === 'routeCard' ? 'landscape' : 'portrait') as 'landscape' | 'portrait',
+    pageBreakAfterMetadata: documentType === 'instruction',
+  };
 }
 
 // ---------- top-level export entry point ----------
@@ -440,7 +254,9 @@ const CONTENT_TYPE: Record<ExportFormat, string> = {
 
 export async function exportTechDoc(doc: TechnicalProcessDocument, documentType: DocumentType, format: ExportFormat): Promise<ExportResult> {
   const viewModel = buildDocumentViewModel(doc, documentType);
-  const buffer = format === 'docx' ? await renderDocx(viewModel) : await renderPdf(viewModel);
+  const generic = toGenericViewModel(viewModel);
+  const options = renderOptionsFor(documentType);
+  const buffer = format === 'docx' ? await renderGenericDocx(generic, options) : await renderGenericPdf(generic, options);
   return { buffer, filename: buildExportFilename(doc, documentType, format), contentType: CONTENT_TYPE[format] };
 }
 

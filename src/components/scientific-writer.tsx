@@ -38,6 +38,7 @@ function toInput(form: FormState): ScientificWriterInput {
 }
 
 type GenerationState = 'idle' | 'loading' | 'done' | 'not_configured' | 'unavailable' | 'error';
+type ExportState = 'idle' | 'generating' | 'done' | 'error';
 
 interface GenerationResult {
   generatedText: string;
@@ -56,6 +57,9 @@ export function ScientificWriter() {
   const [scaffold, setScaffold] = useState<ScaffoldSection[] | null>(null);
   const [evidencePreview, setEvidencePreview] = useState<EvidenceReport | null>(null);
   const [result, setResult] = useState<GenerationResult | null>(null);
+  const [exportFormat, setExportFormat] = useState<'docx' | 'pdf'>('docx');
+  const [exportState, setExportState] = useState<ExportState>('idle');
+  const [exportError, setExportError] = useState('');
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -128,7 +132,54 @@ export function ScientificWriter() {
     try { await navigator.clipboard.writeText(text); } catch { /* clipboard unavailable - nothing to fall back to */ }
   }
 
+  function buildExportPayload() {
+    if (result) {
+      return {
+        documentType: form.documentType, title: form.title || undefined, generatedByAI: true,
+        sections: [{ heading: DOCUMENT_TYPE_LABELS[form.documentType], text: result.generatedText }],
+        providedFields: result.evidence.provided, missingFields: result.evidence.missing, warnings: result.warnings,
+      };
+    }
+    if (scaffold) {
+      return {
+        documentType: form.documentType, title: form.title || undefined, generatedByAI: false,
+        sections: scaffold.map(s => ({ heading: s.heading, text: s.text })),
+        providedFields: evidencePreview?.provided ?? [], missingFields: evidencePreview?.missing ?? [], warnings: [] as string[],
+      };
+    }
+    return null;
+  }
+
+  async function exportDocument() {
+    const payload = buildExportPayload();
+    if (!payload) return;
+    setExportState('generating'); setExportError('');
+    try {
+      const response = await fetch('/api/workspace/scientific-writer/export', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ request: payload, format: exportFormat }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.error ?? 'Не удалось сформировать файл.');
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get('Content-Disposition') ?? '';
+      const match = /filename\*=UTF-8''([^;]+)/.exec(disposition);
+      const filename = match ? decodeURIComponent(match[1]) : `document.${exportFormat}`;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url; link.download = filename;
+      document.body.appendChild(link); link.click(); link.remove();
+      URL.revokeObjectURL(url);
+      setExportState('done');
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : 'Не удалось сформировать файл.');
+      setExportState('error');
+    }
+  }
+
   const isRewriteLike = REWRITE_LIKE_MODES.includes(form.mode);
+  const canExport = !!(result || scaffold);
 
   return <div className="flex flex-col gap-6">
     {providerConfigured === false && <p role="status" className="content-card">
@@ -240,6 +291,24 @@ export function ScientificWriter() {
       </div>)}
       {evidencePreview && <p className="muted small mt-3">Не задано: {evidencePreview.missing.join(', ') || '—'}</p>}
     </section>}
+
+    <section className="content-card">
+      <h2>Экспорт документа</h2>
+      <p className="muted small">Экспортируется именно текущий результат ({result ? 'сгенерированный ИИ' : scaffold ? 'локальная структура без ИИ' : 'пока отсутствует'}) - сначала нажмите «Сформировать» выше.</p>
+      <div className="flex gap-2 items-end mt-3">
+        <label className="text-sm">Формат
+          <select className="rounded-md border border-[#dce0e5] p-3 mt-1 block" value={exportFormat} onChange={e => setExportFormat(e.target.value as 'docx' | 'pdf')}>
+            <option value="docx">DOCX</option>
+            <option value="pdf">PDF</option>
+          </select>
+        </label>
+        <button type="button" className="button primary" disabled={!canExport || exportState === 'generating'} onClick={exportDocument}>
+          {exportState === 'generating' ? 'Формирование…' : 'Экспортировать'}
+        </button>
+      </div>
+      {exportState === 'done' && <p role="status" className="mt-2">Файл сформирован и скачан.</p>}
+      {exportState === 'error' && <p role="alert" className="mt-2">{exportError}</p>}
+    </section>
 
     <SimilarityCheck />
 
