@@ -9,6 +9,7 @@ import {
 } from '@/services/workspace/scientific-writer';
 import { SimilarityCheck } from './anti-plagiarism';
 import { ReferenceManager } from './reference-manager';
+import { consumePendingReferences } from '@/services/workspace/scifinder-import';
 import type { Reference, CitationStyle, DocumentProfileId } from '@/services/workspace/references';
 
 const REWRITE_LIKE_MODES: readonly WriterMode[] = ['rewrite', 'edit', 'translate_ru_en', 'translate_en_ru'];
@@ -69,6 +70,16 @@ export function ScientificWriter() {
   useEffect(() => {
     const t = setTimeout(() => {
       fetch('/api/workspace/scientific-writer').then(r => r.json()).then(body => setProviderConfigured(!!body.configured)).catch(() => setProviderConfigured(false));
+    }, 0);
+    return () => clearTimeout(t);
+  }, []);
+
+  // Picks up any references queued from SciFinder ("Добавить в Scientific Writer") since the
+  // last time this module was open - consumed once per mount, never re-imported on remount.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const pending = consumePendingReferences();
+      if (pending.length > 0) setReferences(prev => [...prev, ...pending]);
     }, 0);
     return () => clearTimeout(t);
   }, []);

@@ -1,8 +1,21 @@
+'use client';
+
+import { useState } from 'react';
 import type { Publication } from '@/services/scientific-search/types';
 import { doiUrl } from '@/services/scientific-search/normalization';
+import { queuePublicationForScientificWriter } from '@/services/workspace/scifinder-import';
 import styles from './search.module.css';
 
+type ImportState = 'idle' | 'added' | 'duplicate';
+
 export function PublicationCard({ publication, index }: { publication: Publication; index: number }) {
+  const [importState, setImportState] = useState<ImportState>('idle');
+
+  function addToScientificWriter() {
+    const outcome = queuePublicationForScientificWriter(publication);
+    setImportState(outcome.status === 'queued' ? 'added' : 'duplicate');
+  }
+
   const fields = [
     ['Год', publication.year], ['Журнал / источник', publication.journal],
     ['Тип публикации', publication.type], ['Издатель', publication.publisher],
@@ -30,6 +43,13 @@ export function PublicationCard({ publication, index }: { publication: Publicati
         <p>{publication.abstract.length > 700 ? `${publication.abstract.slice(0, 700)}…` : publication.abstract}</p>
         {publication.abstract.length > 700 && <details><summary>Показать abstract полностью</summary><p>{publication.abstract}</p></details>}
       </div>}
+      <div className="mt-2">
+        <button type="button" className="button secondary" onClick={addToScientificWriter} disabled={importState !== 'idle'}>
+          Добавить в Scientific Writer
+        </button>
+        {importState === 'added' && <p role="status" className="muted small mt-1">Добавлено в список источников Scientific Writer - откройте модуль Scientific Writer, чтобы увидеть его.</p>}
+        {importState === 'duplicate' && <p role="alert" className="muted small mt-1">Такой источник (по DOI/названию) уже был добавлен ранее - повторно не добавлен.</p>}
+      </div>
     </article>
   );
 }

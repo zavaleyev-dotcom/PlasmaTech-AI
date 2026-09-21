@@ -19,6 +19,18 @@ export const REFERENCE_TYPE_LABELS: Record<ReferenceType, string> = {
   website: 'Веб-источник',
 };
 
+/** Where a reference came from - purely informational, never read by any formatter, so it can
+ *  never change the formatted citation text (SciFinder-integration item 4). Absent entirely for
+ *  a manually-typed reference. */
+export interface ReferenceProvenance {
+  source: 'scifinder';
+  /** Provider(s) that reported this record, e.g. "crossref", "openalex", or "crossref+openalex". */
+  provider: string;
+  importedAt: string;
+  /** The original SciFinder result's DOI or internal id, kept only for traceability. */
+  originalId?: string;
+}
+
 export interface Reference {
   id: string;
   type: ReferenceType;
@@ -35,9 +47,10 @@ export interface Reference {
   url?: string;
   accessDate?: string;
   language?: string;
+  provenance?: ReferenceProvenance;
 }
 
-function generateReferenceId(): string {
+export function generateReferenceId(): string {
   return `ref-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
