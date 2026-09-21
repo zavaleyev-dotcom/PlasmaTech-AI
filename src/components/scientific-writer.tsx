@@ -8,6 +8,8 @@ import {
   type EvidenceReport, type ScaffoldSection, type PreservationCheck,
 } from '@/services/workspace/scientific-writer';
 import { SimilarityCheck } from './anti-plagiarism';
+import { ReferenceManager } from './reference-manager';
+import type { Reference, CitationStyle, DocumentProfileId } from '@/services/workspace/references';
 
 const REWRITE_LIKE_MODES: readonly WriterMode[] = ['rewrite', 'edit', 'translate_ru_en', 'translate_en_ru'];
 
@@ -60,6 +62,9 @@ export function ScientificWriter() {
   const [exportFormat, setExportFormat] = useState<'docx' | 'pdf'>('docx');
   const [exportState, setExportState] = useState<ExportState>('idle');
   const [exportError, setExportError] = useState('');
+  const [references, setReferences] = useState<Reference[]>([]);
+  const [citationStyle, setCitationStyle] = useState<CitationStyle>('apa');
+  const [profileId, setProfileId] = useState<DocumentProfileId>('generic_article');
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -133,11 +138,13 @@ export function ScientificWriter() {
   }
 
   function buildExportPayload() {
+    const referenceFields = { references: references.length ? references : undefined, citationStyle, profileId };
     if (result) {
       return {
         documentType: form.documentType, title: form.title || undefined, generatedByAI: true,
         sections: [{ heading: DOCUMENT_TYPE_LABELS[form.documentType], text: result.generatedText }],
         providedFields: result.evidence.provided, missingFields: result.evidence.missing, warnings: result.warnings,
+        ...referenceFields,
       };
     }
     if (scaffold) {
@@ -145,6 +152,7 @@ export function ScientificWriter() {
         documentType: form.documentType, title: form.title || undefined, generatedByAI: false,
         sections: scaffold.map(s => ({ heading: s.heading, text: s.text })),
         providedFields: evidencePreview?.provided ?? [], missingFields: evidencePreview?.missing ?? [], warnings: [] as string[],
+        ...referenceFields,
       };
     }
     return null;
@@ -309,6 +317,12 @@ export function ScientificWriter() {
       {exportState === 'done' && <p role="status" className="mt-2">Файл сформирован и скачан.</p>}
       {exportState === 'error' && <p role="alert" className="mt-2">{exportError}</p>}
     </section>
+
+    <ReferenceManager
+      references={references} onChangeReferences={setReferences}
+      citationStyle={citationStyle} onChangeCitationStyle={setCitationStyle}
+      profileId={profileId} onChangeProfileId={setProfileId}
+    />
 
     <SimilarityCheck />
 
