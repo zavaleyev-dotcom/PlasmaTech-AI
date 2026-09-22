@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { workspaceModules, isWorkspaceModuleLive, moduleBadge, getWorkspaceModule } from '../src/modules/workspace/registry';
 import { tools } from '../src/lib/content';
 
@@ -58,4 +60,10 @@ test('content.ts: no tool metadata still claims to be a non-functional demo/plac
     assert.ok(!text.includes('не выполняется') && !text.includes('не используются для расчета') && !text.includes('не генерируются'),
       `${tool.id}: note text still disclaims real functionality: "${tool.note}"`);
   }
+});
+
+test('src/app/page.tsx: the homepage no longer claims the (fully live) workspace is a demo (regression against reintroducing false demo copy)', () => {
+  const source = readFileSync(join(__dirname, '..', 'src', 'app', 'page.tsx'), 'utf8').toLocaleLowerCase();
+  assert.ok(!source.includes('демонстрационном режиме'), 'homepage must not claim the tools run "in demo mode"');
+  assert.ok(!source.includes('демонстрационн'), 'homepage must not contain any "demo"-framing copy for the (live) workspace section');
 });
