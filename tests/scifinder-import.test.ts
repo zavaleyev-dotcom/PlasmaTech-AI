@@ -6,12 +6,13 @@ import { normalizeCrossrefWork } from '../src/integrations/crossref/normalize';
 import { normalizeOpenAlexWork } from '../src/integrations/openalex/normalize';
 import type { Publication } from '../src/services/scientific-search/types';
 import {
-  mapPublicationToReference, queuePublicationForScientificWriter, consumePendingReferences,
+  mapPublicationToReference, queuePublicationForScientificWriter, peekPendingReferences, clearPendingReferences,
   createInMemoryStoreForTests, type KeyValueStore,
 } from '../src/services/workspace/scifinder-import';
 import {
-  formatReferenceApa, formatReferenceIeee, formatReferenceGost, removeReference, updateReference,
+  formatReferenceApa, formatReferenceIeee, formatReferenceGost, removeReference, updateReference, type Reference,
 } from '../src/services/workspace/references';
+import { loadReferences, saveReferences, mergeReferencesById } from '../src/services/workspace/scientific-writer-references-store';
 import { exportScientificDocument, buildScientificDocumentViewModel } from '../src/services/workspace/scientific-writer-export';
 
 // The Node test runtime's built-in `localStorage` global exists but its methods are
@@ -19,6 +20,19 @@ import { exportScientificDocument, buildScientificDocumentViewModel } from '../s
 // instead of relying on the (auto-detected, real-browser-only) default.
 function freshStore(): KeyValueStore {
   return createInMemoryStoreForTests();
+}
+
+/** Simulates EXACTLY what Scientific Writer's own mount effect does (see
+ *  src/components/scientific-writer.tsx): load the canonical list, merge in anything queued
+ *  from SciFinder, and only clear the queue once the merge is confirmed durably saved. Used
+ *  here to exercise the real F02 fix (persistence across "unmount/remount") without a browser. */
+function simulateScientificWriterMount(store: KeyValueStore): Reference[] {
+  const saved = loadReferences(store);
+  const pending = peekPendingReferences(store);
+  if (pending.length === 0) return saved;
+  const merged = mergeReferencesById(saved, pending);
+  if (saveReferences(merged, store)) clearPendingReferences(pending.map(r => r.id), store);
+  return merged;
 }
 
 async function extractPdfText(buffer: Buffer): Promise<string> {
@@ -218,22 +232,25 @@ test('provider disagreement: a publication already merged from Crossref+OpenAlex
 
 // ---------- import into Scientific Writer / edit / remove (item 14) ----------
 
-test('import into Scientific Writer: consumePendingReferences returns queued items once, and never re-imports them on a second call', () => {
+test('import into Scientific Writer: mounting merges the queue into the canonical store and clears it, so a second mount does not re-add anything', () => {
   const store = freshStore();
   const pub = normalizeCrossrefWork(crossrefWork());
   queuePublicationForScientificWriter(pub, store);
-  const firstConsume = consumePendingReferences(store);
-  assert.equal(firstConsume.length, 1);
-  assert.equal(firstConsume[0].doi, '10.5555/scifinder.test.0001');
-  const secondConsume = consumePendingReferences(store);
-  assert.equal(secondConsume.length, 0, 'already-consumed items must not be re-imported on a later mount');
+  const firstMount = simulateScientificWriterMount(store);
+  assert.equal(firstMount.length, 1);
+  assert.equal(firstMount[0].doi, '10.5555/scifinder.test.0001');
+  assert.equal(peekPendingReferences(store).length, 0, 'the queue must be cleared once the merge is durably saved');
+
+  const secondMount = simulateScientificWriterMount(store);
+  assert.equal(secondMount.length, 1, 'the reference must still be there on a second mount - not duplicated, not lost');
+  assert.deepEqual(secondMount, firstMount);
 });
 
 test('remove imported reference: removeReference works uniformly on a SciFinder-imported reference', () => {
   const store = freshStore();
   const pub = normalizeCrossrefWork(crossrefWork());
   queuePublicationForScientificWriter(pub, store);
-  const [imported] = consumePendingReferences(store);
+  const [imported] = simulateScientificWriterMount(store);
   const afterRemoval = removeReference([imported], imported.id);
   assert.equal(afterRemoval.length, 0);
 });
@@ -242,10 +259,67 @@ test('edit imported reference: updateReference changes a field while provenance 
   const store = freshStore();
   const pub = normalizeCrossrefWork(crossrefWork());
   queuePublicationForScientificWriter(pub, store);
-  const [imported] = consumePendingReferences(store);
+  const [imported] = simulateScientificWriterMount(store);
   const [edited] = updateReference([imported], imported.id, { title: 'Manually corrected title' });
   assert.equal(edited.title, 'Manually corrected title');
   assert.equal(edited.provenance?.source, 'scifinder');
+});
+
+// ---------- F02 (HIGH) full regression flow: persistence survives unmount/remount ----------
+
+test('F02 full flow: import -> mount (merge+save) -> simulated unmount/remount -> reference still restored, and re-importing the SAME DOI is correctly a duplicate', () => {
+  const store = freshStore();
+  const pub = normalizeCrossrefWork(crossrefWork());
+
+  // 1. SciFinder: user clicks "Добавить в Scientific Writer".
+  const queued = queuePublicationForScientificWriter(pub, store);
+  assert.equal(queued.status, 'queued');
+
+  // 2. Scientific Writer mounts for the first time: reference appears, queue is drained.
+  const afterFirstMount = simulateScientificWriterMount(store);
+  assert.equal(afterFirstMount.length, 1);
+
+  // 3. Simulated unmount: nothing more happens to the store (no code runs) - this IS the
+  //    unmount, since React state alone (never touched here) is where the OLD bug lived.
+
+  // 4. Simulated remount: Scientific Writer mounts again from scratch.
+  const afterRemount = simulateScientificWriterMount(store);
+  assert.equal(afterRemount.length, 1, 'the reference must survive the remount - this is exactly the bug F02 reports');
+  assert.equal(afterRemount[0].doi, '10.5555/scifinder.test.0001');
+
+  // 5. Re-importing the SAME publication is correctly detected as a duplicate, because the
+  //    reference genuinely, durably still exists - not because of a stale, separate ledger flag.
+  const secondImport = queuePublicationForScientificWriter(pub, store);
+  assert.equal(secondImport.status, 'duplicate');
+
+  // 6. After the user deletes the reference, the DOI is genuinely gone - so re-importing the
+  //    same publication is now correctly allowed again (predictable delete/re-import semantics).
+  const afterDelete = removeReference(afterRemount, afterRemount[0].id);
+  assert.equal(saveReferences(afterDelete, store), true);
+  const thirdImport = queuePublicationForScientificWriter(pub, store);
+  assert.equal(thirdImport.status, 'queued', 'once genuinely deleted, the same DOI must be importable again');
+});
+
+test('F02: a failed save never clears the pending queue, so a later successful mount still delivers the reference', () => {
+  const store = freshStore();
+  const pub = normalizeCrossrefWork(crossrefWork());
+  queuePublicationForScientificWriter(pub, store);
+
+  // Simulate a mount whose save attempt fails (storage unavailable/quota) - pass a store whose
+  // setItem always throws, exactly like a real quota/permission failure would.
+  const failingStore: KeyValueStore = { getItem: store.getItem.bind(store), setItem: () => { throw new Error('quota exceeded'); } };
+  const saved = loadReferences(failingStore);
+  const pendingDuringFailure = peekPendingReferences(failingStore);
+  assert.equal(pendingDuringFailure.length, 1);
+  const merged = mergeReferencesById(saved, pendingDuringFailure);
+  const persisted = saveReferences(merged, failingStore);
+  assert.equal(persisted, false, 'the save itself must honestly report failure');
+  if (persisted) clearPendingReferences(pendingDuringFailure.map(r => r.id), failingStore); // never reached - mirrors the real component's guard
+
+  // The queue must be untouched by the failed attempt - a later, working mount still delivers it.
+  assert.equal(peekPendingReferences(store).length, 1, 'a failed save must never clear the pending queue');
+  const laterMount = simulateScientificWriterMount(store);
+  assert.equal(laterMount.length, 1, 'the reference must still be delivered once storage works again');
 });
 
 // ---------- citation formatting after import (item 11/14) ----------

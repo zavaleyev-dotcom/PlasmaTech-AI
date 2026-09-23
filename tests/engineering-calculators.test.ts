@@ -87,3 +87,35 @@ test('calculateMeanFreePath (Codex regression): an unexpected pressure unit or g
   assert.throws(() => calculateMeanFreePath({ pressure: 1, pressureUnit: 'bogus' as never, temperatureC: 20, gas: 'argon' }), /[Ее]диница давления/);
   assert.throws(() => calculateMeanFreePath({ pressure: 1, pressureUnit: 'pa', temperatureC: 20, gas: 'bogus_gas' as never }), /Газ/);
 });
+
+// ---------- F04 (MEDIUM): null-coercion and overflow are real validation errors, not silent 0/Infinity ----------
+
+test('calculateMeanFreePath (F04): a null temperature must never be silently treated as 0 °C (JS would otherwise compute null + 273.15 = 273.15)', () => {
+  assert.throws(
+    () => calculateMeanFreePath({ pressure: 1, pressureUnit: 'pa', temperatureC: null as unknown as number, gas: 'argon' }),
+    /Температура: введите конечное число\./,
+  );
+});
+
+test('calculateMeanFreePath (F04): undefined/NaN/Infinity temperature is also rejected, never coerced', () => {
+  for (const bad of [undefined, NaN, Infinity, -Infinity]) {
+    assert.throws(() => calculateMeanFreePath({ pressure: 1, pressureUnit: 'pa', temperatureC: bad as number, gas: 'argon' }), /Температура: введите конечное число\./);
+  }
+});
+
+test('calculateMeanFreePath (F04): a genuinely valid negative temperature (a real cryogenic value) is still accepted, not rejected just for being negative', () => {
+  assert.doesNotThrow(() => calculateMeanFreePath({ pressure: 1, pressureUnit: 'pa', temperatureC: -150, gas: 'argon' }));
+});
+
+test('solveDeposition (F04): an extreme but individually-valid combination that would overflow to Infinity is rejected as a controlled error, never returned as Infinity', () => {
+  assert.throws(
+    () => solveDeposition({ solveFor: 'time', thickness: 1e300, thicknessUnit: 'nm', rate: 1e-300, rateUnit: 'nm_per_min', timeUnit: 'min' }),
+    /результат расчёта не является конечным числом/,
+  );
+});
+
+test('solveDeposition (F04): a normal, representative calculation is completely unaffected by the new overflow guard', () => {
+  const result = solveDeposition({ solveFor: 'time', thickness: 2500, thicknessUnit: 'nm', rate: 25, rateUnit: 'nm_per_min', timeUnit: 'min' });
+  assert.ok(Number.isFinite(result.value));
+  assert.ok(Math.abs(result.value - 100) < 1e-9);
+});

@@ -30,6 +30,26 @@ function optionalNonNegative(value: number | undefined, label: string): number {
   return assertValid(value, label, { allowZero: true });
 }
 
+/** F05: for a figure that may legitimately be negative (an economic effect/benefit/savings
+ *  can be a real loss, not just a gain) - still requires a genuine finite number. Previously
+ *  several of these parameters were used directly with no validation of their own, so a NaN
+ *  (from an upstream bug, or a caller that skips the UI entirely) silently produced a NaN
+ *  "successful" result instead of a controlled error - e.g. `calculatePayback(100, NaN)`
+ *  returned `{ years: NaN, ... }` because `NaN <= 0` is false in JS, so the "not defined"
+ *  branch never even ran. */
+function assertFinite(value: number, label: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${label}: введите конечное число.`);
+  return value;
+}
+
+/** F05: a computed result must itself be a real, finite number - extreme but individually
+ *  in-range inputs can still overflow the arithmetic to Infinity/NaN. Such a result is a
+ *  controlled validation error, never returned as if it were a normal calculation. */
+function requireFiniteResult(value: number, label: string): number {
+  if (!Number.isFinite(value)) throw new Error(`${label}: результат расчёта не является конечным числом - проверьте введённые величины.`);
+  return value;
+}
+
 // ---------- currency: display formatting ONLY - never a conversion ----------
 
 export type Currency = 'RUB' | 'USD' | 'EUR';
@@ -148,14 +168,21 @@ export interface ProductionCapacityResult {
 export function calculateProductionCapacity(input: ProductionCapacityInput): ProductionCapacityResult {
   const shiftsPerDay = assertValid(input.shiftsPerDay, 'Смен в сутки');
   const hoursPerShift = assertValid(input.hoursPerShift, 'Часов в смену');
+  // F05: a day genuinely has only 24 hours - shifts×hours exceeding that is not "unusual but
+  // possible", it is physically impossible, unlike e.g. an unusually high temperature
+  // elsewhere in this app which is deliberately never capped. This is the one universally
+  // safe ceiling for this input pair - no other field here gets an invented limit.
+  if (shiftsPerDay * hoursPerShift > 24) {
+    throw new Error(`Смены и часы: ${shiftsPerDay} смены × ${hoursPerShift} ч физически невозможны - в сутках только 24 часа.`);
+  }
   const workingDaysPerYear = assertValid(input.workingDaysPerYear, 'Рабочих дней в год', { max: 366 });
   const utilizationPercent = assertValid(input.utilizationPercent, 'Загрузка оборудования', { max: 100, allowZero: true });
   const cycleTimeMinutes = assertValid(input.cycleTimeMinutes, 'Время одного цикла');
   const unitsPerCycle = assertValid(input.unitsPerCycle, 'Количество изделий за цикл');
 
-  const effectiveHoursPerYear = shiftsPerDay * hoursPerShift * workingDaysPerYear * (utilizationPercent / 100);
-  const cyclesPerYear = (effectiveHoursPerYear * 60) / cycleTimeMinutes;
-  const unitsPerYear = cyclesPerYear * unitsPerCycle;
+  const effectiveHoursPerYear = requireFiniteResult(shiftsPerDay * hoursPerShift * workingDaysPerYear * (utilizationPercent / 100), 'Эффективные часы в год');
+  const cyclesPerYear = requireFiniteResult((effectiveHoursPerYear * 60) / cycleTimeMinutes, 'Циклов в год');
+  const unitsPerYear = requireFiniteResult(cyclesPerYear * unitsPerCycle, 'Единиц в год');
   return {
     effectiveHoursPerYear, cyclesPerYear, unitsPerYear,
     formula: `эфф. часы = ${shiftsPerDay} × ${hoursPerShift} × ${workingDaysPerYear} × ${(utilizationPercent / 100).toFixed(2)}; циклов/год = эфф. часы × 60 / ${cycleTimeMinutes}; ед./год = циклов/год × ${unitsPerCycle}`,
@@ -229,6 +256,7 @@ export function calculateEconomicEffect(input: EconomicEffectInput): EconomicEff
 /** Simple (non-discounted) cumulative savings for each of `years` years - a running sum,
  *  never randomized or estimated. */
 export function calculateCumulativeSavings(annualSavings: number, years: number): number[] {
+  assertFinite(annualSavings, 'Годовая экономия');
   const n = Math.floor(assertValid(years, 'Число лет для накопленной экономии'));
   const result: number[] = [];
   for (let i = 1; i <= n; i++) result.push(annualSavings * i);
@@ -244,10 +272,14 @@ export interface PaybackResult { years: number | null; months: number | null; me
  *  understandable message instead (item 7). */
 export function calculatePayback(capex: number, annualEffect: number): PaybackResult {
   assertValid(capex, 'CAPEX', { allowZero: true });
+  // F05: `annualEffect` itself was never validated - since `NaN <= 0` is false in JS, a NaN
+  // effect used to skip straight past the "not defined" branch below and come out as
+  // `{ years: NaN, months: NaN, message: null }`, i.e. a NaN result presented as successful.
+  assertFinite(annualEffect, 'Годовой экономический эффект');
   if (annualEffect <= 0) {
     return { years: null, months: null, message: 'Окупаемость не определена: годовой экономический эффект не положителен.', formula: 'payback = CAPEX / годовой эффект (не определено при эффекте ≤ 0)' };
   }
-  const years = capex / annualEffect;
+  const years = requireFiniteResult(capex / annualEffect, 'Окупаемость');
   return { years, months: years * 12, message: null, formula: `payback = CAPEX / годовой эффект = ${capex.toFixed(2)} / ${annualEffect.toFixed(2)}` };
 }
 
@@ -265,9 +297,12 @@ export interface RoiResult { percent: number; formula: string }
  *  DELTA, i.e. already net of the new system's operating cost) must pass 0 here, or OPEX gets
  *  subtracted twice (see runAssessment). */
 export function calculateRoi(annualBenefit: number, annualOperatingCost: number, capex: number): RoiResult {
+  // F05: annualBenefit may legitimately be negative (a losing investment), but must still be a
+  // real finite number - previously unvalidated, so a NaN benefit produced a NaN "result".
+  assertFinite(annualBenefit, 'Годовой экономический эффект');
   assertValid(annualOperatingCost, 'Годовые эксплуатационные затраты', { allowZero: true });
   const capexValue = assertValid(capex, 'CAPEX');
-  const percent = ((annualBenefit - annualOperatingCost) / capexValue) * 100;
+  const percent = requireFiniteResult(((annualBenefit - annualOperatingCost) / capexValue) * 100, 'ROI');
   return { percent, formula: `ROI % = (годовой эффект − годовые OPEX) / CAPEX × 100 = (${annualBenefit.toFixed(2)} − ${annualOperatingCost.toFixed(2)}) / ${capexValue.toFixed(2)} × 100` };
 }
 

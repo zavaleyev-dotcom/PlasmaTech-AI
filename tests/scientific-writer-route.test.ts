@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { GET as writerGET, POST as writerPOST, handleGenerate } from '../src/app/api/workspace/scientific-writer/route';
+import { GET as writerGET, POST as writerPOST } from '../src/app/api/workspace/scientific-writer/route';
+import { handleGenerate } from '../src/services/workspace/scientific-writer-handler';
 import { WriterProviderError, type WriterProvider } from '../src/services/workspace/scientific-writer-provider';
 
 function stubProvider(overrides: Partial<WriterProvider> = {}): WriterProvider {
@@ -155,6 +156,18 @@ test('handleGenerate: provider error (401/malformed/empty) returns 502 with code
   const { status, body } = await handleGenerate(validDraftBody, stubProvider({ generate: async () => { throw new WriterProviderError('OpenAI отклонил доступ.', 'error'); } }));
   assert.equal(status, 502);
   assert.equal(body.code, 'error');
+});
+
+// ---------- F10: an arbitrary (non-WriterProviderError) exception never leaks its message ----------
+
+test('handleGenerate: an arbitrary Error thrown by a misbehaving provider (not a WriterProviderError) never leaks its raw message', async () => {
+  const { status, body } = await handleGenerate(validDraftBody, stubProvider({
+    generate: async () => { throw new Error('ENOENT: /Users/someone/.secret/config.json'); },
+  }));
+  assert.equal(status, 502);
+  assert.equal(body.code, 'error');
+  assert.equal(body.error, 'Не удалось сформировать текст.');
+  assert.ok(!String(body.error).includes('/Users/'), 'a raw filesystem path from an unrelated exception must never reach the client');
 });
 
 test('handleGenerate: a non-object body is rejected with 400 rather than crashing', async () => {

@@ -96,6 +96,28 @@ test('validateDocument: rejects NaN/Infinity, negative time/pressure/flow/power,
   assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { gasUsage: [{ gas: 'Ar', flowSccm: -1 }] }) }), /расход газа/);
 });
 
+test('validateDocument (F08): rejects negative rotation speed and negative target-to-substrate distance - magnitudes with no negative convention anywhere in this model', () => {
+  let doc = withName(createBlankDocument());
+  doc = { ...doc, steps: addStep(doc.steps, 'main_coating') };
+  assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { rotationRpm: -10 }) }), /вращение/);
+  assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { distanceMm: -50 }) }), /расстояние/);
+  assert.doesNotThrow(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { rotationRpm: 30, distanceMm: 120 }) }));
+});
+
+test('validateDocument (F08): substrate bias stays finite-only (never rejected merely for being negative - that is its normal, expected sign in PVD)', () => {
+  let doc = withName(createBlankDocument());
+  doc = { ...doc, steps: addStep(doc.steps, 'main_coating') };
+  assert.doesNotThrow(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { substrateBiasV: -80 }) }), 'a negative bias is the normal case in PVD, not an error');
+  assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { substrateBiasV: NaN }) }), /bias/);
+});
+
+test('validateDocument (F08): an unusual but physically possible high temperature (e.g. 900 °C) is never rejected just because it is large - no invented technological ceiling', () => {
+  let doc = withName(createBlankDocument());
+  doc = { ...doc, steps: addStep(doc.steps, 'main_coating') };
+  assert.doesNotThrow(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { temperatureC: 900 }) }));
+  assert.doesNotThrow(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { temperatureC: -196 }) }), 'a real cryogenic sub-zero temperature is also not an error');
+});
+
 test('validateDocument: rejects a duplicate step order and an empty process name', () => {
   const doc = withName(createBlankDocument());
   const withSteps = { ...doc, steps: [
@@ -293,7 +315,14 @@ test('traceability: version increments and updatedAt changes on touch, while cre
 test('tryRestoreDocument (Codex regression): restores a validly-saved document exactly, so a page reload after "Сохранить структуру" genuinely gets the saved data back', () => {
   const doc = withName(createDocumentFromPreset('pecvd'));
   const restored = tryRestoreDocument(JSON.stringify(doc));
-  assert.deepEqual(restored, doc);
+  // F07 changed tryRestoreDocument to run the persisted JSON through the same structural
+  // parser the export API route uses - every optional field the ORIGINAL object simply never
+  // had a key for now comes back explicitly `undefined` instead of absent (e.g.
+  // `{processName: 'x'}` -> `{processName: 'x', purpose: undefined, ...}`). Both mean exactly
+  // the same thing to every reader in this app (`=== undefined`/`?.`), but they are not
+  // `deepEqual` as raw objects - comparing the JSON representation (how this is actually
+  // persisted and read back for real) is the meaningful equivalence check here.
+  assert.deepEqual(JSON.parse(JSON.stringify(restored)), JSON.parse(JSON.stringify(doc)));
 });
 
 test('tryRestoreDocument (Codex regression): never crashes or loads bad data - missing, malformed, non-JSON, or failing-validation input all fall back to null', () => {
@@ -303,6 +332,58 @@ test('tryRestoreDocument (Codex regression): never crashes or loads bad data - m
   assert.equal(tryRestoreDocument('not json at all'), null);
   assert.equal(tryRestoreDocument(JSON.stringify({ general: { processName: '' } })), null, 'a saved document that fails validateDocument (e.g. empty process name) must not be loaded silently');
   assert.equal(tryRestoreDocument(JSON.stringify({ general: { processName: '   ' } })), null, 'whitespace-only process name must also be rejected, matching validateDocument');
+});
+
+// ---------- F07 (MEDIUM): restore boundary - real runtime schema validation, not just value ranges ----------
+
+test('F07: structurally invalid JSON (steps replaced by a string instead of an array) is rejected, never accepted as a document with a broken steps field', () => {
+  const doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  const corrupted = { ...doc, steps: 'not an array at all' };
+  assert.equal(tryRestoreDocument(JSON.stringify(corrupted)), null);
+});
+
+test('F07: missing required nested objects/arrays (safety, gasSystem, sources entirely absent) still restore safely - either filled in with a real empty shape, or rejected, never a half-broken object that crashes a later view', () => {
+  const doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  const rest = { ...(doc as unknown as Record<string, unknown>) };
+  delete rest.safety;
+  delete rest.gasSystem;
+  delete rest.sources;
+  const restored = tryRestoreDocument(JSON.stringify(rest));
+  assert.ok(restored !== null, 'a document missing these fields entirely must still restore (they get a real, empty, well-shaped default)');
+  assert.deepEqual(restored!.safety.hazards, []);
+  assert.deepEqual(restored!.safety.ppe, []);
+  assert.deepEqual(restored!.safety.interlocks, []);
+  assert.deepEqual(restored!.gasSystem, []);
+  assert.deepEqual(restored!.sources.magnetrons, []);
+  // the restored document must be genuinely usable by every view, not just "not null"
+  assert.doesNotThrow(() => buildInstructionView(restored!));
+});
+
+test('F07: a wrong field TYPE inside a nested object (magnetron powerW as a string) is rejected, not silently coerced or left to crash a later render', () => {
+  const doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc.sources.magnetrons.push({ id: 'm1', enabled: true, powerW: 3000 });
+  const corrupted = JSON.stringify(doc).replace('"powerW":3000', '"powerW":"THREE THOUSAND"');
+  assert.equal(tryRestoreDocument(corrupted), null);
+});
+
+test('F07: one partially corrupted step inside an otherwise valid steps array is rejected wholesale, never silently dropped or half-loaded', () => {
+  const doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  const raw = JSON.parse(JSON.stringify(doc));
+  raw.steps[2] = { order: 3 }; // missing required `name`/`type`
+  assert.equal(tryRestoreDocument(JSON.stringify(raw)), null);
+});
+
+test('F07: a genuinely valid, fully-populated persisted document (covering steps/sources/gasSystem/qualityChecks/safety) still restores correctly - the stricter parser does not regress the happy path', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, sources: { ...doc.sources, magnetrons: [{ id: 'm1', enabled: true, powerW: 3000, material: 'Ti', mode: 'DC' }] } };
+  doc = { ...doc, gasSystem: updateGasLine(doc.gasSystem, doc.gasSystem[0].id, { gas: 'Ar', flow: 40, enabled: true }) };
+  doc = { ...doc, qualityChecks: [{ ...createQualityCheck('Толщина'), method: 'Калотест', result: '2.3 мкм', status: 'pass' }] };
+  doc = { ...doc, safety: { ...doc.safety, hazards: ['Высокое напряжение'] } };
+  const restored = tryRestoreDocument(JSON.stringify(doc));
+  assert.ok(restored !== null);
+  assert.equal(restored!.sources.magnetrons[0].powerW, 3000);
+  assert.equal(restored!.qualityChecks[0].status, 'pass');
+  assert.deepEqual(restored!.safety.hazards, ['Высокое напряжение']);
 });
 
 // ---------- calculated values only after an explicit action ----------
@@ -369,3 +450,57 @@ test('no silent parameter substitution: an untouched preset document round-trips
   assert.ok(exported.markdown.technologicalCard.includes('—'));
   for (const step of doc.steps) assert.equal(step.calculatedFields.length, 0);
 });
+
+// ---------- F06 (MEDIUM): provenance must reflect what actually produced the CURRENT value ----------
+
+test('F06: calculate -> the step is correctly stamped as system-calculated', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
+  const step = doc.steps.find(s => s.order === 6)!;
+  assert.deepEqual(step.calculatedFields, ['durationMin']);
+  assert.ok(Math.abs(step.durationMin! - 100) < 1e-9);
+});
+
+test('F06: edit calculated value -> manually overwriting durationMin clears its "calculated" provenance stamp (Codex regression: it previously stayed stamped after a manual edit)', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
+  assert.deepEqual(doc.steps.find(s => s.order === 6)!.calculatedFields, ['durationMin']);
+
+  doc = { ...doc, steps: updateStep(doc.steps, 6, { durationMin: 250 }) };
+  const edited = doc.steps.find(s => s.order === 6)!;
+  assert.equal(edited.durationMin, 250, 'the manually-entered value itself must be preserved exactly');
+  assert.deepEqual(edited.calculatedFields, [], 'provenance must no longer claim this value is system-calculated');
+  assert.equal(edited.origin, 'user');
+});
+
+test('F06: editing an UNRELATED field never clears a different field\'s calculated stamp', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
+  doc = { ...doc, steps: updateStep(doc.steps, 6, { temperatureC: 350 }) };
+  const step = doc.steps.find(s => s.order === 6)!;
+  assert.deepEqual(step.calculatedFields, ['durationMin'], 'durationMin is still genuinely the calculator\'s value - only editing IT should clear the stamp');
+  assert.equal(step.temperatureC, 350);
+});
+
+test('F06: copy a calculated step -> the copy never inherits the "calculated" stamp (it is a fresh, user-created row, even though its initial value came from the original\'s calculation)', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
+  doc = { ...doc, steps: duplicateStep(doc.steps, 6) };
+  const copy = doc.steps.find(s => s.order === 7)!;
+  assert.equal(copy.durationMin, 100, 'the copy starts with the same value...');
+  assert.deepEqual(copy.calculatedFields, [], '...but is never falsely claimed to still be a live calculated result');
+  assert.equal(copy.origin, 'user');
+  // the ORIGINAL is untouched by copying it
+  assert.deepEqual(doc.steps.find(s => s.order === 6)!.calculatedFields, ['durationMin']);
+});
+
+test('F06: edit the copied step -> a manual edit on the copy behaves normally (nothing was falsely stamped to begin with)', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
+  doc = { ...doc, steps: duplicateStep(doc.steps, 6) };
+  doc = { ...doc, steps: updateStep(doc.steps, 7, { durationMin: 42 }) };
+  const editedCopy = doc.steps.find(s => s.order === 7)!;
+  assert.equal(editedCopy.durationMin, 42);
+  assert.deepEqual(editedCopy.calculatedFields, []);
+});
+

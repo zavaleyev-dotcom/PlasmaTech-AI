@@ -9,9 +9,10 @@
 import { normalizeDoi, normalizedTitle } from '@/services/scientific-search/normalization';
 import type { Publication } from '@/services/scientific-search/types';
 import { generateReferenceId, type Reference, type ReferenceType, type ReferenceProvenance } from './references';
+import { loadReferences as loadCanonicalReferences } from './scientific-writer-references-store';
 
-const STORAGE_KEY = 'plasmatech.scifinder-import.v1';
-const MAX_LEDGER_ENTRIES = 200;
+const STORAGE_KEY = 'plasmatech.scifinder-import.pending.v1';
+const MAX_PENDING_ENTRIES = 200;
 
 // ---------- publication -> reference type mapping (item 3) ----------
 
@@ -72,9 +73,15 @@ function bestDedupKey(ref: Pick<Reference, 'doi' | 'title' | 'year' | 'authors'>
   return null;
 }
 
-// ---------- the transfer ledger itself (item 6) ----------
-
-interface LedgerRecord { reference: Reference; consumed: boolean }
+// ---------- the transfer queue itself (item 6) ----------
+//
+// F02 fix: this queue holds ONLY references not yet durably merged into Scientific Writer's
+// own canonical store (scientific-writer-references-store.ts). It is not itself the source of
+// truth for "has this been imported" - that question is answered by the canonical store, which
+// is what actually determines what the user sees on every mount. A pending entry is removed
+// from this queue ONLY after Scientific Writer confirms the merge was durably saved
+// (clearPendingReferences), never merely because it was handed to the caller once - so a failed
+// save can never silently lose a reference.
 
 /** Minimal storage shape this module needs - real `localStorage` satisfies it. Injectable so
  *  tests can supply a working in-memory fake instead of depending on a real browser (some Node
@@ -93,24 +100,23 @@ function detectWorkingLocalStorage(): KeyValueStore | null {
   } catch { return null; }
 }
 
-function isLedgerRecord(value: unknown): value is LedgerRecord {
-  return value !== null && typeof value === 'object' && typeof (value as { consumed?: unknown }).consumed === 'boolean'
-    && typeof (value as { reference?: unknown }).reference === 'object' && (value as { reference?: unknown }).reference !== null;
+function isReference(value: unknown): value is Reference {
+  return value !== null && typeof value === 'object' && typeof (value as { id?: unknown }).id === 'string';
 }
 
-function readLedger(store: KeyValueStore | null): LedgerRecord[] {
+function readPending(store: KeyValueStore | null): Reference[] {
   if (!store) return [];
   try {
     const raw = store.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter(isLedgerRecord) : [];
+    return Array.isArray(parsed) ? parsed.filter(isReference) : [];
   } catch { return []; }
 }
 
-function writeLedger(store: KeyValueStore | null, records: LedgerRecord[]): void {
+function writePending(store: KeyValueStore | null, refs: Reference[]): void {
   if (!store) return;
-  try { store.setItem(STORAGE_KEY, JSON.stringify(records.slice(-MAX_LEDGER_ENTRIES))); }
+  try { store.setItem(STORAGE_KEY, JSON.stringify(refs.slice(-MAX_PENDING_ENTRIES))); }
   catch { /* storage unavailable (quota/private mode) - nothing to fall back to */ }
 }
 
@@ -120,29 +126,39 @@ export type ImportOutcome =
 
 /** Called from the SciFinder "Добавить в Scientific Writer" action. Never adds a silent
  *  duplicate (item 5/8): if the same publication (by DOI, else title+year, else title+first
- *  author) was already sent through this mechanism, reports it instead of queuing a copy. */
+ *  author) already exists in Scientific Writer's REAL, currently-saved reference list, or is
+ *  still sitting in this queue waiting to be merged, this reports it instead of queuing a copy -
+ *  so a reference the user deleted can always be re-imported, and one that is merely queued
+ *  (Writer not opened yet) is not queued twice. */
 export function queuePublicationForScientificWriter(pub: Publication, store: KeyValueStore | null = detectWorkingLocalStorage()): ImportOutcome {
   const reference = mapPublicationToReference(pub);
-  const ledger = readLedger(store);
+  const pending = readPending(store);
   const key = bestDedupKey(reference);
   if (key) {
-    const existing = ledger.find(record => bestDedupKey(record.reference) === key);
-    if (existing) return { status: 'duplicate', existingReference: existing.reference };
+    const existing = [...loadCanonicalReferences(store), ...pending].find(existingRef => bestDedupKey(existingRef) === key);
+    if (existing) return { status: 'duplicate', existingReference: existing };
   }
-  writeLedger(store, [...ledger, { reference, consumed: false }]);
+  writePending(store, [...pending, reference]);
   return { status: 'queued', reference };
 }
 
-/** Called once when Scientific Writer mounts: returns every reference queued since the last
- *  time it was consumed, and marks them consumed so a later remount does not re-add them. The
- *  ledger itself is kept (not cleared) so duplicate detection above still works across page
- *  reloads within the same browser. */
-export function consumePendingReferences(store: KeyValueStore | null = detectWorkingLocalStorage()): Reference[] {
-  const ledger = readLedger(store);
-  const pending = ledger.filter(record => !record.consumed);
-  if (pending.length === 0) return [];
-  writeLedger(store, ledger.map(record => ({ ...record, consumed: true })));
-  return pending.map(record => record.reference);
+/** Called when Scientific Writer mounts: returns every reference queued since the last
+ *  successful merge, WITHOUT removing them from the queue - the caller must durably save the
+ *  merge first and only then call `clearPendingReferences()`. Never mutates the queue itself,
+ *  so a failed save leaves the queue exactly as it was for the next attempt to retry. */
+export function peekPendingReferences(store: KeyValueStore | null = detectWorkingLocalStorage()): Reference[] {
+  return readPending(store);
+}
+
+/** Called ONLY after Scientific Writer has confirmed (via scientific-writer-references-store's
+ *  `saveReferences` returning true) that the pending references are now durably part of its
+ *  own canonical list. Removes exactly the given ids - not "everything currently queued" - so a
+ *  publication queued concurrently (after the peek that was just saved) is never dropped. */
+export function clearPendingReferences(ids: readonly string[], store: KeyValueStore | null = detectWorkingLocalStorage()): void {
+  if (ids.length === 0) return;
+  const idSet = new Set(ids);
+  const remaining = readPending(store).filter(ref => !idSet.has(ref.id));
+  writePending(store, remaining);
 }
 
 /** Test-only: a working in-memory KeyValueStore, for environments (some Node test runtimes)

@@ -252,3 +252,37 @@ test('formatCurrency (Codex regression) never converts the numeric value - only 
   assert.notEqual(rub, usd, 'the symbol/format must differ');
   assert.notEqual(usd, eur);
 });
+
+// ---------- F05 (MEDIUM): validation gaps found by Codex ----------
+
+test('calculateProductionCapacity (F05): a physically impossible schedule (4 shifts x 12 hours/day = 48h > 24h) is rejected with a clear message', () => {
+  assert.throws(
+    () => calculateProductionCapacity({ shiftsPerDay: 4, hoursPerShift: 12, workingDaysPerYear: 250, utilizationPercent: 80, cycleTimeMinutes: 20, unitsPerCycle: 1 }),
+    /физически невозможны/,
+  );
+});
+
+test('calculateProductionCapacity (F05): a normal schedule at or under 24h/day is unaffected (e.g. 3 shifts x 8 hours = 24h exactly)', () => {
+  assert.doesNotThrow(() => calculateProductionCapacity({ shiftsPerDay: 3, hoursPerShift: 8, workingDaysPerYear: 250, utilizationPercent: 80, cycleTimeMinutes: 20, unitsPerCycle: 1 }));
+});
+
+test('calculatePayback (F05): calculatePayback(100, NaN) must be a validation error, never a NaN "successful" result (NaN <= 0 is false in JS)', () => {
+  assert.throws(() => calculatePayback(100, NaN), /Годовой экономический эффект: введите конечное число\./);
+});
+
+test('calculatePayback (F05): Infinity/-Infinity annual effect is also rejected, never silently computed', () => {
+  assert.throws(() => calculatePayback(100, Infinity), /Годовой экономический эффект/);
+  assert.throws(() => calculatePayback(100, -Infinity), /Годовой экономический эффект/);
+});
+
+test('calculateRoi (F05): a NaN annual benefit is rejected server-side, independent of any UI check', () => {
+  assert.throws(() => calculateRoi(NaN, 0, 1_000_000), /Годовой экономический эффект: введите конечное число\./);
+});
+
+test('calculateCumulativeSavings (F05): a NaN annual savings figure is rejected rather than producing an array of NaN', () => {
+  assert.throws(() => calculateCumulativeSavings(NaN, 5), /Годовая экономия: введите конечное число\./);
+});
+
+test('calculateRoi (F05): a genuinely negative annual benefit (a real loss) is still accepted, not rejected just for being negative', () => {
+  assert.doesNotThrow(() => calculateRoi(-50_000, 0, 1_000_000));
+});

@@ -8,7 +8,7 @@ import {
 } from '../src/services/workspace/techdoc-export';
 import {
   createDocumentFromPreset, updateStep, createQualityCheck, toggleStepEnabled, addMagnetron, updateMagnetron, updateGasLine,
-  buildTechnologicalCard, buildRouteCard, buildBriefRecipe,
+  buildTechnologicalCard, buildRouteCard, buildBriefRecipe, calculateStepDurationFromDeposition,
   type TechnicalProcessDocument,
 } from '../src/services/workspace/techdoc-assistant';
 import { POST as exportPOST } from '../src/app/api/workspace/techdoc/export/route';
@@ -131,6 +131,18 @@ test('traceability is carried into every document type, with the numbered headin
   const recipeVm = buildDocumentViewModel(doc, 'recipe');
   assert.equal(recipeVm.traceabilityHeading, 'Traceability');
   assert.equal(recipeVm.traceability.version, instructionVm.traceability.version);
+});
+
+test('F06 (MEDIUM): the exported calculatedFieldsNote reflects a manual edit clearing a calculated field\'s provenance - UI and export read the same underlying calculatedFields data', () => {
+  let doc = createDocumentFromPreset('magnetron-pvd');
+  doc = { ...doc, general: { ...doc.general, processName: 'F06 provenance test' } };
+  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
+  const beforeEdit = buildDocumentViewModel(doc, 'instruction');
+  assert.ok(beforeEdit.traceability.calculatedFieldsNote.includes('durationMin'));
+
+  doc = { ...doc, steps: updateStep(doc.steps, 6, { durationMin: 250 }) };
+  const afterEdit = buildDocumentViewModel(doc, 'instruction');
+  assert.equal(afterEdit.traceability.calculatedFieldsNote, 'Полей, вычисленных системой, нет.');
 });
 
 // ---------- preview/export consistency (item 16): both read the SAME underlying data ----------

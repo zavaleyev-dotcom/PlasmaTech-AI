@@ -7,6 +7,7 @@
  *  file implements: no silent parameter substitution, ever. */
 
 import { solveDeposition, type ThicknessUnit, type RateUnit } from './engineering-calculators';
+import { parseTechnicalProcessDocument } from './techdoc-parse';
 
 // ---------- shared validation helpers ----------
 
@@ -128,8 +129,16 @@ export function toggleStepEnabled(steps: ProcessStep[], order: number): ProcessS
   return steps.map(step => step.order === order ? { ...step, enabled: !step.enabled } : step);
 }
 
+/** F06: manually editing a field that is currently stamped as system-calculated
+ *  (`calculatedFields`) must clear that stamp for exactly that field - the value on screen is
+ *  now the user's own typed value, not the calculator's output, and provenance must reflect
+ *  what actually produced the CURRENT value, not what produced an earlier one. Any other
+ *  field's calculated stamp (if this step ever has more than one) is left untouched. */
 export function updateStep(steps: ProcessStep[], order: number, patch: Partial<Omit<ProcessStep, 'order' | 'origin' | 'calculatedFields'>>): ProcessStep[] {
-  return steps.map(step => step.order === order ? { ...step, ...patch, origin: 'user' } : step);
+  const editedFields = Object.keys(patch);
+  return steps.map(step => step.order === order
+    ? { ...step, ...patch, origin: 'user', calculatedFields: step.calculatedFields.filter(f => !editedFields.includes(f)) }
+    : step);
 }
 
 /** Explicit-action-only calculation (item 14): reuses Engineering Calculators' own deposition
@@ -280,11 +289,22 @@ export function touchDocument(doc: TechnicalProcessDocument): TechnicalProcessDo
 /** Attempts to restore a document previously saved to the browser's own localStorage (see the
  *  "Экспорт документа" module's "Сохранить структуру" control) - returns `null` on anything
  *  that doesn't parse as JSON or doesn't pass the same validation a fresh edit would, so a
- *  corrupted/incompatible save never crashes the page or silently loads a half-broken document. */
+ *  corrupted/incompatible save never crashes the page or silently loads a half-broken document.
+ *
+ *  F07: a bare `JSON.parse(...) as TechnicalProcessDocument` type assertion previously trusted
+ *  the persisted shape completely - `validateDocument` only range-checks numeric VALUES on the
+ *  assumption the document is already correctly SHAPED (an array where one is expected, an
+ *  object where one is expected, etc.), so a structurally wrong but numerically-quiet snapshot
+ *  (e.g. `steps` replaced by a string, a missing `safety`/`qualityChecks` field) could pass
+ *  straight through and only crash LATER, outside this function's own try/catch, when a
+ *  view/export tried to read it. `parseTechnicalProcessDocument` (techdoc-parse.ts) is the
+ *  same thorough structural parser the DOCX/PDF export API route already trusts for untrusted
+ *  HTTP input - reusing it here closes that gap instead of writing a second, possibly
+ *  inconsistent validator. */
 export function tryRestoreDocument(rawJson: string | null | undefined): TechnicalProcessDocument | null {
   if (!rawJson) return null;
   try {
-    const parsed = JSON.parse(rawJson) as TechnicalProcessDocument;
+    const parsed = parseTechnicalProcessDocument(JSON.parse(rawJson));
     validateDocument(parsed);
     return parsed;
   } catch {
@@ -368,9 +388,13 @@ export function validateDocument(doc: TechnicalProcessDocument): void {
     checkOptionalNonNegative(step.pressureMbar, `Этап №${step.order}: давление`);
     checkOptionalNonNegative(step.powerW, `Этап №${step.order}: мощность`);
     checkOptionalNonNegative(step.currentA, `Этап №${step.order}: ток`);
-    checkOptionalFinite(step.substrateBiasV, `Этап №${step.order}: substrate bias`);
-    checkOptionalFinite(step.rotationRpm, `Этап №${step.order}: вращение`);
-    checkOptionalFinite(step.distanceMm, `Этап №${step.order}: расстояние`);
+    checkOptionalFinite(step.substrateBiasV, `Этап №${step.order}: substrate bias`); // bias is routinely negative in PVD - finite only, never non-negative
+    // F08: rotation speed and target-to-substrate distance are magnitudes - the model has no
+    // "negative RPM"/"negative distance" convention anywhere, so a negative value here is not
+    // "unusual but possible" (unlike e.g. a high temperature, which is never capped), it is a
+    // mathematically/physically impossible reading. Was previously checked only for finiteness.
+    checkOptionalNonNegative(step.rotationRpm, `Этап №${step.order}: вращение`);
+    checkOptionalNonNegative(step.distanceMm, `Этап №${step.order}: расстояние`);
     for (const usage of step.gasUsage) checkOptionalNonNegative(usage.flowSccm, `Этап №${step.order}: расход газа (${usage.gas || 'без названия'})`);
   }
 

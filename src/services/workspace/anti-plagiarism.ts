@@ -82,10 +82,17 @@ export interface SimilarityReport { matches: SimilarityMatch[]; scope: Similarit
 
 // ---------- validation (item 9) ----------
 
+/** Thrown only for a genuinely bad user input - its `.message` is always a hand-authored,
+ *  safe-to-display string, never a raw internal/filesystem error. Callers (the API route
+ *  handler) use `instanceof ValidationError` - not a message regex - to decide whether an
+ *  error's message may reach the client (see F10: a fragile regex-based classification of
+ *  "is this a validation error" previously risked leaking unrelated internal error text). */
+export class ValidationError extends Error {}
+
 export function validateSimilarityInput(text: string): void {
-  if (typeof text !== 'string' || !text.trim()) throw new Error('Введите текст для проверки.');
-  if (text.trim().length < MIN_INPUT_CHARS) throw new Error(`Текст слишком короткий для проверки (минимум ${MIN_INPUT_CHARS} символов).`);
-  if (text.length > MAX_INPUT_CHARS) throw new Error(`Текст слишком длинный (максимум ${MAX_INPUT_CHARS} символов).`);
+  if (typeof text !== 'string' || !text.trim()) throw new ValidationError('Введите текст для проверки.');
+  if (text.trim().length < MIN_INPUT_CHARS) throw new ValidationError(`Текст слишком короткий для проверки (минимум ${MIN_INPUT_CHARS} символов).`);
+  if (text.length > MAX_INPUT_CHARS) throw new ValidationError(`Текст слишком длинный (максимум ${MAX_INPUT_CHARS} символов).`);
 }
 
 // ---------- normalization / segmentation (item 6/7) ----------
@@ -209,16 +216,45 @@ export function sortMatches(matches: SimilarityMatch[]): SimilarityMatch[] {
   return [...matches].sort((a, b) => TYPE_SEVERITY[b.type] - TYPE_SEVERITY[a.type] || b.score - a.score);
 }
 
-/** Fraction of the input text's characters covered by at least one corpus match (exact/
- *  near_exact/similar - self-repeats excluded, since they answer a different question). Simple
- *  sum-of-unique-span-lengths approximation, not a full interval merge - documented as a known
- *  limitation (a paragraph match and a sentence match against the same underlying text both
- *  count their own length, so this can slightly OVER-report coverage in that specific case). */
+/** F15: fraction of the input text's characters covered by at least one corpus match (exact/
+ *  near_exact/similar - self-repeats excluded, since they answer a different question).
+ *  Locates each match's span as a real character interval within the normalized input, then
+ *  merges overlapping/nested/adjacent/duplicate intervals into a UNION of unique ranges before
+ *  summing - a paragraph match and a sentence match nested inside it (or two chunks matching
+ *  the same sentence) no longer double-count the same characters. A span that cannot be
+ *  located in the input (should not normally happen) is skipped rather than guessed at, so
+ *  this only ever under-counts, never invents coverage. Result is always in [0, 1]. */
 export function computeCoveredFraction(matches: SimilarityMatch[], inputText: string): number {
   const corpusMatches = matches.filter(m => m.type !== 'self_repeat');
   if (corpusMatches.length === 0) return 0;
-  const uniqueSpans = new Set(corpusMatches.map(m => normalizeText(m.inputSpan).toLocaleLowerCase()));
-  const coveredChars = [...uniqueSpans].reduce((sum, span) => sum + span.length, 0);
-  const totalChars = normalizeText(inputText).length;
-  return totalChars > 0 ? Math.min(1, coveredChars / totalChars) : 0;
+
+  const normalizedInput = normalizeText(inputText).toLocaleLowerCase();
+  const totalChars = normalizedInput.length;
+  if (totalChars === 0) return 0;
+
+  const intervals: Array<[number, number]> = [];
+  for (const match of corpusMatches) {
+    const span = normalizeText(match.inputSpan).toLocaleLowerCase();
+    if (!span) continue;
+    const start = normalizedInput.indexOf(span);
+    if (start === -1) continue;
+    intervals.push([start, start + span.length]);
+  }
+  if (intervals.length === 0) return 0;
+
+  intervals.sort((a, b) => a[0] - b[0]);
+  let covered = 0;
+  let [curStart, curEnd] = intervals[0];
+  for (let i = 1; i < intervals.length; i++) {
+    const [start, end] = intervals[i];
+    if (start <= curEnd) {
+      curEnd = Math.max(curEnd, end);
+    } else {
+      covered += curEnd - curStart;
+      [curStart, curEnd] = [start, end];
+    }
+  }
+  covered += curEnd - curStart;
+
+  return Math.min(1, covered / totalChars);
 }

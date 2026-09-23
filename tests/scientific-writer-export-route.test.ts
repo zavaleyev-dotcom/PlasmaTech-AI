@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { POST as exportPOST, handleExport } from '../src/app/api/workspace/scientific-writer/export/route';
+import { POST as exportPOST } from '../src/app/api/workspace/scientific-writer/export/route';
+import { handleExport } from '../src/services/workspace/scientific-writer-export';
 
 const validRequest = {
   documentType: 'article',
@@ -54,6 +55,16 @@ test('handleExport: rejects an invalid format', async () => {
 test('handleExport: rejects an invalid document type', async () => {
   const { status } = await handleExport({ ...validRequest, documentType: 'bogus' }, 'docx');
   assert.equal(status, 400);
+});
+
+// ---------- F10: a render-layer failure (font/filesystem/renderer bug) never leaks its message ----------
+
+test('handleExport: a failure inside the actual DOCX/PDF render step never forwards its raw message (e.g. a font/filesystem path)', async () => {
+  const throwingExport = async () => { throw new Error("ENOENT: no such file or directory, open '/Volumes/123-All/GitHub/PlasmaTech-AI/node_modules/dejavu-fonts-ttf/ttf/DejaVuSans.ttf'"); };
+  const { status, body } = await handleExport(validRequest, 'docx', throwingExport);
+  assert.equal(status, 500);
+  assert.equal(body?.error, 'Не удалось сформировать файл.');
+  assert.ok(!String(body?.error).includes('/node_modules/'), 'a real filesystem path must never reach the client');
 });
 
 // ---------- oversized payload ----------

@@ -1,4 +1,4 @@
-import { parseExportRequest, parseExportFormat, exportScientificDocument } from '@/services/workspace/scientific-writer-export';
+import { handleExport } from '@/services/workspace/scientific-writer-export';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -27,21 +27,6 @@ const json = (value: unknown, status = 200) => Response.json(value, { status, he
 function contentDisposition(filename: string): string {
   const asciiFallback = filename.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, "'");
   return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
-}
-
-export interface ExportResponse { status: number; body?: Record<string, unknown>; file?: { buffer: Buffer; filename: string; contentType: string } }
-
-/** The whole "given a parsed request body, produce a file or an error" step as one function,
- *  so tests can exercise every outcome directly. */
-export async function handleExport(raw: unknown, formatRaw: unknown): Promise<ExportResponse> {
-  try {
-    const format = parseExportFormat(formatRaw);
-    const request = parseExportRequest(raw);
-    const { buffer, filename, contentType } = await exportScientificDocument(request, format);
-    return { status: 200, file: { buffer, filename, contentType } };
-  } catch (error) {
-    return { status: 400, body: { error: error instanceof Error ? error.message : 'Не удалось сформировать файл.' } };
-  }
 }
 
 export async function POST(request: Request) {

@@ -84,8 +84,8 @@ test('checkPreservation: flags a missing number as unpreserved, and reports succ
   assert.equal(checkPreservation(original, goodEdit).ok, true);
   const bad = checkPreservation(original, badEdit);
   assert.equal(bad.ok, false);
-  assert.ok(bad.missingNumbers.includes('350'));
-  assert.ok(bad.missingNumbers.includes('300'));
+  assert.ok(bad.missingNumbers.includes('350 нм'), `expected a "350 нм" entry, got: ${bad.missingNumbers.join(', ')}`);
+  assert.ok(bad.missingNumbers.includes('300°C'), `expected a "300°C" entry, got: ${bad.missingNumbers.join(', ')}`);
 });
 
 test('checkPreservation: protected technical abbreviations (PVD, ta-C, ICP/RF, ...) must survive verbatim, RU translation or not', () => {
@@ -176,13 +176,20 @@ test('checkNoInventedNumbers: flags a generated number that traces back to nothi
   assert.equal(clean.ok, true);
   const withInvented = checkNoInventedNumbers(input, 'Итоговая твёрдость составила 5000 HV.');
   assert.equal(withInvented.ok, false);
-  assert.ok(withInvented.invented.includes('5000'));
+  assert.ok(withInvented.invented.includes('5000 HV'), `expected a "5000 HV" entry, got: ${withInvented.invented.join(', ')}`);
 });
 
 test('checkNoInventedNumbers: small structural numbers (list/section numbering) are excluded to avoid false positives', () => {
   const input = draftInput({ results: 'Результат зафиксирован.' });
-  const check = checkNoInventedNumbers(input, '1. Введение. 2. Материалы и методы.');
+  const check = checkNoInventedNumbers(input, '1. Введение.\n2. Материалы и методы.');
   assert.equal(check.ok, true);
+});
+
+test('checkNoInventedNumbers: a small number is NOT automatically excluded just because it is <=20 - only a real list-marker shape is (F03 regression: the old blanket 0-20 exclusion let a genuinely invented small value slip through)', () => {
+  const input = draftInput({ results: 'Покрытие нанесено без данных о твёрдости.' });
+  const check = checkNoInventedNumbers(input, 'Твёрдость составила 15 ГПа.');
+  assert.equal(check.ok, false);
+  assert.ok(check.invented.includes('15 ГПа'), `expected a "15 ГПа" entry, got: ${check.invented.join(', ')}`);
 });
 
 // ---------- scholarly-artifact safeguard (item 5) ----------
@@ -201,4 +208,69 @@ test('buildSafetyWarnings: returns an empty array only when every safeguard pass
   assert.deepEqual(buildSafetyWarnings(input, 'Твёрдость составила 2400 HV.', null), []);
   const withProblem = buildSafetyWarnings(input, 'Твёрдость составила 9999 HV (doi:10.1000/fake).', null);
   assert.ok(withProblem.length >= 2);
+});
+
+// ---------- F03 (HIGH) explicit regression set: number+unit safeguards must be exact, not substring ----------
+
+test('F03: 5 µm -> 15 nm must warn (different number AND different unit, not just a substring of "15")', () => {
+  const result = checkPreservation('Толщина покрытия 5 µm.', 'Толщина покрытия 15 nm.');
+  assert.equal(result.ok, false);
+  assert.ok(result.missingNumbers.includes('5 µm'), `expected "5 µm" missing, got: ${result.missingNumbers.join(', ')}`);
+});
+
+test('F03: 10 °C -> 10 K must warn (same bare number, different unit)', () => {
+  const result = checkPreservation('Отжиг при 10 °C.', 'Отжиг при 10 K.');
+  assert.equal(result.ok, false);
+  assert.ok(result.missingNumbers.includes('10 °C'), `expected "10 °C" missing, got: ${result.missingNumbers.join(', ')}`);
+});
+
+test('F03: 5 -> 15 (no units at all) must warn - "5" must never match as a substring of "15"', () => {
+  const result = checkPreservation('Образцов: 5.', 'Образцов: 15.');
+  assert.equal(result.ok, false);
+  assert.ok(result.missingNumbers.includes('5'), `expected "5" missing, got: ${result.missingNumbers.join(', ')}`);
+});
+
+test('F03: an invented "15 GPa" hardness claim (draft mode, no source at all) is flagged, not excluded just because 15 is small', () => {
+  const input = draftInput({ results: 'Покрытие получено без измерения твёрдости.' });
+  const check = checkNoInventedNumbers(input, 'Твёрдость составила 15 GPa.');
+  assert.equal(check.ok, false);
+  assert.ok(check.invented.includes('15 GPa'));
+});
+
+test('F03: 400 °C is preserved when it genuinely survives verbatim', () => {
+  const result = checkPreservation('Процесс при 400 °C.', 'Процесс проводился при температуре 400 °C, без изменений.');
+  assert.equal(result.ok, true);
+  assert.ok(result.preservedNumbers.includes('400 °C'));
+});
+
+test('F03: 60 min is preserved when it genuinely survives verbatim', () => {
+  const result = checkPreservation('Длительность процесса 60 min.', 'Процесс длился 60 min в описанных условиях.');
+  assert.equal(result.ok, true);
+  assert.ok(result.preservedNumbers.includes('60 min'));
+});
+
+test('F03: 2.5 µm is preserved when it genuinely survives verbatim (decimal point, not comma)', () => {
+  const result = checkPreservation('Толщина составила 2.5 µm.', 'Итоговая толщина покрытия - 2.5 µm.');
+  assert.equal(result.ok, true);
+  assert.ok(result.preservedNumbers.includes('2.5 µm'));
+});
+
+test('F03: a fully Cyrillic scientific sentence with no space before the unit ("5мкм") is still tokenized correctly', () => {
+  const result = checkPreservation('Толщина покрытия 5мкм при 10мин обработки.', 'Толщина стала 15мкм при 10мин обработки.');
+  assert.equal(result.ok, false);
+  assert.ok(result.missingNumbers.includes('5мкм'), `expected "5мкм" missing, got: ${result.missingNumbers.join(', ')}`);
+  assert.ok(result.preservedNumbers.includes('10мин'), `expected "10мин" preserved, got: ${result.preservedNumbers.join(', ')}`);
+});
+
+test('F03: dates and plain list numbering are never broken by the new tokenizer', () => {
+  const result = checkPreservation('Испытания проведены в 2024 году, этап 3.', 'В 2024 году были проведены испытания, этап 3 завершён.');
+  assert.equal(result.ok, true);
+});
+
+test('F03: a protected term is never matched as a substring of an unrelated word (Unicode-aware word boundary, not plain .includes())', () => {
+  // "RF" (radio-frequency) must not be considered "preserved" just because the edited text
+  // happens to contain the unrelated word "performance", which contains "RF" as a substring.
+  const result = checkPreservation('Обработка в режиме RF плазмы.', 'Обработка показала хорошую performance по сравнению с базовым режимом.');
+  assert.equal(result.ok, false);
+  assert.ok(result.missingTerms.includes('RF'));
 });

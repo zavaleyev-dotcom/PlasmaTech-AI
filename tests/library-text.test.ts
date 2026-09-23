@@ -134,12 +134,40 @@ test('search() caps pagination depth: a large offset on a non-trivial result set
   const documentId = store.records()[0].id;
   bulkInsertChunks(store, documentId, 2000, 'paginationword');
 
-  const shallow = store.search('paginationword', 0);
-  assert.equal(shallow.rankingDegraded, false, 'offset=0 on a moderate result set must keep real ranking');
-
   const deep = store.search('paginationword', 100_000); // way beyond MAX_SEARCH_OFFSET
   assert.equal(deep.rankingDegraded, true, 'a deep offset on a non-trivial result set must degrade rather than pay unbounded pagination cost');
   assert.ok(deep.hits.length <= 20);
+}));
+
+test('search() (F09) uses the SAME ordering on every page of the same query - the ranking decision depends only on total/candidate cost, never on offset, so pages never skip or duplicate rows', () => fixture(async (root, indexFile, store) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'A single real document establishing one real documentId for the bulk-insert fixture.' }] }) });
+  const documentId = store.records()[0].id;
+  bulkInsertChunks(store, documentId, 2000, 'paginationword');
+
+  // Codex regression: page 1 (offset=0) previously always used bm25 ranking regardless of
+  // total, while page 2+ (offset>0) of the exact SAME query switched to a different (rowid)
+  // ordering once total > 1000 - two different orderings of the same match set, so walking
+  // the pages could skip some rows and repeat others. Every page of this 2000-match query
+  // must now agree on the same ordering.
+  const page0 = store.search('paginationword', 0);
+  const page1 = store.search('paginationword', 20);
+  const page2 = store.search('paginationword', 40);
+  assert.equal(page0.rankingDegraded, page1.rankingDegraded, 'page 1 and page 2 of the same query must use the same ordering');
+  assert.equal(page1.rankingDegraded, page2.rankingDegraded, 'page 2 and page 3 of the same query must use the same ordering');
+
+  // Walking every page sequentially (0, 20, 40, ...) up to the offset cap must visit each
+  // matching chunk exactly once - no gaps, no repeats - which is only possible under one
+  // single consistent ordering across every page.
+  const seen = new Set<string>();
+  for (let offset = 0; offset < 500; offset += 20) {
+    const page = store.search('paginationword', offset);
+    for (const hit of page.hits) {
+      assert.ok(!seen.has(hit.chunkId), `chunk ${hit.chunkId} appeared on more than one page (offset=${offset})`);
+      seen.add(hit.chunkId);
+    }
+  }
+  assert.equal(seen.size, 500, 'offsets 0,20,...,480 (25 pages x 20 hits) must cover exactly 500 distinct chunks - no gaps, no repeats');
 }));
 
 test('search() (Codex regression) reports offsetCapped so a caller can never silently keep "paging deeper" past the enforced pagination limit while actually re-fetching the same frozen page', () => fixture(async (root, indexFile, store) => {

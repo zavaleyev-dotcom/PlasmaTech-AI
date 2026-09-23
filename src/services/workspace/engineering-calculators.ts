@@ -51,6 +51,25 @@ function requirePositiveFinite(value: number | undefined, label: string): number
   return value;
 }
 
+/** Like requirePositiveFinite, but for values that may legitimately be negative or zero (e.g.
+ *  a Celsius temperature) - still rejects anything that is not a genuine finite number.
+ *  F04: `null` (or any non-number) must never be silently coerced by later arithmetic (JS
+ *  itself would turn `null + 273.15` into `273.15`, i.e. quietly treat a missing temperature
+ *  as exactly 0 °C) - this check runs BEFORE any arithmetic touches the value. */
+function requireFiniteNumber(value: number | undefined, label: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${label}: введите конечное число.`);
+  return value;
+}
+
+/** F04: a computed result must itself be a real, finite number - extreme (e.g. astronomically
+ *  large) but individually-valid inputs can still overflow the arithmetic to Infinity/NaN.
+ *  Such a result is never returned as if it were a normal calculation - it is a controlled
+ *  validation error instead. */
+function requireFiniteResult(value: number, label: string): number {
+  if (!Number.isFinite(value)) throw new Error(`${label}: результат расчёта не является конечным числом - проверьте введённые величины (слишком большое/малое значение).`);
+  return value;
+}
+
 /** Runtime guard for the string-literal unit/preset fields (solveFor, thicknessUnit,
  *  rateUnit, timeUnit, pressureUnit, gas). TypeScript enforces these at compile time for
  *  callers written in TS, but nothing stopped an unexpected runtime value (e.g. a stray
@@ -72,21 +91,21 @@ export function solveDeposition(input: DepositionInput): DepositionResult {
   if (input.solveFor === 'thickness') {
     const rateNmMin = requirePositiveFinite(input.rate, 'Скорость осаждения') * RATE_TO_NM_PER_MIN[input.rateUnit];
     const timeMin = requirePositiveFinite(input.time, 'Время осаждения') * TIME_TO_MIN[input.timeUnit];
-    const thicknessNm = rateNmMin * timeMin;
-    const value = thicknessNm / THICKNESS_TO_NM[input.thicknessUnit];
+    const thicknessNm = requireFiniteResult(rateNmMin * timeMin, 'Толщина покрытия');
+    const value = requireFiniteResult(thicknessNm / THICKNESS_TO_NM[input.thicknessUnit], 'Толщина покрытия');
     return { solveFor: 'thickness', value, unit: input.thicknessUnit, formula: `d = v × t = ${rateNmMin.toFixed(4)} нм/мин × ${timeMin.toFixed(4)} мин` };
   }
   if (input.solveFor === 'rate') {
     const thicknessNm = requirePositiveFinite(input.thickness, 'Толщина покрытия') * THICKNESS_TO_NM[input.thicknessUnit];
     const timeMin = requirePositiveFinite(input.time, 'Время осаждения') * TIME_TO_MIN[input.timeUnit];
-    const rateNmMin = thicknessNm / timeMin;
-    const value = rateNmMin / RATE_TO_NM_PER_MIN[input.rateUnit];
+    const rateNmMin = requireFiniteResult(thicknessNm / timeMin, 'Скорость осаждения');
+    const value = requireFiniteResult(rateNmMin / RATE_TO_NM_PER_MIN[input.rateUnit], 'Скорость осаждения');
     return { solveFor: 'rate', value, unit: input.rateUnit, formula: `v = d / t = ${thicknessNm.toFixed(4)} нм / ${timeMin.toFixed(4)} мин` };
   }
   const thicknessNm = requirePositiveFinite(input.thickness, 'Толщина покрытия') * THICKNESS_TO_NM[input.thicknessUnit];
   const rateNmMin = requirePositiveFinite(input.rate, 'Скорость осаждения') * RATE_TO_NM_PER_MIN[input.rateUnit];
-  const timeMin = thicknessNm / rateNmMin;
-  const value = timeMin / TIME_TO_MIN[input.timeUnit];
+  const timeMin = requireFiniteResult(thicknessNm / rateNmMin, 'Время осаждения');
+  const value = requireFiniteResult(timeMin / TIME_TO_MIN[input.timeUnit], 'Время осаждения');
   return { solveFor: 'time', value, unit: input.timeUnit, formula: `t = d / v = ${thicknessNm.toFixed(4)} нм / ${rateNmMin.toFixed(4)} нм/мин` };
 }
 
@@ -131,12 +150,19 @@ export function calculateMeanFreePath(input: MeanFreePathInput): MeanFreePathRes
   assertOneOf(input.pressureUnit, PRESSURE_UNITS, 'Единица давления');
   assertOneOf(input.gas, GAS_PRESETS, 'Газ');
   const pressurePa = requirePositiveFinite(input.pressure, 'Давление');
-  const temperatureK = input.temperatureC + 273.15;
-  if (!Number.isFinite(temperatureK) || temperatureK <= 0) throw new Error('Температура: значение должно быть выше абсолютного нуля (-273.15 °C).');
+  // F04: validate temperatureC itself BEFORE any arithmetic - `null + 273.15` evaluates to a
+  // perfectly normal, positive, finite number (273.15) in JS, so without this check a missing
+  // temperature was silently computed as if it were exactly 0 °C instead of being rejected.
+  const temperatureC = requireFiniteNumber(input.temperatureC, 'Температура');
+  const temperatureK = temperatureC + 273.15;
+  if (temperatureK <= 0) throw new Error('Температура: значение должно быть выше абсолютного нуля (-273.15 °C).');
   const diameterPm = input.gas === 'custom' ? requirePositiveFinite(input.customDiameterPm, 'Диаметр молекулы газа') : GAS_DIAMETER_PM[input.gas];
   const pressureInPa = pressurePa * PRESSURE_TO_PA[input.pressureUnit];
   const diameterM = diameterPm * 1e-12;
-  const meanFreePathM = (BOLTZMANN_J_PER_K * temperatureK) / (Math.SQRT2 * Math.PI * diameterM * diameterM * pressureInPa);
+  const meanFreePathM = requireFiniteResult(
+    (BOLTZMANN_J_PER_K * temperatureK) / (Math.SQRT2 * Math.PI * diameterM * diameterM * pressureInPa),
+    'Средняя длина свободного пробега',
+  );
   return {
     meanFreePathM, meanFreePathMm: meanFreePathM * 1000,
     formula: `λ = kT / (√2·π·d²·p) при T = ${temperatureK.toFixed(2)} К, p = ${pressureInPa.toExponential(3)} Па, d = ${diameterPm} пм`,

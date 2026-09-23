@@ -129,8 +129,47 @@ const CONTENT_TYPE: Record<ExportFormat, string> = {
 export async function exportScientificDocument(request: ScientificExportRequest, format: ExportFormat): Promise<ExportResult> {
   validateExportRequest(request);
   const viewModel = buildScientificDocumentViewModel(request);
-  const buffer = format === 'docx' ? await renderGenericDocx(viewModel) : await renderGenericPdf(viewModel);
+  // F11: the chosen formatting profile must actually reach the renderer - margins/body font
+  // size/heading size/line spacing - not just appear as a metadata label. Omitted entirely
+  // when no profile was chosen, so the renderer's own unchanged defaults apply.
+  const renderOptions = request.profileId ? { formatting: FORMATTING_PROFILES[request.profileId] } : {};
+  const buffer = format === 'docx' ? await renderGenericDocx(viewModel, renderOptions) : await renderGenericPdf(viewModel, renderOptions);
   return { buffer, filename: buildExportFilename(request, format), contentType: CONTENT_TYPE[format] };
+}
+
+export interface ExportResponse { status: number; body?: Record<string, unknown>; file?: { buffer: Buffer; filename: string; contentType: string } }
+
+/** The whole "given a parsed request body, produce a file or an error" step as one function
+ *  (F01: kept out of route.ts - a Next.js `route.ts` module may only export the handful of
+ *  names Next itself recognizes, and an extra export like this one fails Next's generated
+ *  route-type check under the webpack production build even though Turbopack silently accepts
+ *  it), so tests can exercise every outcome directly.
+ *
+ *  F10: parsing/validation failures (parseExportFormat/parseExportRequest/validateExportRequest)
+ *  always throw a hand-authored, safe message - forwarded as-is. Anything that fails during the
+ *  actual DOCX/PDF render (a font/filesystem problem, a renderer bug) is a SEPARATE, later
+ *  try/catch: it is logged server-side with full detail and answered with one fixed, neutral
+ *  message, never the raw error/path/stack. */
+export async function handleExport(
+  raw: unknown, formatRaw: unknown, exportDocument: typeof exportScientificDocument = exportScientificDocument,
+): Promise<ExportResponse> {
+  let format: ExportFormat;
+  let request: ScientificExportRequest;
+  try {
+    format = parseExportFormat(formatRaw);
+    request = parseExportRequest(raw);
+    validateExportRequest(request);
+  } catch (error) {
+    return { status: 400, body: { error: error instanceof Error ? error.message : 'Некорректный запрос экспорта.' } };
+  }
+
+  try {
+    const { buffer, filename, contentType } = await exportDocument(request, format);
+    return { status: 200, file: { buffer, filename, contentType } };
+  } catch (error) {
+    console.error('[scientific-writer-export] render failed:', error);
+    return { status: 500, body: { error: 'Не удалось сформировать файл.' } };
+  }
 }
 
 // ---------- server-side parsing of untrusted client JSON ----------

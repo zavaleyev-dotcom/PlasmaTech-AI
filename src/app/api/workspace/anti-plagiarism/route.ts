@@ -1,4 +1,4 @@
-import { checkSimilarity } from '@/services/workspace/anti-plagiarism-corpus';
+import { handleCheck } from '@/services/workspace/anti-plagiarism-handler';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -20,29 +20,6 @@ function isLocalJsonRequest(request: Request): boolean {
 }
 
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store' } });
-
-export interface CheckResponse { status: number; body: Record<string, unknown> }
-
-/** The whole "given a parsed request body, produce a response" step as one function, so tests
- *  can exercise it directly (with a stub corpus via checkSimilarity's own openStore injection)
- *  without needing a live HTTP request object beyond what POST itself already builds. */
-export async function handleCheck(raw: unknown): Promise<CheckResponse> {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { status: 400, body: { error: 'Неверный формат запроса.' } };
-  const text = (raw as Record<string, unknown>).text;
-  if (typeof text !== 'string') return { status: 400, body: { error: 'Текст для проверки: обязательное строковое поле.' } };
-
-  try {
-    const report = await checkSimilarity(text);
-    return { status: 200, body: { ...report } };
-  } catch (error) {
-    // validateSimilarityInput() throws a plain Error with a safe, user-facing message; any
-    // other failure (a genuine store/index problem) gets a generic message - never a raw
-    // stack trace or internal path.
-    const message = error instanceof Error ? error.message : 'Не удалось выполнить проверку.';
-    const isValidation = error instanceof Error && /символов|Введите текст/.test(error.message);
-    return { status: isValidation ? 400 : 500, body: { error: message } };
-  }
-}
 
 export async function POST(request: Request) {
   if (!isLocalJsonRequest(request)) return json({ error: 'Недопустимый локальный запрос.' }, 403);

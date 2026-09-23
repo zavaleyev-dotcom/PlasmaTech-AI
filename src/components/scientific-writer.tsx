@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   DOCUMENT_TYPES, WRITER_MODES, LANGUAGES, DOCUMENT_TYPE_LABELS, WRITER_MODE_LABELS,
   validateInput, buildEvidenceReport, buildLocalScaffold,
@@ -9,7 +9,8 @@ import {
 } from '@/services/workspace/scientific-writer';
 import { SimilarityCheck } from './anti-plagiarism';
 import { ReferenceManager } from './reference-manager';
-import { consumePendingReferences } from '@/services/workspace/scifinder-import';
+import { peekPendingReferences, clearPendingReferences } from '@/services/workspace/scifinder-import';
+import { loadReferences, saveReferences, mergeReferencesById } from '@/services/workspace/scientific-writer-references-store';
 import type { Reference, CitationStyle, DocumentProfileId } from '@/services/workspace/references';
 
 const REWRITE_LIKE_MODES: readonly WriterMode[] = ['rewrite', 'edit', 'translate_ru_en', 'translate_en_ru'];
@@ -66,6 +67,9 @@ export function ScientificWriter() {
   const [references, setReferences] = useState<Reference[]>([]);
   const [citationStyle, setCitationStyle] = useState<CitationStyle>('apa');
   const [profileId, setProfileId] = useState<DocumentProfileId>('generic_article');
+  // Guards the auto-save effect below from firing (and overwriting real saved data with an
+  // empty array) before the load-on-mount effect has actually run once.
+  const referencesHydrated = useRef(false);
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -74,15 +78,35 @@ export function ScientificWriter() {
     return () => clearTimeout(t);
   }, []);
 
-  // Picks up any references queued from SciFinder ("Добавить в Scientific Writer") since the
-  // last time this module was open - consumed once per mount, never re-imported on remount.
+  // F02 fix: references (manual AND SciFinder-imported) now live in Scientific Writer's own
+  // durable local store, not only in React state - so they survive unmount/remount. On mount:
+  // restore whatever was already saved, merge in anything queued from SciFinder since last
+  // time, and only mark that queue as delivered once the merge is confirmed durably saved -
+  // never based merely on having handed it to this component once.
   useEffect(() => {
     const t = setTimeout(() => {
-      const pending = consumePendingReferences();
-      if (pending.length > 0) setReferences(prev => [...prev, ...pending]);
+      const saved = loadReferences();
+      const pending = peekPendingReferences();
+      if (pending.length > 0) {
+        const merged = mergeReferencesById(saved, pending);
+        setReferences(merged);
+        if (saveReferences(merged)) clearPendingReferences(pending.map(r => r.id));
+        // else: leave the queue intact - the merged view is still shown this session, and the
+        // next mount will retry persisting/clearing it.
+      } else {
+        setReferences(saved);
+      }
+      referencesHydrated.current = true;
     }, 0);
     return () => clearTimeout(t);
   }, []);
+
+  // Every subsequent change (manual add/edit/delete, or a later SciFinder import) is saved
+  // immediately - references never rely on an explicit "Save" action to survive navigation.
+  useEffect(() => {
+    if (!referencesHydrated.current) return;
+    saveReferences(references);
+  }, [references]);
 
   function set<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm(prev => ({ ...prev, [key]: value }));

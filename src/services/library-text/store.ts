@@ -148,15 +148,17 @@ export class TextStore {
     // way to know the requested offset was clamped, so it kept incrementing its own displayed
     // "X-Y of total" range while the actual returned rows silently stayed frozen at the cap).
     const offsetCapped = cappedOffset !== normalizedOffset;
-    // Deep pagination has the SAME root cause even for an otherwise cheap term: bm25 order is
-    // not index-backed, so reaching row `offset+20` in ranked order still costs roughly
-    // proportional to `offset` regardless of how selective the query itself is (measured:
-    // the same single moderately-common term went from ~100ms at offset=0 to multiple
-    // seconds at offset=10000). A shallower cap (below) already bounds the worst case; this
-    // flag additionally prefers the fast fallback once still-deep pagination meets a
-    // non-trivial candidate set, rather than assuming a small `total` always stays cheap.
-    const deepOffset = cappedOffset > 0 && total > 1000;
-    const rankingDegraded = candidateBudget > RANK_CANDIDATE_BUDGET || deepOffset;
+    // F09: this decision must depend ONLY on facts that are the same for every page of the
+    // SAME query (candidateBudget/total) - NEVER on `offset` itself. It previously also
+    // triggered on `cappedOffset > 0`, which meant page 1 (offset=0) of a query with total >
+    // 1000 matches ranked by bm25 while page 2+ of the exact same query silently switched to
+    // rowid order - two DIFFERENT orderings of the same match set, so some rows that would
+    // have appeared on one page under a single consistent ordering were skipped entirely and
+    // others could appear twice. Bm25 order still costs roughly proportional to `offset` to
+    // reach deep pages (measured: a moderately-common term went from ~100ms at offset=0 to
+    // multiple seconds at offset=10000) - handled by capping the offset itself above, not by
+    // changing the ordering mid-pagination.
+    const rankingDegraded = candidateBudget > RANK_CANDIDATE_BUDGET || total > 1000;
 
     // Degraded path: natural rowid order instead of bm25 - proven, by measurement, to stay in
     // the low single-digit milliseconds regardless of how many rows match (no bm25/snippet

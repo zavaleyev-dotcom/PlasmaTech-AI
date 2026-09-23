@@ -253,25 +253,81 @@ export function buildGenerationPrompt(input: ScientificWriterInput, evidence: Ev
 }
 
 // ---------- post-generation safety checks (items 6/7): verify, never trust blindly ----------
+//
+// F03: numbers are matched as whole tokens (never substring - "5" must never match inside
+// "15"), and - critically - a number is paired with whatever recognized physical unit
+// immediately follows it, so "5 µm" and "15 nm" are distinct tokens even though neither
+// substring-contains the other, and "10 °C" and "10 K" are distinct even though the bare
+// number is identical. All boundary checks are Unicode-aware (\p{L}/\p{N}, not the ASCII-only
+// \b/\w), so this works the same right up against Cyrillic text with no space at all
+// ("5мкм").
 
-const NUMBER_RE = /[-+]?\d+(?:[.,]\d+)?(?:[eE][-+]?\d+)?/g;
+function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+/** True only if `needle` occurs in `haystack` as a whole token - never merely as a substring
+ *  of a longer word or number (e.g. "RF" inside "performance", "5" inside "15"). */
+function containsAsWord(haystack: string, needle: string): boolean {
+  return new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(needle)}(?![\\p{L}\\p{N}])`, 'u').test(haystack);
+}
+
+/** Units this project's scientific-writing domain actually uses (PVD/CVD/PECVD/plasma
+ *  materials science, RU+EN) - deliberately explicit and curated, exactly like
+ *  PROTECTED_TECHNICAL_TERMS above, rather than guessing at "unit-shaped" words (which risks
+ *  either missing real units or misreading ordinary text as one). Sorted longest-first so e.g.
+ *  "kPa"/"MPa"/"GPa" match before a bare "Pa" would. */
+const KNOWN_UNITS = [
+  'nm', 'мкм', 'нм', 'mm', 'мм', 'cm', 'см', 'µm', 'm', 'м',
+  '°C', '°К', '°F', 'K', 'К',
+  'ms', 'мс', 'min', 'мин', 'h', 'ч', 's', 'с',
+  'kPa', 'кПа', 'MPa', 'МПа', 'GPa', 'ГПа', 'Pa', 'Па', 'mbar', 'мбар', 'bar', 'бар', 'torr', 'Torr',
+  'kW', 'кВт', 'mA', 'мА', 'kV', 'кВ', 'W', 'Вт', 'A', 'А', 'V', 'В',
+  'kHz', 'кГц', 'Hz', 'Гц',
+  'HRC', 'HV', 'sccm', '%',
+].sort((a, b) => b.length - a.length);
+
+const UNIT_ALTERNATION = KNOWN_UNITS.map(escapeRegExp).join('|');
+/** Captures a number, and - only if immediately followed (after optional whitespace, allowing
+ *  "5мкм" with no space at all) by one of KNOWN_UNITS and then a non-letter/digit - that unit
+ *  too. The trailing lookahead also stops a bare number from matching as a prefix of an
+ *  unrelated alphanumeric token (e.g. "5G" is never read as the number 5). */
+const NUMBER_TOKEN_RE = new RegExp(`([-+]?\\d+(?:[.,]\\d+)?)(?:\\s*(${UNIT_ALTERNATION}))?(?![\\p{L}\\p{N}])`, 'gu');
+
+interface NumericToken { raw: string; key: string }
+
+/** Every number (optionally paired with its unit) in `text`, as both a human-readable form
+ *  (`raw`, exactly as written - for display in warnings) and a comparison key (`key`, with the
+ *  decimal separator normalized so "2,5" and "2.5" are treated as the same value). */
+function extractNumericTokens(text: string): NumericToken[] {
+  return Array.from(text.matchAll(NUMBER_TOKEN_RE)).map(match => {
+    const [raw, number, unit] = match;
+    const normalizedNumber = number.replace(',', '.');
+    return { raw: raw.trim(), key: unit ? `${normalizedNumber}${unit}` : normalizedNumber };
+  });
+}
+
+function uniqueByKey(tokens: NumericToken[]): NumericToken[] {
+  return Array.from(new Map(tokens.map(t => [t.key, t])).values());
+}
 
 export interface PreservationCheck { preservedNumbers: string[]; missingNumbers: string[]; preservedTerms: string[]; missingTerms: string[]; ok: boolean }
 
-/** Confirms every number and every protected technical term present in the ORIGINAL text still
- *  appears verbatim in the EDITED/translated text - a real, checkable guarantee rather than an
- *  assumption about how the model behaved. */
+/** Confirms every number (with its unit, when it has one) and every protected technical term
+ *  present in the ORIGINAL text still appears - as the SAME number+unit pair, never merely a
+ *  matching substring - somewhere in the EDITED/translated text. A real, checkable guarantee
+ *  rather than an assumption about how the model behaved. */
 export function checkPreservation(original: string, edited: string): PreservationCheck {
-  const numbers = Array.from(new Set(original.match(NUMBER_RE) ?? []));
-  const missingNumbers = numbers.filter(n => !edited.includes(n));
-  const presentTerms = PROTECTED_TECHNICAL_TERMS.filter(t => original.includes(t));
-  const missingTerms = presentTerms.filter(t => !edited.includes(t));
+  const originalTokens = uniqueByKey(extractNumericTokens(original));
+  const editedKeys = new Set(extractNumericTokens(edited).map(t => t.key));
+  const missing = originalTokens.filter(t => !editedKeys.has(t.key));
+  const missingKeys = new Set(missing.map(t => t.key));
+  const presentTerms = PROTECTED_TECHNICAL_TERMS.filter(t => containsAsWord(original, t));
+  const missingTerms = presentTerms.filter(t => !containsAsWord(edited, t));
   return {
-    preservedNumbers: numbers.filter(n => !missingNumbers.includes(n)),
-    missingNumbers,
+    preservedNumbers: originalTokens.filter(t => !missingKeys.has(t.key)).map(t => t.raw),
+    missingNumbers: missing.map(t => t.raw),
     preservedTerms: presentTerms.filter(t => !missingTerms.includes(t)),
     missingTerms,
-    ok: missingNumbers.length === 0 && missingTerms.length === 0,
+    ok: missing.length === 0 && missingTerms.length === 0,
   };
 }
 
@@ -292,26 +348,40 @@ export function summarizeChanges(original: string, edited: string): string[] {
   return changes;
 }
 
-/** Numbers that commonly appear as structural artifacts (list/section numbering, ordinal
- *  references) rather than invented data - excluded from the invented-number check to keep it
- *  useful instead of noisy. Everything else is a real claim and must trace back to the user. */
-const STRUCTURAL_NUMBER_EXCLUSIONS = new Set(Array.from({ length: 21 }, (_, i) => String(i)));
+/** A bare number (never one with a unit - a list marker never has a physical unit attached) is
+ *  treated as structural (list/section numbering, not a claimed quantity) ONLY when it actually
+ *  appears in that shape: at the start of a line, immediately followed by ". "/") "/": " - a
+ *  real list-marker, never merely because the value itself happens to be small (F03: the old
+ *  blanket "any number 0-20" exclusion let a genuinely invented small experimental value, e.g.
+ *  "15 GPa", slip through unchecked purely because 15 <= 20 - unsafe, since real values
+ *  routinely fall in that range). */
+function structuralListMarkerKeys(text: string): Set<string> {
+  const keys = new Set<string>();
+  for (const match of text.matchAll(/(?:^|\n)[ \t]*(\d{1,3})[.):]\s/g)) keys.add(match[1]);
+  return keys;
+}
 
 export interface InventedNumberCheck { invented: string[]; ok: boolean }
 
-/** Checks that every number in the GENERATED text traces back to something the user actually
- *  supplied (across all input fields, including sourceText) - catches a model inventing a new
- *  experimental figure from nothing, which checkPreservation alone (original -> edited survival)
- *  cannot: for `draft` mode there is no "original" to compare against at all. */
+/** Checks that every number+unit pair in the GENERATED text traces back to the SAME pair the
+ *  user actually supplied (across all input fields, including sourceText) - catches a model
+ *  inventing a new experimental figure from nothing, which checkPreservation alone (original ->
+ *  edited survival) cannot: for `draft` mode there is no "original" to compare against at all.
+ *  A bare number with no unit that supplied text also mentions bare (in ANY context - a
+ *  legitimate duration, count, etc.) is not flagged; a number that only appears attached to a
+ *  DIFFERENT or no unit in the supplied text (e.g. "15 GPa" when the user only ever gave "15
+ *  min") is a genuinely new claim and IS flagged - because it is compared as a pair, not a bare
+ *  digit string. */
 export function checkNoInventedNumbers(input: ScientificWriterInput, generatedText: string): InventedNumberCheck {
   const suppliedText = [
     input.title, input.researchField, input.goal, input.researchObject, input.methods,
     input.results, input.conclusions, input.keywords, input.sourceText, input.additionalRequirements,
   ].filter((v): v is string => !!v).join('\n');
-  const suppliedNumbers = new Set(suppliedText.match(NUMBER_RE) ?? []);
-  const generatedNumbers = Array.from(new Set(generatedText.match(NUMBER_RE) ?? []));
-  const invented = generatedNumbers.filter(n => !suppliedNumbers.has(n) && !STRUCTURAL_NUMBER_EXCLUSIONS.has(n));
-  return { invented, ok: invented.length === 0 };
+  const suppliedKeys = new Set(extractNumericTokens(suppliedText).map(t => t.key));
+  const generatedTokens = uniqueByKey(extractNumericTokens(generatedText));
+  const structuralKeys = structuralListMarkerKeys(generatedText);
+  const invented = generatedTokens.filter(t => !suppliedKeys.has(t.key) && !structuralKeys.has(t.key));
+  return { invented: invented.map(t => t.raw), ok: invented.length === 0 };
 }
 
 const DOI_RE = /\b10\.\d{4,9}\/\S+/;

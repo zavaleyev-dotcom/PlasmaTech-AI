@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { POST as checkPOST, handleCheck } from '../src/app/api/workspace/anti-plagiarism/route';
+import { POST as checkPOST } from '../src/app/api/workspace/anti-plagiarism/route';
+import { handleCheck } from '../src/services/workspace/anti-plagiarism-handler';
 
 function postRequest(body: unknown, headers: Record<string, string> = {}) {
   return new Request('http://localhost/api/workspace/anti-plagiarism', {
@@ -53,6 +54,23 @@ test('server-side validation rejects an oversized text', async () => {
 test('rejects an oversized raw request body before ever parsing JSON', async () => {
   const response = await checkPOST(postRequest('a'.repeat(200_001)));
   assert.equal(response.status, 413);
+});
+
+// ---------- F10: internal errors never leak to the client ----------
+
+test('handleCheck: an arbitrary internal exception (e.g. a filesystem/storage failure) is never forwarded verbatim - only a fixed, neutral message', async () => {
+  const throwing = async () => { throw new Error('ENOENT: no such file or directory, open \'/tmp/secret-internal-path/index.sqlite\''); };
+  const { status, body } = await handleCheck({ text: 'a'.repeat(200) }, throwing);
+  assert.equal(status, 500);
+  assert.equal(body.error, 'Не удалось выполнить проверку.');
+  assert.ok(!String(body.error).includes('/tmp/'), 'the real filesystem path must never reach the client');
+  assert.ok(!String(body.error).includes('ENOENT'));
+});
+
+test('handleCheck: a genuine ValidationError (e.g. text too short) still returns its own safe, specific message', async () => {
+  const { status, body } = await handleCheck({ text: 'short' });
+  assert.equal(status, 400);
+  assert.ok(String(body.error).includes('короткий'), 'a real validation message must still reach the client');
 });
 
 // Note: a "valid request against the REAL local corpus returns 200" check is intentionally

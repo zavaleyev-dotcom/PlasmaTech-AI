@@ -107,3 +107,63 @@ test('computeCoveredFraction: is a plain coverage ratio (0..1) over corpus match
   assert.ok(fraction > 0 && fraction <= 1);
   assert.equal(computeCoveredFraction([], input), 0);
 });
+
+// ---------- F15 (MEDIUM): coveredFraction must be a UNION of unique intervals, never a sum of
+// overlapping/nested/duplicate span lengths (which can wildly overstate real coverage) ----------
+
+const ALPHABET = 'abcdefghijklmnopqrstuvwxyz'; // 26 unique characters -> every slice is an unambiguous, uniquely-locatable substring
+
+test('F15 computeCoveredFraction: a nested span (fully inside an already-covered span) adds nothing to coverage', () => {
+  const outer = ALPHABET.slice(5, 20); // 15 chars, positions 5-20
+  const inner = ALPHABET.slice(8, 12); // 4 chars, positions 8-12, fully nested inside `outer`
+  const matches: SimilarityMatch[] = [fakeMatch({ inputSpan: outer }), fakeMatch({ inputSpan: inner, chunkId: 'chunk-2' })];
+  const fraction = computeCoveredFraction(matches, ALPHABET);
+  assert.equal(fraction, 15 / 26, 'the nested span must not add its own length on top of the span that already covers it');
+});
+
+test('F15 computeCoveredFraction: overlapping (non-identical) spans are merged into their union, not summed - this is the exact Codex regression (real 58%, previously reported as inflated)', () => {
+  const spanA = ALPHABET.slice(0, 15); // positions 0-15 (15 chars)
+  const spanB = ALPHABET.slice(10, 20); // positions 10-20 (10 chars) - overlaps spanA on 10-15
+  const matches: SimilarityMatch[] = [fakeMatch({ inputSpan: spanA }), fakeMatch({ inputSpan: spanB, chunkId: 'chunk-2' })];
+  const fraction = computeCoveredFraction(matches, ALPHABET);
+  assert.equal(fraction, 20 / 26, 'union of [0,15) and [10,20) is [0,20) = 20 chars, NOT the sum 15+10=25 chars the old code would have reported');
+});
+
+test('F15 computeCoveredFraction: adjacent (touching, non-overlapping) spans merge into one continuous covered region with no gap and no double count', () => {
+  const spanA = ALPHABET.slice(0, 10);
+  const spanB = ALPHABET.slice(10, 20);
+  const matches: SimilarityMatch[] = [fakeMatch({ inputSpan: spanA }), fakeMatch({ inputSpan: spanB, chunkId: 'chunk-2' })];
+  const fraction = computeCoveredFraction(matches, ALPHABET);
+  assert.equal(fraction, 20 / 26);
+});
+
+test('F15 computeCoveredFraction: the exact same span text matched against two different corpus chunks (duplicate spans) still counts those characters only once', () => {
+  const span = ALPHABET.slice(0, 10);
+  const matches: SimilarityMatch[] = [fakeMatch({ inputSpan: span, chunkId: 'chunk-1' }), fakeMatch({ inputSpan: span, chunkId: 'chunk-2', documentId: 'doc-2' })];
+  const fraction = computeCoveredFraction(matches, ALPHABET);
+  assert.equal(fraction, 10 / 26);
+});
+
+test('F15 computeCoveredFraction: no matches at all -> 0', () => {
+  assert.equal(computeCoveredFraction([], ALPHABET), 0);
+});
+
+test('F15 computeCoveredFraction: a match covering the entire input text -> exactly 1 (full coverage), never above 1', () => {
+  const matches: SimilarityMatch[] = [fakeMatch({ inputSpan: ALPHABET })];
+  assert.equal(computeCoveredFraction(matches, ALPHABET), 1);
+});
+
+test('F15 computeCoveredFraction: several overlapping/nested/duplicate spans together still never exceed 1, even though their raw lengths sum to far more than the input', () => {
+  const matches: SimilarityMatch[] = [
+    fakeMatch({ inputSpan: ALPHABET, chunkId: 'chunk-1' }),
+    fakeMatch({ inputSpan: ALPHABET.slice(0, 10), chunkId: 'chunk-2' }),
+    fakeMatch({ inputSpan: ALPHABET.slice(5, 15), chunkId: 'chunk-3' }),
+    fakeMatch({ inputSpan: ALPHABET.slice(20, 26), chunkId: 'chunk-4' }),
+  ];
+  assert.equal(computeCoveredFraction(matches, ALPHABET), 1);
+});
+
+test('F15 computeCoveredFraction: a span that cannot be located in the input is skipped rather than guessed at - never inflates or crashes', () => {
+  const matches: SimilarityMatch[] = [fakeMatch({ inputSpan: 'not present anywhere in the alphabet text 123' })];
+  assert.equal(computeCoveredFraction(matches, ALPHABET), 0);
+});

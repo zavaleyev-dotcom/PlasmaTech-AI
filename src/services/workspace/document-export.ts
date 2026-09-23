@@ -46,28 +46,57 @@ export interface GenericDocumentViewModel {
   footer: string;
 }
 
+/** F11: real, applied formatting-profile parameters - when omitted, every existing caller
+ *  (TechDoc, and Scientific Writer's own default) gets EXACTLY the previous fixed values,
+ *  unchanged. Only the fields already defined on FormattingProfile (references.ts) are wired
+ *  through here - no new "paragraph spacing" or similar knob is invented beyond what that
+ *  data model already declares. */
+export interface FormattingOverrides {
+  bodyFontSizePt?: number;
+  headingFontSizePt?: number;
+  lineSpacing?: number;
+  marginsMm?: { top: number; bottom: number; left: number; right: number };
+}
+
 export interface RenderOptions {
   layout?: 'portrait' | 'landscape';
   /** Insert a page break right after the metadata block, before the first section - used for
    *  long, multi-section prose documents where a clean break reads better. */
   pageBreakAfterMetadata?: boolean;
+  formatting?: FormattingOverrides;
 }
 
 // ---------- DOCX renderer ----------
 
 const DOCX_FONT = 'Times New Roman'; // ships with every Word install and renders Cyrillic natively
-const BODY_SIZE = 22; // half-points -> 11pt
+const BODY_SIZE = 22; // half-points -> 11pt (default when no formatting profile is given)
+const HEADING_SIZE = 26; // half-points -> 13pt (default)
 const SMALL_SIZE = 18; // 9pt, for table cells
+const DEFAULT_MARGINS_TWIPS = { top: 1134, bottom: 1134, left: 1417, right: 1417 };
 
-function textParagraph(text: string, opts: { bold?: boolean; size?: number } = {}): Paragraph {
-  return new Paragraph({ children: [new TextRun({ text, font: DOCX_FONT, size: opts.size ?? BODY_SIZE, bold: opts.bold })], spacing: { after: 100 } });
+function ptToHalfPoints(pt: number): number { return Math.round(pt * 2); }
+function mmToTwips(mm: number): number { return Math.round(mm * 56.6929); }
+
+/** F12: a single `\n` inside `text` must become a real Word line break (`<w:br/>`), not vanish
+ *  inside one TextRun's text - Word does not render embedded "\n" characters as line breaks on
+ *  its own. Each line after the first gets its own TextRun with `break: 1`, which the `docx`
+ *  package renders as a `<w:br/>` immediately before that run's text (verified empirically). */
+function textParagraph(text: string, opts: { bold?: boolean; size?: number; lineSpacing?: number } = {}): Paragraph {
+  const lines = text.split('\n');
+  const size = opts.size ?? BODY_SIZE;
+  return new Paragraph({
+    children: lines.map((line, index) => new TextRun({
+      text: line, font: DOCX_FONT, size, bold: opts.bold, ...(index > 0 ? { break: 1 } : {}),
+    })),
+    spacing: { after: 100, ...(opts.lineSpacing ? { line: Math.round(240 * opts.lineSpacing), lineRule: 'auto' } : {}) },
+  });
 }
 
-function metadataParagraph(item: ExportMetadataItem): Paragraph {
+function metadataParagraph(item: ExportMetadataItem, size = BODY_SIZE): Paragraph {
   return new Paragraph({
     children: [
-      new TextRun({ text: `${item.label}: `, font: DOCX_FONT, size: BODY_SIZE, bold: true }),
-      new TextRun({ text: item.value, font: DOCX_FONT, size: BODY_SIZE }),
+      new TextRun({ text: `${item.label}: `, font: DOCX_FONT, size, bold: true }),
+      new TextRun({ text: item.value, font: DOCX_FONT, size }),
     ],
     spacing: { after: 40 },
   });
@@ -94,30 +123,40 @@ function docxTable(table: ExportTable): Table {
 }
 
 export async function renderGenericDocx(viewModel: GenericDocumentViewModel, options: RenderOptions = {}): Promise<Buffer> {
+  const bodySize = options.formatting?.bodyFontSizePt !== undefined ? ptToHalfPoints(options.formatting.bodyFontSizePt) : BODY_SIZE;
+  const headingSize = options.formatting?.headingFontSizePt !== undefined ? ptToHalfPoints(options.formatting.headingFontSizePt) : HEADING_SIZE;
+  const lineSpacing = options.formatting?.lineSpacing;
+  const margins = options.formatting?.marginsMm
+    ? {
+      top: mmToTwips(options.formatting.marginsMm.top), bottom: mmToTwips(options.formatting.marginsMm.bottom),
+      left: mmToTwips(options.formatting.marginsMm.left), right: mmToTwips(options.formatting.marginsMm.right),
+    }
+    : DEFAULT_MARGINS_TWIPS;
+
   const children: (Paragraph | Table)[] = [];
   children.push(new Paragraph({ children: [new TextRun({ text: viewModel.title, font: DOCX_FONT, size: 32, bold: true })], heading: HeadingLevel.TITLE, alignment: AlignmentType.LEFT, spacing: { after: 200 } }));
-  children.push(...viewModel.metadata.map(metadataParagraph));
+  children.push(...viewModel.metadata.map(item => metadataParagraph(item, bodySize)));
   if (options.pageBreakAfterMetadata) children.push(new Paragraph({ children: [new PageBreak()] }));
 
   for (const section of viewModel.sections) {
-    children.push(new Paragraph({ children: [new TextRun({ text: section.heading, font: DOCX_FONT, size: 26, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
-    children.push(...section.paragraphs.map(p => textParagraph(p)));
+    children.push(new Paragraph({ children: [new TextRun({ text: section.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
+    children.push(...section.paragraphs.map(p => textParagraph(p, { size: bodySize, lineSpacing })));
   }
 
   for (const table of viewModel.tables) {
-    children.push(new Paragraph({ children: [new TextRun({ text: table.heading, font: DOCX_FONT, size: 26, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
+    children.push(new Paragraph({ children: [new TextRun({ text: table.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
     children.push(docxTable(table));
   }
 
-  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.traceabilityHeading, font: DOCX_FONT, size: 26, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 300, after: 100 } }));
-  children.push(...viewModel.traceability.map(metadataParagraph));
+  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.traceabilityHeading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 300, after: 100 } }));
+  children.push(...viewModel.traceability.map(item => metadataParagraph(item, bodySize)));
   children.push(new Paragraph({ children: [new TextRun({ text: viewModel.footer, font: DOCX_FONT, size: 18, italics: true })], spacing: { before: 300 } }));
 
   const landscape = options.layout === 'landscape';
   const [width, height] = landscape ? [16838, 11906] : [11906, 16838];
   const document = new Document({
     sections: [{
-      properties: { page: { size: { width, height }, margin: { top: 1134, bottom: 1134, left: 1417, right: 1417 } } },
+      properties: { page: { size: { width, height }, margin: margins } },
       children,
     }],
   });
@@ -136,12 +175,33 @@ export async function renderGenericDocx(viewModel: GenericDocumentViewModel, opt
 const PDF_FONT_REGULAR = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans.ttf');
 const PDF_FONT_BOLD = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans-Bold.ttf');
 const PDF_MARGIN = 56;
+const PDF_BODY_SIZE = 10;
+const PDF_HEADING_SIZE = 13;
+
+const MM_TO_PT = 72 / 25.4;
+function mmToPt(mm: number): number { return Math.round(mm * MM_TO_PT); }
+
+interface PdfMargins { top: number; bottom: number; left: number; right: number }
 
 export async function renderGenericPdf(viewModel: GenericDocumentViewModel, options: RenderOptions = {}): Promise<Buffer> {
   const landscape = options.layout === 'landscape';
+  const margins: PdfMargins = options.formatting?.marginsMm
+    ? {
+      top: mmToPt(options.formatting.marginsMm.top), bottom: mmToPt(options.formatting.marginsMm.bottom),
+      left: mmToPt(options.formatting.marginsMm.left), right: mmToPt(options.formatting.marginsMm.right),
+    }
+    : { top: PDF_MARGIN, bottom: PDF_MARGIN, left: PDF_MARGIN, right: PDF_MARGIN };
+  const bodySize = options.formatting?.bodyFontSizePt ?? PDF_BODY_SIZE;
+  const headingSize = options.formatting?.headingFontSizePt ?? PDF_HEADING_SIZE;
+  // PDFKit has no native "line spacing multiplier" for wrapped text (unlike DOCX's
+  // spacing.line) - approximated as extra gap between wrapped lines, proportional to the
+  // resolved body font size, so e.g. thesis_report's 1.5 genuinely reads roomier than
+  // conference_paper's 1.0 without claiming exact DOCX-equivalent typographic line-height.
+  const lineGap = options.formatting?.lineSpacing ? Math.round(bodySize * (options.formatting.lineSpacing - 1)) : 0;
+
   return new Promise((resolve, reject) => {
     try {
-      const doc = new PDFDocument({ size: 'A4', layout: landscape ? 'landscape' : 'portrait', margin: PDF_MARGIN, bufferPages: true });
+      const doc = new PDFDocument({ size: 'A4', layout: landscape ? 'landscape' : 'portrait', margins, bufferPages: true });
       doc.registerFont('Body', PDF_FONT_REGULAR);
       doc.registerFont('Bold', PDF_FONT_BOLD);
       doc.font('Body');
@@ -153,17 +213,17 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
         for (let i = 0; i < pages.count; i++) {
           doc.switchToPage(pages.start + i);
           doc.font('Body').fontSize(8).fillColor('#666666')
-            .text(`Страница ${i + 1} из ${pages.count}`, PDF_MARGIN, doc.page.height - PDF_MARGIN + 20, { width: doc.page.width - PDF_MARGIN * 2, align: 'center' });
+            .text(`Страница ${i + 1} из ${pages.count}`, margins.left, doc.page.height - margins.bottom + 20, { width: doc.page.width - margins.left - margins.right, align: 'center' });
         }
         resolve(Buffer.concat(chunks));
       });
       doc.on('error', reject);
 
-      const contentWidth = doc.page.width - PDF_MARGIN * 2;
+      const contentWidth = doc.page.width - margins.left - margins.right;
 
       doc.font('Bold').fontSize(16).fillColor('#000000').text(viewModel.title, { width: contentWidth });
       doc.moveDown(0.5);
-      doc.font('Body').fontSize(10);
+      doc.font('Body').fontSize(bodySize);
       for (const item of viewModel.metadata) {
         doc.font('Bold').text(`${item.label}: `, { continued: true, width: contentWidth }).font('Body').text(item.value);
       }
@@ -171,30 +231,30 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
       if (options.pageBreakAfterMetadata) doc.addPage();
 
       for (const section of viewModel.sections) {
-        ensureSpace(doc, 40);
-        doc.font('Bold').fontSize(13).text(section.heading, { width: contentWidth });
+        ensureSpace(doc, 40, margins);
+        doc.font('Bold').fontSize(headingSize).text(section.heading, { width: contentWidth });
         doc.moveDown(0.3);
-        doc.font('Body').fontSize(10);
+        doc.font('Body').fontSize(bodySize);
         for (const paragraph of section.paragraphs) {
-          ensureSpace(doc, 14);
-          doc.text(paragraph, { width: contentWidth, align: 'left' });
+          ensureSpace(doc, 14, margins);
+          doc.text(paragraph, { width: contentWidth, align: 'left', lineGap });
           doc.moveDown(0.2);
         }
         doc.moveDown(0.4);
       }
 
       for (const table of viewModel.tables) {
-        ensureSpace(doc, 40);
-        doc.font('Bold').fontSize(13).text(table.heading, { width: contentWidth });
+        ensureSpace(doc, 40, margins);
+        doc.font('Bold').fontSize(headingSize).text(table.heading, { width: contentWidth });
         doc.moveDown(0.3);
-        drawTable(doc, table, contentWidth);
+        drawTable(doc, table, contentWidth, margins);
         doc.moveDown(0.4);
       }
 
-      ensureSpace(doc, 60);
-      doc.font('Bold').fontSize(13).text(viewModel.traceabilityHeading, { width: contentWidth });
+      ensureSpace(doc, 60, margins);
+      doc.font('Bold').fontSize(headingSize).text(viewModel.traceabilityHeading, { width: contentWidth });
       doc.moveDown(0.3);
-      doc.font('Body').fontSize(10);
+      doc.font('Body').fontSize(bodySize);
       for (const item of viewModel.traceability) {
         doc.font('Bold').text(`${item.label}: `, { continued: true, width: contentWidth }).font('Body').text(item.value);
       }
@@ -208,11 +268,11 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
   });
 }
 
-function ensureSpace(doc: PDFKit.PDFDocument, minHeight: number): void {
-  if (doc.y + minHeight > doc.page.height - PDF_MARGIN) doc.addPage();
+function ensureSpace(doc: PDFKit.PDFDocument, minHeight: number, margins: PdfMargins): void {
+  if (doc.y + minHeight > doc.page.height - margins.bottom) doc.addPage();
 }
 
-function drawTable(doc: PDFKit.PDFDocument, table: ExportTable, contentWidth: number): void {
+function drawTable(doc: PDFKit.PDFDocument, table: ExportTable, contentWidth: number, margins: PdfMargins): void {
   const columnWidth = contentWidth / table.columns.length;
   const rows = table.rows.length > 0 ? table.rows : [table.columns.map(() => DASH)];
 
@@ -220,10 +280,10 @@ function drawTable(doc: PDFKit.PDFDocument, table: ExportTable, contentWidth: nu
     const startY = doc.y;
     doc.font('Bold').fontSize(8);
     const rowHeight = Math.max(...table.columns.map(col => doc.heightOfString(col, { width: columnWidth - 6 }))) + 8;
-    doc.rect(PDF_MARGIN, startY, contentWidth, rowHeight).fill('#E2E2E2');
+    doc.rect(margins.left, startY, contentWidth, rowHeight).fill('#E2E2E2');
     doc.fillColor('#000000');
     table.columns.forEach((col, i) => {
-      doc.text(col, PDF_MARGIN + i * columnWidth + 3, startY + 4, { width: columnWidth - 6 });
+      doc.text(col, margins.left + i * columnWidth + 3, startY + 4, { width: columnWidth - 6 });
     });
     doc.y = startY + rowHeight;
   }
@@ -233,14 +293,14 @@ function drawTable(doc: PDFKit.PDFDocument, table: ExportTable, contentWidth: nu
 
   for (const row of rows) {
     const rowHeight = Math.max(...row.map(cell => doc.heightOfString(cell || DASH, { width: columnWidth - 6 }))) + 8;
-    if (doc.y + rowHeight > doc.page.height - PDF_MARGIN) {
+    if (doc.y + rowHeight > doc.page.height - margins.bottom) {
       doc.addPage();
       drawHeader();
       doc.font('Body').fontSize(8);
     }
     const startY = doc.y;
     row.forEach((cell, i) => {
-      doc.text(cell || DASH, PDF_MARGIN + i * columnWidth + 3, startY + 4, { width: columnWidth - 6 });
+      doc.text(cell || DASH, margins.left + i * columnWidth + 3, startY + 4, { width: columnWidth - 6 });
     });
     doc.y = startY + rowHeight;
   }
