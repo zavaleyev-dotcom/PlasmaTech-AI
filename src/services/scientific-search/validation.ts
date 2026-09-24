@@ -1,6 +1,9 @@
 import { ScientificSearchError } from './errors';
 import { normalizeDoi } from './normalization';
-import { publicationTypes, MAX_SEARCH_OFFSET, type ScientificSearchQuery, type SearchContinuation, type Publication } from './types';
+import {
+  publicationTypes, MAX_SEARCH_OFFSET, MAX_COMBINED_SEARCH_DEPTH, MAX_COMBINED_EMITTED_KEYS,
+  type ScientificSearchQuery, type SearchContinuation, type Publication,
+} from './types';
 
 function invalid(message: string): never {
   throw new ScientificSearchError('INVALID_QUERY', message, 400);
@@ -30,9 +33,18 @@ function parseContinuation(value: unknown): SearchContinuation | undefined {
   const numOrNull = (x: unknown): number | null => typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : null;
   const bool = (x: unknown): boolean => x === true;
   const buffer = Array.isArray(v.buffer) ? v.buffer.filter(isPublicationLike).slice(0, 50) : [];
-  const emittedKeys = Array.isArray(v.emittedKeys) ? v.emittedKeys.filter((k): k is string => typeof k === 'string').slice(0, MAX_SEARCH_OFFSET) : [];
+  // F20 (Codex re-detection #3): `emittedKeys` is a sliding window of the MOST RECENTLY
+  // emitted keys, kept with `slice(-N)` - the tail of the array, not the head. A previous
+  // version used `slice(0, N)`, which kept the OLDEST entries and silently evicted the newest
+  // ones once the array exceeded the cap; that let an already-shown record re-appear on a much
+  // later page (its key had been forgotten) instead of ever staying correctly bounded AND
+  // correct. Also hard-clamps `crossrefOffset`/`openalexOffset` to MAX_COMBINED_SEARCH_DEPTH -
+  // a tampered or foreign continuation token can never make the pipeline believe a provider is
+  // further along than the configured bound permits.
+  const emittedKeys = Array.isArray(v.emittedKeys) ? v.emittedKeys.filter((k): k is string => typeof k === 'string').slice(-MAX_COMBINED_EMITTED_KEYS) : [];
   return {
-    crossrefOffset: num(v.crossrefOffset), openalexOffset: num(v.openalexOffset),
+    crossrefOffset: Math.min(num(v.crossrefOffset), MAX_COMBINED_SEARCH_DEPTH),
+    openalexOffset: Math.min(num(v.openalexOffset), MAX_COMBINED_SEARCH_DEPTH),
     crossrefTotal: numOrNull(v.crossrefTotal), openalexTotal: numOrNull(v.openalexTotal),
     crossrefExhausted: bool(v.crossrefExhausted), openalexExhausted: bool(v.openalexExhausted),
     buffer, emittedKeys,

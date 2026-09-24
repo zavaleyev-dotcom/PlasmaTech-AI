@@ -196,6 +196,11 @@ export function SciFinderSearch() {
         {/* F20: combined mode pages by its own client-cached continuation (goToCombinedPage);
             single-provider mode keeps its simpler offset-based navigation (goToOffset) -
             these are genuinely different pagination mechanisms, never forced into one. */}
+        {/* F20 (Codex re-detection #3): combined pagination has a real depth limit -
+            `boundReached` (never the internal MAX_COMBINED_SEARCH_DEPTH value itself) tells the
+            user honestly why "Далее" stopped working, instead of silently disabling it as if
+            the dataset itself had simply ended. */}
+        {result && result.source === 'combined' && result.boundReached && <p className={`${styles.status} mt-4`} role="status">Достигнут предел глубины поиска. Уточните поисковый запрос.</p>}
         {result && result.source === 'combined' && (page > 0 || result.hasMore) && <div className={`${styles.actions} ${styles.full} mt-4`}>
           <button type="button" className="button secondary" disabled={busy || page === 0} onClick={() => goToCombinedPage(page - 1)}>← Назад</button>
           <span className="muted small">Страница {page + 1}</span>

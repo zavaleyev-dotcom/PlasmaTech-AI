@@ -3,7 +3,7 @@ import { filterPublications } from './filters';
 import { sortPublications } from './sort';
 import { ScientificSearchError } from './errors';
 import {
-  MAX_SEARCH_OFFSET,
+  MAX_SEARCH_OFFSET, MAX_COMBINED_SEARCH_DEPTH, MAX_COMBINED_EMITTED_KEYS,
   type ScientificSearchQuery, type ScientificSearchResult, type ScientificSourceProvider, type Publication,
   type SearchContinuation,
 } from './types';
@@ -62,10 +62,20 @@ const emptyContinuation = (): SearchContinuation => ({
  *  pattern that was discarding records, AND what keeps the buffer/continuation itself from
  *  growing without bound across many pages) - never more than one round per provider per
  *  call, so a single request can never auto-walk deeper than one page's worth of extra
- *  fetching; (3) dedupe/filter/sort the WHOLE pool (buffer +
- *  freshly fetched) exactly like a normal page; (4) emit the first `limit`, carry the rest
- *  into the new buffer, and record what was emitted in `emittedKeys` so it can never be
- *  re-emitted by a later fetch that happens to return it again. */
+ *  fetching, AND only if that provider's own offset has not yet reached
+ *  MAX_COMBINED_SEARCH_DEPTH (Codex re-detection #3 - see below); (3) dedupe/filter/sort the
+ *  WHOLE pool (buffer + freshly fetched) exactly like a normal page; (4) emit the first
+ *  `limit`, carry the rest into the new buffer, and record what was emitted in `emittedKeys`
+ *  so it can never be re-emitted by a later fetch that happens to return it again.
+ *
+ *  F20 (Codex re-detection #3): combined mode has NO usable `query.offset` - the client keeps
+ *  it fixed at 0 for a combined search's entire lifetime (see search.tsx; only `continuation`
+ *  ever advances), so a depth-bound check that read `query.offset` here was comparing against
+ *  a value that never changed and therefore never fired: `crossrefOffset`/`openalexOffset`
+ *  could climb forever, and `emittedKeys` grew right along with them. The bound is now
+ *  enforced directly against each provider's OWN tracked offset (MAX_COMBINED_SEARCH_DEPTH),
+ *  which is also what makes `emittedKeys` bounded again - it cannot grow once nothing more is
+ *  ever fetched. */
 async function runCombinedSearch(query: ScientificSearchQuery, crossref: ScientificSourceProvider, openalex: ScientificSourceProvider): Promise<ScientificSearchResult> {
   const incoming = query.continuation ?? emptyContinuation();
   const emittedKeys = new Set(incoming.emittedKeys);
@@ -124,18 +134,41 @@ async function runCombinedSearch(query: ScientificSearchQuery, crossref: Scienti
   // avoids; both providers always advance in lockstep whenever a fetch round does happen.
   // Nothing fetched is ever discarded either way - this only decides WHEN the next round's
   // extra records get pulled in, never IF a fetched unique record eventually gets emitted.
+  // F20 (Codex re-detection #3): a provider at/past MAX_COMBINED_SEARCH_DEPTH is treated
+  // exactly like an exhausted one for fetch-gating purposes - its offset simply stops
+  // advancing and it is never fetched from again this session, regardless of what its own
+  // `total` claims. This is the actual enforcement point for the combined-mode depth bound
+  // (nothing upstream of this can be trusted to stop it, since `query.offset` cannot).
   if (incoming.buffer.length <= query.limit) {
-    if (!crossrefExhausted) {
+    if (!crossrefExhausted && crossrefOffset < MAX_COMBINED_SEARCH_DEPTH) {
       const round = await fetchRound(crossref, crossrefOffset);
       crossrefOffset = round.nextOffset; crossrefExhausted = round.exhausted || crossrefExhausted; crossrefTotal = round.total ?? crossrefTotal;
     }
-    if (!openalexExhausted) {
+    if (!openalexExhausted && openalexOffset < MAX_COMBINED_SEARCH_DEPTH) {
       const round = await fetchRound(openalex, openalexOffset);
       openalexOffset = round.nextOffset; openalexExhausted = round.exhausted || openalexExhausted; openalexTotal = round.total ?? openalexTotal;
     }
   }
 
-  if (!anySuccess && pool.length === 0) {
+  // F20 (Codex re-detection #3): each provider is "done" once it is genuinely exhausted OR its
+  // own offset has reached MAX_COMBINED_SEARCH_DEPTH - the bound now lives entirely on the
+  // providers' own tracked offsets, never on `query.offset` (which combined mode never
+  // advances - see the module doc comment above). `boundReached` is only true when the bound,
+  // not genuine exhaustion, is what actually cut a provider off - so the UI's message stays
+  // honest instead of firing on ordinary end-of-results too.
+  const crossrefBounded = crossrefOffset >= MAX_COMBINED_SEARCH_DEPTH;
+  const openalexBounded = openalexOffset >= MAX_COMBINED_SEARCH_DEPTH;
+  const crossrefDone = crossrefExhausted || crossrefBounded;
+  const openalexDone = openalexExhausted || openalexBounded;
+
+  // F20 (Codex re-detection #3): an empty result with nothing fetched THIS round is only a
+  // genuine failure when at least one provider was actually still eligible to be fetched from
+  // and simply came back empty/errored. Once both providers are already done (exhausted, or
+  // correctly held at the depth bound - the whole point of this fix), a call that lands here
+  // with an empty pool is the legitimate, honest end of a bounded/exhausted combined search,
+  // never a "sources unavailable" error - the fetch block above deliberately skipped both
+  // providers on purpose, so `anySuccess` staying false says nothing about availability.
+  if (!anySuccess && pool.length === 0 && !(crossrefDone && openalexDone)) {
     throw new ScientificSearchError('SOURCES_UNAVAILABLE', 'Не удалось получить данные научных источников. Повторите поиск.', 502, true);
   }
 
@@ -145,29 +178,32 @@ async function runCombinedSearch(query: ScientificSearchQuery, crossref: Scienti
   const publications = sorted.slice(0, query.limit);
   const remainder = sorted.slice(query.limit); // never dropped - carried into the next page's buffer
   for (const item of publications) { const key = publicationIdentityKey(item); if (key) emittedKeys.add(key); }
+  // F20 (Codex re-detection #3): defense in depth on top of the offset bound above - even if
+  // something upstream ever let a round over-fetch, `emittedKeys` itself can never exceed this
+  // cap. Keeps the NEWEST keys (the ones a subsequent fetch is actually at risk of re-hitting),
+  // never the oldest - see the matching slice(-N) in validation.ts's parseContinuation.
+  const boundedEmittedKeys = [...emittedKeys].slice(-MAX_COMBINED_EMITTED_KEYS);
 
   const offset = query.offset ?? 0;
-  const belowBound = offset + query.limit < MAX_SEARCH_OFFSET;
   // hasMore reflects the ACTUAL combined continuation - true if there is still buffered
-  // content, or either provider might still have more to give (not yet exhausted and its own
-  // reported total, if known, has not been fully consumed) - never just one provider's own
-  // single-page response.
-  const hasMore = belowBound && (
-    remainder.length > 0
-    || (!crossrefExhausted && (crossrefTotal === null || crossrefOffset < crossrefTotal))
-    || (!openalexExhausted && (openalexTotal === null || openalexOffset < openalexTotal))
-  );
+  // content (always drained fully, bound or not - the bound only stops FETCHING further, it
+  // never discards what was already fetched), or either provider is neither exhausted nor
+  // bounded and its own reported total, if known, has not been fully consumed.
+  const hasMore = remainder.length > 0
+    || (!crossrefDone && (crossrefTotal === null || crossrefOffset < crossrefTotal))
+    || (!openalexDone && (openalexTotal === null || openalexOffset < openalexTotal));
+  const boundReached = !hasMore && (crossrefBounded || openalexBounded);
 
   const continuation: SearchContinuation = {
     crossrefOffset, openalexOffset, crossrefTotal, openalexTotal, crossrefExhausted, openalexExhausted,
-    buffer: remainder, emittedKeys: [...emittedKeys],
+    buffer: remainder, emittedKeys: boundedEmittedKeys,
   };
 
   return {
     publications, total: (crossrefTotal ?? 0) + (openalexTotal ?? 0), source: 'combined', query,
     retrieved: pool.length, duplicatesRemoved: pool.length - unique.length,
     uniqueRetrieved: unique.length, filteredOut: unique.length - filtered.length,
-    returned: publications.length, sourceStats, warnings, offset, hasMore, continuation,
+    returned: publications.length, sourceStats, warnings, offset, hasMore, continuation, boundReached,
   };
 }
 

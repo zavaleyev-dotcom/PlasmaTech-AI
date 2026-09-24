@@ -53,8 +53,11 @@ export interface PublicationFilters {
  *  from either provider happens to return it again. Bounded by construction: `buffer` never
  *  grows past roughly two pages' worth of records (the pipeline only fetches a fresh round
  *  once the buffer has AT MOST one page's worth left, so it oscillates rather than growing
- *  forever), and `emittedKeys` never exceeds MAX_SEARCH_OFFSET entries (this app never pages
- *  deeper than that). */
+ *  forever), `crossrefOffset`/`openalexOffset` never advance past MAX_COMBINED_SEARCH_DEPTH
+ *  (the pipeline stops fetching from a provider once its own offset reaches the bound, exactly
+ *  like an exhausted provider), and `emittedKeys` never exceeds MAX_COMBINED_EMITTED_KEYS
+ *  entries (enforced both by the offset bound making further growth impossible, and as an
+ *  explicit cap on the parsed/persisted array itself). */
 export interface SearchContinuation {
   crossrefOffset: number;
   openalexOffset: number;
@@ -93,6 +96,28 @@ export interface ScientificSearchQuery extends PublicationFilters {
  *  here auto-walks every page), never silently exceeded. */
 export const MAX_SEARCH_OFFSET = 500;
 
+/** F20 (Codex re-detection #3): the deepest offset EITHER provider may ever be advanced to in
+ *  COMBINED mode. Deliberately the same value as MAX_SEARCH_OFFSET (one honest pagination-depth
+ *  bound for the whole app), but named and exported separately because combined mode cannot
+ *  reuse `query.offset` to enforce it: the client keeps `query.offset` fixed at 0 for the whole
+ *  life of a combined search (only `continuation` advances - see below), so a bound check that
+ *  read `query.offset` in combined mode was comparing against a value that never changed,
+ *  silently never firing. Only `crossrefOffset`/`openalexOffset`, tracked inside
+ *  `SearchContinuation` itself, can enforce this bound. */
+export const MAX_COMBINED_SEARCH_DEPTH = MAX_SEARCH_OFFSET;
+
+/** F20 (Codex re-detection #3): hard cap on `SearchContinuation.emittedKeys`. Once both
+ *  providers' offsets are held at/under MAX_COMBINED_SEARCH_DEPTH (enforced in the pipeline),
+ *  the TOTAL number of records either provider can ever supply across an entire combined
+ *  session is naturally bounded - each provider stops being fetched from once its own offset
+ *  would cross the depth bound, so at most one round can overshoot it by less than one page.
+ *  With the largest allowed page size (50) this puts a provably safe ceiling on how many
+ *  records either provider could ever contribute, and therefore on `emittedKeys` itself:
+ *  `2 * (bound + largest limit)`. Kept as an explicit, independently-enforced cap (not just a
+ *  side effect of the offset bound) so `emittedKeys` can never grow without limit even if a
+ *  future change to the offset bound is made without updating this file. */
+export const MAX_COMBINED_EMITTED_KEYS = 2 * (MAX_COMBINED_SEARCH_DEPTH + 50);
+
 export interface SourceSearchResult {
   publications: Publication[];
   total: number;
@@ -129,6 +154,12 @@ export interface ScientificSearchResult extends SourceSearchResult {
    *  forward without losing or re-emitting a result. Absent for single-provider searches, which
    *  use the simpler `offset` contract above instead. */
   continuation?: SearchContinuation;
+  /** F20 (Codex re-detection #3): combined-mode-only - true once `hasMore` has gone false
+   *  BECAUSE at least one provider was cut off by MAX_COMBINED_SEARCH_DEPTH, as opposed to
+   *  both providers having genuinely run out of real results on their own. The UI uses this to
+   *  show an honest "search depth limit reached" message instead of silently disabling "Next"
+   *  as if the dataset itself had simply ended - never exposes the numeric bound itself. */
+  boundReached?: boolean;
 }
 
 export interface SearchErrorBody {

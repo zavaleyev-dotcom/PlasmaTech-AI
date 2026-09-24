@@ -12,7 +12,10 @@ import { normalizeDoi, plainText, safeUrl } from '../src/services/scientific-sea
 import { parseSearchQuery } from '../src/services/scientific-search/validation';
 import { runSearch } from '../src/services/scientific-search/pipeline';
 import { buildOpenAlexUrl } from '../src/integrations/openalex';
-import { MAX_SEARCH_OFFSET, type Publication, type ScientificSourceProvider, type ScientificSearchResult } from '../src/services/scientific-search/types';
+import {
+  MAX_SEARCH_OFFSET, MAX_COMBINED_SEARCH_DEPTH, MAX_COMBINED_EMITTED_KEYS,
+  type Publication, type ScientificSourceProvider, type ScientificSearchResult,
+} from '../src/services/scientific-search/types';
 import { POST } from '../src/app/api/scifinder/search/route';
 
 const query = parseSearchQuery({ query: 'AlTiSiN coating cutting tools' });
@@ -508,6 +511,192 @@ test('F20 (re-detection): bounding the buffer never drops or duplicates a record
   }
   assert.equal(seen.length, 40, `expected exactly 40 emitted records total (no duplicates, nothing lost), got ${seen.length}`);
   assert.equal(new Set(seen).size, 40, 'every emitted DOI must be unique - no record re-emitted on a later page');
+});
+
+// ---------- F20 (Codex re-detection #3): combined pagination must have a REAL depth bound -
+// the old `belowBound` check compared MAX_SEARCH_OFFSET against `query.offset`, which combined
+// mode never advances (the client keeps it fixed at 0 - see search.tsx), so the bound silently
+// never fired: crossrefOffset/openalexOffset/emittedKeys could all grow forever. The bound now
+// lives on the providers' own tracked offsets (MAX_COMBINED_SEARCH_DEPTH) instead. ----------
+
+test('F20 (bound fix #3) A. LONG RUN / BOUND: two never-exhausting providers - provider offsets, emitted/dedup state and carry-over all stay bounded through the full configured combined depth, hasMore goes false at the bound, and no further provider fetch happens beyond it', async () => {
+  const limit = 50;
+  const crossref = makeListProvider('crossref', makeUniqueRecords('bound-cr', 5000));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('bound-oa', 5000));
+
+  let continuation: ScientificSearchResult['continuation'];
+  let last: ScientificSearchResult | undefined;
+  for (let page = 0; page < 100; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit, continuation }, [crossref, openalex]);
+    last = result;
+    assert.ok((result.continuation?.crossrefOffset ?? 0) <= MAX_COMBINED_SEARCH_DEPTH + limit, `page ${page + 1}: crossrefOffset ${result.continuation?.crossrefOffset} exceeded the bound by more than one round`);
+    assert.ok((result.continuation?.openalexOffset ?? 0) <= MAX_COMBINED_SEARCH_DEPTH + limit, `page ${page + 1}: openalexOffset ${result.continuation?.openalexOffset} exceeded the bound by more than one round`);
+    assert.ok((result.continuation?.emittedKeys.length ?? 0) <= MAX_COMBINED_EMITTED_KEYS, `page ${page + 1}: emittedKeys grew to ${result.continuation?.emittedKeys.length}, past the hard cap`);
+    assert.ok((result.continuation?.buffer.length ?? 0) <= 2 * limit, `page ${page + 1}: buffer grew to ${result.continuation?.buffer.length}, past the O(limit) carry-over bound`);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.ok(last, 'the loop must have run at least once');
+  assert.equal(last!.hasMore, false, 'the configured depth bound must eventually make hasMore false even though neither provider ever truly runs out');
+  assert.equal(last!.boundReached, true, 'hasMore going false here must be attributed to the depth bound, not genuine provider exhaustion');
+  assert.equal(last!.continuation?.crossrefOffset, MAX_COMBINED_SEARCH_DEPTH, 'Crossref offset must be held exactly at the configured bound, never past it');
+  assert.equal(last!.continuation?.openalexOffset, MAX_COMBINED_SEARCH_DEPTH, 'OpenAlex offset must be held exactly at the configured bound, never past it');
+
+  const callsBefore = { crossref: crossref.callCount, openalex: openalex.callCount };
+  const beyond = await runSearch({ ...query, source: 'combined', limit, continuation: last!.continuation }, [crossref, openalex]);
+  assert.equal(crossref.callCount, callsBefore.crossref, 'no further Crossref fetch once the bound is reached and the buffer is drained - Next must be a genuine no-op');
+  assert.equal(openalex.callCount, callsBefore.openalex, 'no further OpenAlex fetch once the bound is reached and the buffer is drained');
+  assert.equal(beyond.returned, 0);
+  assert.equal(beyond.hasMore, false);
+});
+
+test('F20 (bound fix #3) B. LOSSLESS: well within the supported combined depth, draining every page yields every unique record exactly once (0 lost, 0 duplicated)', async () => {
+  const limit = 25;
+  const crossref = makeListProvider('crossref', makeUniqueRecords('lossless-cr', 60));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('lossless-oa', 60));
+
+  let continuation: ScientificSearchResult['continuation'];
+  const seen: string[] = [];
+  for (let page = 0; page < 20; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit, continuation }, [crossref, openalex]);
+    for (const pub of result.publications) if (pub.doi) seen.push(pub.doi);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.equal(seen.length, 120, `expected all 120 unique records emitted (60 + 60), got ${seen.length}`);
+  assert.equal(new Set(seen).size, 120, 'no record emitted twice across pages');
+});
+
+test('F20 (bound fix #3) C. PARTIAL OVERLAP: shared DOIs between Crossref and OpenAlex dedupe correctly across pages, within the supported depth', async () => {
+  const shared = Array.from({ length: 8 }, (_, i) => publication({ doi: `10.9999/bound-shared-${i}`, title: `Shared ${i}`, year: 2021 }));
+  const crossref = makeListProvider('crossref', [...shared, ...makeUniqueRecords('bound-cr-only', 22)]);
+  const openalex = makeListProvider('openalex', [...shared, ...makeUniqueRecords('bound-oa-only', 22)]);
+
+  let continuation: ScientificSearchResult['continuation'];
+  const allDois = new Set<string>();
+  let totalReturned = 0;
+  for (let page = 0; page < 10; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit: 10, continuation }, [crossref, openalex]);
+    totalReturned += result.returned;
+    for (const pub of result.publications) if (pub.doi) allDois.add(pub.doi);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.equal(allDois.size, 52, '8 shared + 22 crossref-only + 22 openalex-only = 52 unique works');
+  assert.equal(totalReturned, 52, 'no record emitted twice across pages');
+});
+
+test('F20 (bound fix #3) D. FULL OVERLAP: both providers return the identical record set - merges into one copy each, no duplicates, and hasMore correctly reflects genuine (not bounded) exhaustion', async () => {
+  const shared = makeUniqueRecords('bound-dup', 40);
+  const crossref = makeListProvider('crossref', shared);
+  const openalex = makeListProvider('openalex', shared);
+
+  let continuation: ScientificSearchResult['continuation'];
+  const allDois = new Set<string>();
+  let totalReturned = 0;
+  let last: ScientificSearchResult | undefined;
+  for (let page = 0; page < 10; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit: 25, continuation }, [crossref, openalex]);
+    last = result;
+    totalReturned += result.returned;
+    for (const pub of result.publications) if (pub.doi) allDois.add(pub.doi);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.equal(allDois.size, 40, 'exactly 40 unique works despite both providers listing all 40');
+  assert.equal(totalReturned, 40, 'no duplicate emission');
+  assert.equal(last?.hasMore, false, 'both providers genuinely exhausted -> hasMore false');
+  assert.equal(last?.boundReached, false, 'this is genuine exhaustion, far short of the depth bound - never mislabeled as a bound hit');
+});
+
+test('F20 (bound fix #3) E. PROVIDER EXHAUSTION: pagination completes correctly whichever provider runs out first', async () => {
+  for (const [firstSize, secondSize] of [[6, 34], [34, 6]] as const) {
+    const crossref = makeListProvider('crossref', makeUniqueRecords('exh-cr', firstSize));
+    const openalex = makeListProvider('openalex', makeUniqueRecords('exh-oa', secondSize));
+    let continuation: ScientificSearchResult['continuation'];
+    const allDois = new Set<string>();
+    for (let page = 0; page < 10; page++) {
+      const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit: 10, continuation }, [crossref, openalex]);
+      for (const pub of result.publications) if (pub.doi) allDois.add(pub.doi);
+      continuation = result.continuation;
+      if (!result.hasMore) break;
+    }
+    assert.equal(allDois.size, firstSize + secondSize, `expected ${firstSize + secondSize} unique records regardless of which provider exhausts first`);
+  }
+});
+
+test('F20 (bound fix #3) F. PROVIDER ERROR: one provider fails mid-run (429), the other keeps paging correctly, and the depth bound is still honored on both', async () => {
+  const limit = 50;
+  const crossref = makeListProvider('crossref', makeUniqueRecords('err-cr', 5000));
+  const openalexBase = makeListProvider('openalex', makeUniqueRecords('err-oa', 5000));
+  let callNum = 0;
+  const openalex: ScientificSourceProvider = {
+    id: 'openalex',
+    async search(q) {
+      callNum++;
+      if (callNum === 3) throw new ScientificSearchError('OPENALEX_RATE_LIMIT', 'OpenAlex rate limited', 429, true);
+      return openalexBase.search(q);
+    },
+  };
+
+  let continuation: ScientificSearchResult['continuation'];
+  let last: ScientificSearchResult | undefined;
+  let sawWarning = false;
+  for (let page = 0; page < 100; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit, continuation }, [crossref, openalex]);
+    last = result;
+    if (result.warnings.some(w => w.includes('OpenAlex'))) sawWarning = true;
+    assert.ok((result.continuation?.crossrefOffset ?? 0) <= MAX_COMBINED_SEARCH_DEPTH + limit, `crossrefOffset ${result.continuation?.crossrefOffset} exceeded the bound`);
+    assert.ok((result.continuation?.openalexOffset ?? 0) <= MAX_COMBINED_SEARCH_DEPTH + limit, `openalexOffset ${result.continuation?.openalexOffset} exceeded the bound`);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.ok(sawWarning, 'the 429 must have surfaced as a warning on some page');
+  assert.equal(last?.hasMore, false, 'the depth bound must still be reached on both providers despite the mid-run failure');
+});
+
+test('F20 (bound fix #3) G. BACK NAVIGATION: page1 -> page2 -> page3 -> back to page2 -> back to page1 is deterministic within the supported range', async () => {
+  const crossref = makeListProvider('crossref', makeUniqueRecords('back-cr', 90));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('back-oa', 90));
+  const limit = 10;
+
+  // Mirrors search.tsx's `combinedHistory`: history[i] is the token to send when REQUESTING
+  // page i; history[0] is always undefined (a fresh start).
+  const history: Array<ScientificSearchResult['continuation']> = [undefined];
+  const pages: ScientificSearchResult[] = [];
+  for (let i = 0; i < 3; i++) {
+    const result = await runSearch({ ...query, source: 'combined', limit, continuation: history[i] }, [crossref, openalex]);
+    pages.push(result);
+    history[i + 1] = result.continuation;
+  }
+
+  const backToPage2 = await runSearch({ ...query, source: 'combined', limit, continuation: history[1] }, [crossref, openalex]);
+  assert.deepEqual(backToPage2.publications.map(p => p.doi), pages[1].publications.map(p => p.doi), '"Назад" to page 2 must reproduce page 2 exactly');
+
+  const backToPage1 = await runSearch({ ...query, source: 'combined', limit, continuation: history[0] }, [crossref, openalex]);
+  assert.deepEqual(backToPage1.publications.map(p => p.doi), pages[0].publications.map(p => p.doi), '"Назад" to page 1 must reproduce page 1 exactly');
+});
+
+test('F20 (bound fix #3) H. QUERY RESET: a brand-new query without continuation fully clears provider continuation, carry-over and emitted/dedup state, even after paging deep', async () => {
+  const limit = 50;
+  const crossref = makeListProvider('crossref', makeUniqueRecords('reset-cr', 5000));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('reset-oa', 5000));
+
+  let continuation: ScientificSearchResult['continuation'];
+  for (let page = 0; page < 15; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit, continuation }, [crossref, openalex]);
+    continuation = result.continuation;
+  }
+  assert.ok((continuation?.crossrefOffset ?? 0) > 0, 'sanity: pagination really did advance before the reset');
+
+  // A fresh form submission - exactly src/components/scifinder/search.tsx's `submit`, which
+  // rebuilds the request WITHOUT `continuation` at all.
+  const fresh = await runSearch({ ...query, source: 'combined', limit }, [crossref, openalex]);
+  assert.equal(fresh.offset, 0);
+  assert.equal(fresh.publications[0]?.doi, '10.9999/reset-cr-0', 'must restart from the very first record, not continue from the deep page reached before');
+  assert.equal(fresh.continuation?.crossrefOffset, limit, 'a fresh query starts a brand-new continuation exactly one page in, not wherever the previous session left off');
+  assert.equal(fresh.continuation?.emittedKeys.length, limit, 'emittedKeys must not carry over any history from the previous (deep) session');
+  assert.equal(fresh.continuation?.buffer.length, limit, 'carry-over buffer must not carry over any history either');
 });
 
 test('sorting places unavailable values last and OA filter excludes unknown status', () => {
