@@ -2,7 +2,10 @@
 
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Icon } from '@/components/icon';
-import { publicationTypes, type ScientificSearchQuery, type ScientificSearchResult, type SearchErrorBody } from '@/services/scientific-search/types';
+import {
+  publicationTypes,
+  type ScientificSearchQuery, type ScientificSearchWireQuery, type ScientificSearchWireResult, type SearchErrorBody,
+} from '@/services/scientific-search/types';
 import { PublicationCard } from './publication-card';
 import styles from './search.module.css';
 
@@ -26,26 +29,26 @@ export function SciFinderSearch() {
   const [journalOnly, setJournalOnly] = useState(false);
   const [hasDoi, setHasDoi] = useState(false);
   const [hasAbstract, setHasAbstract] = useState(false);
-  const [result, setResult] = useState<ScientificSearchResult | null>(null);
+  const [result, setResult] = useState<ScientificSearchWireResult | null>(null);
   const [error, setError] = useState<SearchErrorBody['error'] | null>(null);
   const [busy, setBusy] = useState(false);
   const [page, setPage] = useState(0);
-  const lastRequest = useRef<ScientificSearchQuery | null>(null);
+  const lastRequest = useRef<ScientificSearchWireQuery | null>(null);
   const activeRequest = useRef<AbortController | null>(null);
-  // F20: combined-mode-only continuation history, one entry per page - this app is fully
-  // stateless server-side, so the state that makes combined (Crossref + OpenAlex) pagination
-  // correct (each provider's own cursor/exhaustion, and the carry-over buffer of already-
-  // fetched-but-not-yet-shown unique records) has to be cached somewhere between requests,
-  // and the client is the only place that persists across them. `combinedHistory.current[i]`
-  // is the token to send when REQUESTING page i (index 0 is always undefined - a fresh
-  // start); after fetching page i, its response's own `continuation` becomes the token for
-  // page i+1. "Назад" simply replays the ALREADY-CACHED token for the previous page instead
-  // of trying to invert the forward continuation arithmetic (which combined pagination does
-  // not support - only the client's own page history makes "back" deterministic here).
-  const combinedHistory = useRef<Array<ScientificSearchResult['continuation']>>([undefined]);
+  // F20: combined-mode-only continuation history, one entry per page - the client caches a
+  // compact opaque token per page (never the underlying pagination state itself, which lives
+  // server-side in a bounded, ephemeral store - see continuation-store.ts) so each provider's
+  // own cursor/exhaustion and the carry-over buffer of already-fetched-but-not-yet-shown
+  // unique records survive across requests. `combinedHistory.current[i]` is the token to send
+  // when REQUESTING page i (index 0 is always undefined - a fresh start); after fetching page
+  // i, its response's own `continuation` token becomes the token for page i+1. "Назад" simply
+  // replays the ALREADY-CACHED token for the previous page instead of trying to invert the
+  // forward continuation arithmetic (which combined pagination does not support - only the
+  // client's own page history makes "back" deterministic here).
+  const combinedHistory = useRef<Array<ScientificSearchWireResult['continuation']>>([undefined]);
   useEffect(() => () => activeRequest.current?.abort(), []);
 
-  async function search(request: ScientificSearchQuery, targetPage = 0) {
+  async function search(request: ScientificSearchWireQuery, targetPage = 0) {
     activeRequest.current?.abort();
     const controller = new AbortController();
     activeRequest.current = controller;
@@ -60,7 +63,7 @@ export function SciFinderSearch() {
         body: JSON.stringify(request),
         signal: AbortSignal.any([controller.signal, AbortSignal.timeout(25_000)]),
       });
-      const body: ScientificSearchResult | SearchErrorBody = await response.json();
+      const body: ScientificSearchWireResult | SearchErrorBody = await response.json();
       if (!response.ok || 'error' in body) {
         setError('error' in body ? body.error : { code: 'SEARCH_ERROR', message: 'Не удалось выполнить поиск. Повторите запрос.', retryable: true });
       } else {

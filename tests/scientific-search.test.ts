@@ -15,8 +15,11 @@ import { buildOpenAlexUrl } from '../src/integrations/openalex';
 import {
   MAX_SEARCH_OFFSET, MAX_COMBINED_SEARCH_DEPTH, MAX_COMBINED_EMITTED_KEYS,
   type Publication, type ScientificSourceProvider, type ScientificSearchResult,
+  type ScientificSearchWireQuery, type ScientificSearchWireResult,
 } from '../src/services/scientific-search/types';
 import { POST } from '../src/app/api/scifinder/search/route';
+import { searchPublications } from '../src/services/scientific-search';
+import { ContinuationStore, MAX_CONTINUATION_SESSIONS } from '../src/services/scientific-search/continuation-store';
 
 const query = parseSearchQuery({ query: 'AlTiSiN coating cutting tools' });
 const fixture = {
@@ -697,6 +700,229 @@ test('F20 (bound fix #3) H. QUERY RESET: a brand-new query without continuation 
   assert.equal(fresh.continuation?.crossrefOffset, limit, 'a fresh query starts a brand-new continuation exactly one page in, not wherever the previous session left off');
   assert.equal(fresh.continuation?.emittedKeys.length, limit, 'emittedKeys must not carry over any history from the previous (deep) session');
   assert.equal(fresh.continuation?.buffer.length, limit, 'carry-over buffer must not carry over any history either');
+});
+
+// ---------- F20 production remediation (Codex re-detection #4): the client's `continuation`
+// is now a compact opaque token (a ContinuationStore session key), never the actual pagination
+// state - see src/services/scientific-search/continuation-store.ts's doc comment. These tests
+// exercise the REAL wire roundtrip (JSON.stringify -> JSON.parse -> searchPublications, which
+// itself calls parseSearchQuery -> ContinuationStore -> runSearch -> the wire-result
+// conversion), not a direct pipeline call - the exact level the previous test suite never
+// covered, which is how F20A/F20B slipped through. ----------
+
+/** Simulates one real client->server request: JSON.stringify + JSON.parse (exactly what an
+ *  actual HTTP body roundtrip does - never a direct object handoff) through the real
+ *  `searchPublications` entry point (parseSearchQuery -> ContinuationStore -> runSearch -> the
+ *  wire-result conversion), with fake providers/an isolated store injected so this stays
+ *  hermetic and network-free, matching the ConsistencyCache pattern of tests owning their own
+ *  store instance so unrelated tests' sessions can never collide. */
+async function wireSearch(
+  request: Partial<ScientificSearchWireQuery>,
+  deps: { store: ContinuationStore; crossref: ScientificSourceProvider; openalex: ScientificSourceProvider },
+): Promise<ScientificSearchWireResult> {
+  const wireInput: unknown = JSON.parse(JSON.stringify(request));
+  return searchPublications(wireInput, deps);
+}
+
+/** Realistic-sized record (typical Crossref/OpenAlex abstract length, several authors, a
+ *  real-length title/journal/publisher/url) - the tiny placeholder fixtures used elsewhere in
+ *  this file are far smaller than real metadata and would hide F20B's payload-size defect. */
+const REALISTIC_ABSTRACT = 'Wear resistance and mechanical properties of AlTiSiN coatings deposited by cathodic arc evaporation were investigated as a function of Si content. '.repeat(9);
+function realisticRecords(prefix: string, count: number): Publication[] {
+  return Array.from({ length: count }, (_, i) => publication({
+    id: `${prefix}:${i}`, doi: `10.1016/j.surfcoat.${prefix}.${130000 + i}`,
+    title: `Microstructure and tribological performance of ${prefix.toUpperCase()} multilayer PVD coating on cemented carbide substrate, sample ${i}`,
+    authors: ['A. Researcher', 'B. Coauthor', 'C. Coauthor', 'D. Coauthor'],
+    year: 2018 + (i % 7), journal: 'Surface and Coatings Technology', publisher: 'Elsevier B.V.',
+    abstract: REALISTIC_ABSTRACT, url: `https://doi.org/10.1016/j.surfcoat.${prefix}.${130000 + i}`,
+    source: prefix === 'cr' ? 'crossref' : 'openalex', sources: [prefix === 'cr' ? 'crossref' : 'openalex'],
+  }));
+}
+
+test('F20A regression: a REAL JSON-serialized parser/API roundtrip preserves a carry-over buffer holding up to 2x`limit` records (limit=50) - the exact case the old hardcoded slice(0,50) silently truncated', async () => {
+  const store = new ContinuationStore();
+  const limit = 50;
+  const crossref = makeListProvider('crossref', makeUniqueRecords('f20a-cr', 60));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('f20a-oa', 60));
+
+  const page1 = await wireSearch({ query: 'x', limit, source: 'combined' }, { store, crossref, openalex });
+  assert.equal(typeof page1.continuation, 'string', 'the wire response must carry a compact token, not the raw continuation object');
+  assert.ok((page1.continuation?.length ?? 0) < 64, 'the token itself must be small (a UUID), never the serialized state');
+
+  const page2 = await wireSearch({ query: 'x', limit, source: 'combined', continuation: page1.continuation }, { store, crossref, openalex });
+  const allDois = new Set([...page1.publications, ...page2.publications].map(p => p.doi));
+  // 60 + 60 = 120 unique; limit 50 means the pipeline's real carry-over buffer legitimately
+  // reaches 2x50=100 after page 1 - well past the OLD hardcoded parser cap of 50. If that
+  // truncation were still happening, page 2 would be missing up to 50 records here.
+  assert.ok(allDois.size > 50, `expected well over 50 unique records across 2 pages (proving the buffer was NOT truncated to the old hardcoded 50 cap), got ${allDois.size}`);
+});
+
+test('F20A/lossless regression (required case): 20 unique Crossref + 20 unique OpenAlex, all 40 delivered with 0 lost / 0 duplicated through REAL serialized token roundtrips', async () => {
+  const store = new ContinuationStore();
+  const limit = 25;
+  const crossref = makeListProvider('crossref', makeUniqueRecords('wire-cr', 20));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('wire-oa', 20));
+
+  let continuation: string | undefined;
+  const seen: string[] = [];
+  for (let page = 0; page < 6; page++) {
+    const result = await wireSearch({ query: 'x', limit, source: 'combined', continuation }, { store, crossref, openalex });
+    for (const pub of result.publications) if (pub.doi) seen.push(pub.doi);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.equal(seen.length, 40, `expected all 40 unique records via the real wire/token roundtrip, got ${seen.length}`);
+  assert.equal(new Set(seen).size, 40, 'no record emitted twice across pages');
+});
+
+test('F20B regression (required): request payload size stays small and bounded at page 1, 5, 10 and the deepest supported page - never scales with buffer/emittedKeys size, never approaches the 16KB body cap', async () => {
+  const store = new ContinuationStore();
+  const limit = 50;
+  const crossref = makeListProvider('crossref', realisticRecords('cr', 5000));
+  const openalex = makeListProvider('openalex', realisticRecords('oa', 5000));
+  const ROUTE_BODY_CAP = 16_384; // src/app/api/scifinder/search/route.ts's own hard cap
+
+  let continuation: string | undefined;
+  const checkpoints = new Set([1, 5, 10]);
+  const sizes: Record<number, number> = {};
+  let last: ScientificSearchWireResult | undefined;
+  let page = 0;
+  for (; page < 40; page++) {
+    const requestBody = JSON.stringify({ query: 'AlTiSiN coating cutting tools', limit, source: 'combined', continuation });
+    const bytes = Buffer.byteLength(requestBody, 'utf8');
+    if (checkpoints.has(page + 1)) sizes[page + 1] = bytes;
+    assert.ok(bytes < 1024, `page ${page + 1}: request body was ${bytes} bytes - a token-based continuation must stay tiny regardless of page depth`);
+    assert.ok(bytes < ROUTE_BODY_CAP, `page ${page + 1}: request body ${bytes} bytes must never approach the 16KB cap`);
+    const result = await wireSearch({ query: 'AlTiSiN coating cutting tools', limit, source: 'combined', continuation }, { store, crossref, openalex });
+    last = result;
+    continuation = result.continuation;
+    if (!result.hasMore) { sizes[page + 1] = bytes; break; }
+  }
+  assert.ok(last, 'the loop must have run at least once');
+  assert.equal(last!.boundReached, true, 'sanity: this run must actually have reached the configured depth bound (the deepest supported page)');
+  // Real numbers for the record (see FINAL REPORT) - never growing with page depth.
+  console.log('F20B payload sizes (bytes):', sizes, '- deepest supported page:', page + 1);
+  const sizeValues = Object.values(sizes);
+  assert.ok(Math.max(...sizeValues) - Math.min(...sizeValues) < 100, 'request body size must stay essentially constant across page 1, 5, 10 and the deepest page - never growing with depth');
+});
+
+test('F20 (production remediation) PARTIAL OVERLAP: shared DOIs dedupe correctly across pages via the real wire/token roundtrip', async () => {
+  const store = new ContinuationStore();
+  const shared = Array.from({ length: 6 }, (_, i) => publication({ doi: `10.9999/wire-shared-${i}`, title: `Shared ${i}`, year: 2021 }));
+  const crossref = makeListProvider('crossref', [...shared, ...makeUniqueRecords('wire-cr-only', 14)]);
+  const openalex = makeListProvider('openalex', [...shared, ...makeUniqueRecords('wire-oa-only', 14)]);
+
+  let continuation: string | undefined;
+  const allDois = new Set<string>();
+  let totalReturned = 0;
+  for (let page = 0; page < 8; page++) {
+    const result = await wireSearch({ query: 'x', limit: 10, source: 'combined', continuation }, { store, crossref, openalex });
+    totalReturned += result.returned;
+    for (const pub of result.publications) if (pub.doi) allDois.add(pub.doi);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.equal(allDois.size, 34, '6 shared + 14 crossref-only + 14 openalex-only = 34 unique works');
+  assert.equal(totalReturned, 34, 'no record emitted twice across pages');
+});
+
+test('F20 (production remediation) PROVIDER 429: one provider fails mid-run, the other keeps paging correctly via the real wire/token roundtrip, and the session stays usable afterward', async () => {
+  const store = new ContinuationStore();
+  const crossref = makeListProvider('crossref', makeUniqueRecords('wire-err-cr', 30));
+  const openalexBase = makeListProvider('openalex', makeUniqueRecords('wire-err-oa', 30));
+  let callNum = 0;
+  const openalex: ScientificSourceProvider = {
+    id: 'openalex',
+    async search(q) {
+      callNum++;
+      if (callNum === 2) throw new ScientificSearchError('OPENALEX_RATE_LIMIT', 'OpenAlex rate limited', 429, true);
+      return openalexBase.search(q);
+    },
+  };
+
+  const page1 = await wireSearch({ query: 'x', limit: 10, source: 'combined' }, { store, crossref, openalex });
+  const page2 = await wireSearch({ query: 'x', limit: 10, source: 'combined', continuation: page1.continuation }, { store, crossref, openalex });
+  assert.ok(page2.warnings.some(w => w.includes('OpenAlex')), 'the 429 must surface as a warning');
+  assert.equal(page2.returned, 10, 'Crossref alone must still fill the page through the real token roundtrip despite the failure');
+  const page3 = await wireSearch({ query: 'x', limit: 10, source: 'combined', continuation: page2.continuation }, { store, crossref, openalex });
+  assert.ok(page3.returned > 0, 'the session token must still resolve correctly and keep paging after a mid-run provider failure');
+});
+
+test('F20 (production remediation) BACK NAVIGATION: page1 -> page2 -> back to page1, deterministic via cached tokens (never the raw state)', async () => {
+  const store = new ContinuationStore();
+  const crossref = makeListProvider('crossref', makeUniqueRecords('wire-back-cr', 40));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('wire-back-oa', 40));
+
+  const history: Array<string | undefined> = [undefined];
+  const pages: ScientificSearchWireResult[] = [];
+  for (let i = 0; i < 2; i++) {
+    const result = await wireSearch({ query: 'x', limit: 10, source: 'combined', continuation: history[i] }, { store, crossref, openalex });
+    pages.push(result);
+    history[i + 1] = result.continuation;
+  }
+  const backToPage1 = await wireSearch({ query: 'x', limit: 10, source: 'combined', continuation: history[0] }, { store, crossref, openalex });
+  assert.deepEqual(backToPage1.publications.map(p => p.doi), pages[0].publications.map(p => p.doi), '"Назад" to page 1 (an undefined/fresh token) reproduces page 1 exactly');
+});
+
+test('F20 (production remediation) QUERY RESET: a brand-new request (no continuation token) starts an entirely independent session, never reusing a previous deep session\'s state', async () => {
+  const store = new ContinuationStore();
+  const crossref = makeListProvider('crossref', makeUniqueRecords('wire-reset-cr', 200));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('wire-reset-oa', 200));
+
+  let continuation: string | undefined;
+  for (let page = 0; page < 3; page++) {
+    const result = await wireSearch({ query: 'x', limit: 25, source: 'combined', continuation }, { store, crossref, openalex });
+    continuation = result.continuation;
+  }
+  const fresh = await wireSearch({ query: 'x', limit: 25, source: 'combined' }, { store, crossref, openalex });
+  assert.equal(fresh.offset, 0);
+  assert.equal(fresh.publications[0]?.doi, '10.9999/wire-reset-cr-0', 'must restart from the very first record');
+  assert.notEqual(fresh.continuation, continuation, 'a fresh query must mint an entirely new session token, never reuse the deep one');
+});
+
+test('F20 (production remediation) BOUND REACHED: the depth bound is still honestly enforced through the wire/token layer, and the store stays bounded across MANY independent search sessions', async () => {
+  const crossref = makeListProvider('crossref', makeUniqueRecords('wire-bound-cr', 5000));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('wire-bound-oa', 5000));
+  const sharedStore = new ContinuationStore();
+
+  // One deep session actually reaches the bound through the wire layer.
+  let continuation: string | undefined;
+  let last: ScientificSearchWireResult | undefined;
+  for (let page = 0; page < 40; page++) {
+    const result = await wireSearch({ query: 'x', limit: 50, source: 'combined', continuation }, { store: sharedStore, crossref, openalex });
+    last = result;
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.equal(last?.hasMore, false);
+  assert.equal(last?.boundReached, true, 'the depth bound must still be honestly reported through the compact wire/token result');
+
+  // Many independent (single-page) sessions on the SAME store must never make it grow past
+  // MAX_CONTINUATION_SESSIONS - the store itself is bounded, not just any one session's state.
+  for (let i = 0; i < MAX_CONTINUATION_SESSIONS + 50; i++) {
+    await wireSearch({ query: `session ${i}`, limit: 10, source: 'combined' }, { store: sharedStore, crossref, openalex });
+  }
+  assert.ok(sharedStore.size() <= MAX_CONTINUATION_SESSIONS, `store grew to ${sharedStore.size()} sessions, past its own MAX_CONTINUATION_SESSIONS bound of ${MAX_CONTINUATION_SESSIONS}`);
+});
+
+test('F20 (production remediation) MALFORMED CONTINUATION: a garbled or unknown (never-issued) token resolves gracefully to a fresh session - never a crash, never a 4xx/5xx', async () => {
+  const store = new ContinuationStore();
+  const crossref = makeListProvider('crossref', makeUniqueRecords('wire-malformed-cr', 5));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('wire-malformed-oa', 5));
+
+  for (const badToken of ['not a real token!! 🙂', 'A'.repeat(200), '', 'ffffffff-ffff-ffff-ffff-ffffffffffff']) {
+    const result = await wireSearch({ query: 'x', limit: 10, source: 'combined', continuation: badToken }, { store, crossref, openalex });
+    assert.equal(result.offset, 0, `a malformed/unknown token ("${badToken}") must degrade to a fresh start, not an error`);
+    assert.ok(result.publications.length > 0);
+  }
+});
+
+test('F20 (production remediation) OVERSIZED CONTINUATION: a huge continuation value is rejected as a controlled 413, never a 500, via the REAL POST route handler', async () => {
+  const oversized = JSON.stringify({ query: 'x', source: 'combined', limit: 10, continuation: 'A'.repeat(20_000) });
+  const response = await POST(new Request('http://localhost/api/scifinder/search', { method: 'POST', body: oversized }));
+  assert.equal(response.status, 413);
+  const body = await response.json();
+  assert.equal(body.error.code, 'QUERY_TOO_LARGE');
 });
 
 test('sorting places unavailable values last and OA filter excludes unknown status', () => {

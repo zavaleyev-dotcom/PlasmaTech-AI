@@ -37,12 +37,14 @@ export interface PublicationFilters {
   openAccessOnly: boolean;
 }
 
-/** F20: combined-search continuation state - the client's own opaque token, echoed back
- *  verbatim on the NEXT page request (and cached locally per page for "back" navigation). This
- *  app is fully stateless server-side (no session store), so the state that makes combined
- *  pagination correct - each provider's own next offset/exhaustion, and the carry-over buffer
- *  of already-fetched-but-not-yet-shown unique records - has to live somewhere, and the client
- *  is the only place that persists between requests here.
+/** F20: the actual, fully-typed combined-search continuation state - each provider's own next
+ *  offset/exhaustion, and the carry-over buffer of already-fetched-but-not-yet-shown unique
+ *  records. Since the production remediation in continuation-store.ts (Codex re-detection #4),
+ *  this object itself NEVER crosses the wire anymore - it lives server-side, in a bounded,
+ *  ephemeral ContinuationStore, referenced by a compact opaque token (see
+ *  ScientificSearchWireResult/ScientificSearchWireQuery below for what the client actually
+ *  sees). `ScientificSearchQuery.continuation` below is the ALREADY-RESOLVED object (produced
+ *  by validation.ts's parseSearchQuery via the store), exactly what the pipeline consumes.
  *
  *  `buffer` is what actually fixes the lost-results bug: when a page's combined, deduplicated,
  *  filtered result set has MORE unique records than `limit`, the leftover is carried here
@@ -84,12 +86,21 @@ export interface ScientificSearchQuery extends PublicationFilters {
    *  uses `continuation` instead (see below), since a single shared offset is exactly what
    *  previously caused combined pagination to silently drop results. */
   offset: number;
-  /** F20: combined-mode-only continuation from a PREVIOUS response's own `continuation` field
-   *  - omitted (or provided as `undefined`) for a fresh query, which always starts both
+  /** F20: combined-mode-only continuation, ALREADY RESOLVED from the client's compact wire
+   *  token via the server-side ContinuationStore (see continuation-store.ts) - `undefined` for
+   *  a fresh query (no token, or an unknown/expired/malformed one), which always starts both
    *  providers at offset 0 with an empty buffer, exactly like `offset: 0` does for a
-   *  single-provider search. Ignored entirely for `source: 'crossref'|'openalex'`. */
+   *  single-provider search. Ignored entirely for `source: 'crossref'|'openalex'`. Never the
+   *  wire shape itself - see ScientificSearchWireQuery for what the client actually sends. */
   continuation?: SearchContinuation;
 }
+
+/** F20 production remediation: the shape the CLIENT actually sends over HTTP - identical to
+ *  ScientificSearchQuery except `continuation` is a compact opaque token (a ContinuationStore
+ *  key) instead of the full resolved object. This is what search.tsx builds and what
+ *  parseSearchQuery accepts as raw input; parseSearchQuery is what turns the token into the
+ *  real ScientificSearchQuery (with `continuation` resolved) that the pipeline consumes. */
+export type ScientificSearchWireQuery = Omit<ScientificSearchQuery, 'continuation'> & { continuation?: string };
 
 /** F20: the deepest record offset this app will ever request from a provider - a deliberate,
  *  honest bound (not every provider page is reliably rankable arbitrarily deep, and nothing
@@ -149,10 +160,11 @@ export interface ScientificSearchResult extends SourceSearchResult {
    *  the ACTUAL combined continuation (buffer + provider exhaustion), never just one provider's
    *  own response. */
   hasMore: boolean;
-  /** F20: combined-mode-only - the client must cache this (e.g. one entry per page, for "back"
-   *  navigation) and echo it back verbatim as the NEXT request's `continuation` to keep paging
-   *  forward without losing or re-emitting a result. Absent for single-provider searches, which
-   *  use the simpler `offset` contract above instead. */
+  /** F20: combined-mode-only - the PIPELINE's own internal continuation object. Never sent
+   *  over the wire directly (see ScientificSearchWireResult) - index.ts's toWireResult()
+   *  converts this into a compact ContinuationStore token before the API response is built.
+   *  Absent for single-provider searches, which use the simpler `offset` contract above
+   *  instead. */
   continuation?: SearchContinuation;
   /** F20 (Codex re-detection #3): combined-mode-only - true once `hasMore` has gone false
    *  BECAUSE at least one provider was cut off by MAX_COMBINED_SEARCH_DEPTH, as opposed to
@@ -161,6 +173,19 @@ export interface ScientificSearchResult extends SourceSearchResult {
    *  as if the dataset itself had simply ended - never exposes the numeric bound itself. */
   boundReached?: boolean;
 }
+
+/** F20 production remediation: the shape actually sent to the client in the HTTP response -
+ *  identical to ScientificSearchResult except `continuation` is a compact opaque
+ *  ContinuationStore token (never the full object - see continuation-store.ts), and `query` is
+ *  the echoed request with ITS `continuation` shown the same way (the token that was received,
+ *  never the resolved object) so the bulky internal state can never leak into a response body
+ *  either. The client (search.tsx) must cache this token (e.g. one entry per page, for "back"
+ *  navigation) and echo it back verbatim as the NEXT request's `continuation` to keep paging
+ *  forward without losing or re-emitting a result - it never inspects the token's contents. */
+export type ScientificSearchWireResult = Omit<ScientificSearchResult, 'continuation' | 'query'> & {
+  continuation?: string;
+  query: ScientificSearchWireQuery;
+};
 
 export interface SearchErrorBody {
   error: { code: string; message: string; retryable: boolean };

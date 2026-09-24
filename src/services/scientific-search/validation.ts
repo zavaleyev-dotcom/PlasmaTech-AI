@@ -1,57 +1,27 @@
 import { ScientificSearchError } from './errors';
 import { normalizeDoi } from './normalization';
-import {
-  publicationTypes, MAX_SEARCH_OFFSET, MAX_COMBINED_SEARCH_DEPTH, MAX_COMBINED_EMITTED_KEYS,
-  type ScientificSearchQuery, type SearchContinuation, type Publication,
-} from './types';
+import { publicationTypes, MAX_SEARCH_OFFSET, type ScientificSearchQuery, type SearchContinuation } from './types';
+import { processContinuationStore, isValidContinuationToken, type ContinuationStore } from './continuation-store';
 
 function invalid(message: string): never {
   throw new ScientificSearchError('INVALID_QUERY', message, 400);
 }
 
-/** F20: minimal structural check on a buffered record - this data was produced and echoed
- *  back by THIS app's own previous response, so it is not re-validated as untrusted user
- *  input field-by-field; only checked enough to guarantee the pipeline (dedup/filter/sort)
- *  never crashes on a malformed/tampered value. Anything that fails is dropped from the
- *  buffer rather than failing the whole request - a corrupted continuation degrades to "a few
- *  fewer carried-over records", never a hard error. */
-function isPublicationLike(value: unknown): value is Publication {
-  if (!value || typeof value !== 'object') return false;
-  const v = value as Record<string, unknown>;
-  return typeof v.id === 'string' && typeof v.title === 'string' && Array.isArray(v.authors)
-    && Array.isArray(v.sources) && typeof v.source === 'string';
+/** F20 production remediation (Codex re-detection #4): the client's `continuation` is now a
+ *  compact opaque TOKEN (a ContinuationStore key), never the continuation object itself - see
+ *  continuation-store.ts for why. Resolved leniently, same as the previous design: an unknown
+ *  token shape, or one the store has no (or an expired) session for, is never a 400 - it just
+ *  means "start this combined search fresh" (offset 0, empty buffer), so a client bug or a
+ *  stale/foreign/tampered token can never hard-fail a search, only reset its pagination state.
+ *  Nothing about the ACTUAL continuation state (buffer, emittedKeys, provider offsets) is ever
+ *  parsed from client JSON anymore - it is looked up verbatim from server memory, so it can
+ *  never be lossily truncated or malformed by a client-side roundtrip. */
+function resolveContinuation(value: unknown, store: ContinuationStore): SearchContinuation | undefined {
+  if (!isValidContinuationToken(value)) return undefined;
+  return store.resolve(value);
 }
 
-/** F20: the client's own continuation token from a previous response, echoed back verbatim.
- *  Parsed leniently - a missing/malformed continuation is never a 400, it just means "start
- *  this combined search fresh" (offset 0, empty buffer), so a client bug or a stale/foreign
- *  token can never hard-fail a search, only reset its pagination state. */
-function parseContinuation(value: unknown): SearchContinuation | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const v = value as Record<string, unknown>;
-  const num = (x: unknown): number => typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : 0;
-  const numOrNull = (x: unknown): number | null => typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : null;
-  const bool = (x: unknown): boolean => x === true;
-  const buffer = Array.isArray(v.buffer) ? v.buffer.filter(isPublicationLike).slice(0, 50) : [];
-  // F20 (Codex re-detection #3): `emittedKeys` is a sliding window of the MOST RECENTLY
-  // emitted keys, kept with `slice(-N)` - the tail of the array, not the head. A previous
-  // version used `slice(0, N)`, which kept the OLDEST entries and silently evicted the newest
-  // ones once the array exceeded the cap; that let an already-shown record re-appear on a much
-  // later page (its key had been forgotten) instead of ever staying correctly bounded AND
-  // correct. Also hard-clamps `crossrefOffset`/`openalexOffset` to MAX_COMBINED_SEARCH_DEPTH -
-  // a tampered or foreign continuation token can never make the pipeline believe a provider is
-  // further along than the configured bound permits.
-  const emittedKeys = Array.isArray(v.emittedKeys) ? v.emittedKeys.filter((k): k is string => typeof k === 'string').slice(-MAX_COMBINED_EMITTED_KEYS) : [];
-  return {
-    crossrefOffset: Math.min(num(v.crossrefOffset), MAX_COMBINED_SEARCH_DEPTH),
-    openalexOffset: Math.min(num(v.openalexOffset), MAX_COMBINED_SEARCH_DEPTH),
-    crossrefTotal: numOrNull(v.crossrefTotal), openalexTotal: numOrNull(v.openalexTotal),
-    crossrefExhausted: bool(v.crossrefExhausted), openalexExhausted: bool(v.openalexExhausted),
-    buffer, emittedKeys,
-  };
-}
-
-export function parseSearchQuery(input: unknown): ScientificSearchQuery {
+export function parseSearchQuery(input: unknown, store: ContinuationStore = processContinuationStore): ScientificSearchQuery {
   if (!input || typeof input !== 'object' || Array.isArray(input)) invalid('Неверный формат поискового запроса.');
   const data = input as Record<string, unknown>;
   function text(name: string, max: number): string {
@@ -101,9 +71,9 @@ export function parseSearchQuery(input: unknown): ScientificSearchQuery {
   if (type && !publicationTypes.some(item => item === type)) invalid('Неизвестный тип публикации.');
   const journalOnly = flag('journalOnly');
   if (journalOnly && type && type !== 'journal-article') invalid('Фильтр journal article несовместим с выбранным типом публикации.');
-  // F20: only meaningful for source: 'combined' - parsed regardless of `source` (harmless if
-  // present but unused for a single-provider search), never required.
-  const continuation = source === 'combined' ? parseContinuation(data.continuation) : undefined;
+  // F20: only meaningful for source: 'combined' - resolved regardless of `source` being valid
+  // (harmless if present but unused for a single-provider search), never required.
+  const continuation = source === 'combined' ? resolveContinuation(data.continuation, store) : undefined;
   return {
     query, keywords, doi: doi || '', yearFrom, yearTo, limit, source, sort, offset, continuation,
     type: type as ScientificSearchQuery['type'], journalOnly,
