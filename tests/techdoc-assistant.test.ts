@@ -300,6 +300,60 @@ test('quality checks: categories are suggestions only - user supplies method/cri
   assert.equal(qc.status, undefined);
 });
 
+// ---------- F17 (LOW): quality-check unit must appear in the instruction text/UI view exactly
+// as it does in the export QC table, for criterion AND result, never invented when unset ----------
+
+test('F17 buildInstructionView: a quality check with a unit shows it attached to both criterion and result (thickness = 2.5 µm)', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, qualityChecks: [{ ...createQualityCheck('Толщина покрытия'), method: 'Калотест', criterion: '>= 2.0', unit: 'µm', result: '2.5', status: 'pass' }] };
+  const instruction = buildInstructionView(doc);
+  assert.ok(instruction.includes('критерий — >= 2.0 µm'), instruction);
+  assert.ok(instruction.includes('результат — 2.5 µm'), instruction);
+});
+
+test('F17 buildInstructionView: roughness = 10 nm and temperature = 400 °C both carry their unit in the instruction text', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = {
+    ...doc,
+    qualityChecks: [
+      { ...createQualityCheck('Шероховатость'), criterion: '<= 15', unit: 'nm', result: '10' },
+      { ...createQualityCheck('Температура'), criterion: '400', unit: '°C', result: '400' },
+    ],
+  };
+  const instruction = buildInstructionView(doc);
+  assert.ok(instruction.includes('результат — 10 nm'), instruction);
+  assert.ok(instruction.includes('результат — 400 °C'), instruction);
+});
+
+test('F17 buildInstructionView: no unit set -> criterion/result render exactly as typed, nothing invented', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, qualityChecks: [{ ...createQualityCheck('Визуальный контроль'), criterion: 'без дефектов', result: 'соответствует' }] };
+  const instruction = buildInstructionView(doc);
+  assert.ok(instruction.includes('критерий — без дефектов'));
+  assert.ok(instruction.includes('результат — соответствует'));
+  assert.ok(!instruction.includes('без дефектов undefined'));
+});
+
+test('F17 buildInstructionView: an unset criterion/result never gets a fabricated unit-only value', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, qualityChecks: [{ ...createQualityCheck('Адгезия'), unit: 'МПа' }] };
+  const instruction = buildInstructionView(doc);
+  assert.ok(instruction.includes('критерий — не задано'));
+  assert.ok(instruction.includes('результат — не задано'));
+});
+
+test('F17 UI/export consistency: the exact same quality check shows the unit both in buildInstructionView (UI preview) and in the export QC table', async () => {
+  const { buildDocumentViewModel } = await import('../src/services/workspace/techdoc-export');
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, qualityChecks: [{ ...createQualityCheck('Толщина покрытия'), criterion: '>= 2.0', unit: 'µm', result: '2.5', status: 'pass' }] };
+  const instruction = buildInstructionView(doc);
+  const viewModel = buildDocumentViewModel(doc, 'instruction');
+  assert.ok(instruction.includes('2.5 µm'));
+  const exportedRow = viewModel.qualityChecks[0];
+  assert.equal(exportedRow.unit, 'µm');
+  assert.equal(exportedRow.result, '2.5');
+});
+
 // ---------- traceability ----------
 
 test('traceability: version increments and updatedAt changes on touch, while createdAt and source never change', () => {

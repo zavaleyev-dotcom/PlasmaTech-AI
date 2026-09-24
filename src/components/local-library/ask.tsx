@@ -79,16 +79,22 @@ export function AskLibrary() {
         {result.status === 'insufficient_evidence' && <p className={styles.status}>{INSUFFICIENT_DATA_ANSWER} Ниже показаны найденные фрагменты для проверки.</p>}
         {result.status === 'answered' && !!answer.claims.length && <article className={styles.publication}>
           <h3>Ответ</h3>
-          {/* Citation markers are built here from each claim's own citationIds - never taken
-              from the model's text - so the model cannot forge a trusted-looking [n]. */}
+          {/* F21: explicit, honest distinction - a [n] marker only proves the claim cites a
+              real retrieved source (see "Источники" below for its actual excerpt); it is
+              never a claim that the statement's truth was semantically checked. No entailment
+              check runs in this app (that would require an external LLM call), so every claim
+              here is always exactly "retrieved, semantic verification not run" - never
+              "verified" or "proven". */}
+          <p className={styles.hint}>Каждое утверждение подтверждено только тем, что оно ссылается на реально найденный фрагмент (см. текст фрагмента в «Источники» ниже). Смысловая проверка соответствия утверждения содержимому источника (semantic verification) не выполняется.</p>
           {answer.claims.map((claim, i) => <p key={i}>{claim.text} {claim.citationIds.map(id => `[${id}]`).join('')}</p>)}
         </article>}
         <div>
           <h3>Источники</h3>
           <div className={styles.list}>{result.citations.map(c => <article key={c.chunkId} className={styles.publication}>
-            <div className={styles.meta}>[{c.index}] · стр. {c.pageStart}–{c.pageEnd} · {c.year ?? 'Год не указан'}</div>
+            <div className={styles.meta}>[{c.index}] · стр. {c.pageStart}–{c.pageEnd} · {c.year ?? 'Год не указан'} · релевантность {c.score.toFixed(4)}</div>
             <h4>{c.title}</h4>
             <p className={styles.authors}>{c.authors.join('; ') || 'Авторы не указаны'}</p>
+            <p className={styles.hint}>Найденный фрагмент (retrieved evidence): «{c.snippet}»</p>
             <dl className={styles.details}>
               <div><dt>DOI</dt><dd>{c.doi ? <a className={styles.link} href={`https://doi.org/${encodeURIComponent(c.doi)}`} target="_blank" rel="noreferrer">{c.doi}</a> : 'Не указан'}</dd></div>
               <div><dt>Файл</dt><dd>{c.filename}</dd></div>

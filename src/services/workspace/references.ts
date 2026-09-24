@@ -2,7 +2,14 @@
  *  Scientific Writer - no automatic DOI lookup, no Crossref/OpenAlex call, no LLM. Every field
  *  in a Reference comes only from what the user actually typed; formatters only ever print
  *  fields that are present - an absent field is OMITTED from the formatted citation, never
- *  replaced with "undefined" or an invented placeholder. */
+ *  replaced with "undefined" or an invented placeholder.
+ *
+ *  DOI syntax/canonicalization reuses the ONE shared implementation
+ *  (src/services/scientific-search/normalization.ts) already used by the SciFinder search
+ *  pipeline and by scifinder-import.ts's own duplicate check - a pure string function, no
+ *  network call, so this stays dependency-free (F19: never a second, independent regexp). */
+
+import { normalizeDoi, normalizedTitle } from '@/services/scientific-search/normalization';
 
 // ---------- reference data model (item 3) ----------
 
@@ -87,12 +94,14 @@ export function moveReference(refs: Reference[], id: string, direction: 'up' | '
 
 // ---------- validation (item 4/7): syntax only, no external lookup ----------
 
-const DOI_RE = /^10\.\d{4,9}\/\S+$/;
-
 /** Validates DOI SYNTAX only - this block never queries Crossref or any external service to
- *  confirm a DOI actually resolves to something. */
+ *  confirm a DOI actually resolves to something. Accepts every form `normalizeDoi` recognizes
+ *  (bare DOI, "doi:" prefix, doi.org/dx.doi.org URL) - not only the bare canonical form -
+ *  since F19's manual editor normalizes on blur, but a reference created programmatically
+ *  (import, test data) should not be flagged "malformed" just for carrying one of those
+ *  equally-valid forms. */
 export function isValidDoiSyntax(doi: string): boolean {
-  return DOI_RE.test(doi.trim());
+  return normalizeDoi(doi) !== null;
 }
 
 export function isValidUrl(url: string): boolean {
@@ -103,28 +112,52 @@ export function isValidYear(year: number): boolean {
   return Number.isInteger(year) && year >= 1500 && year <= new Date().getFullYear() + 1;
 }
 
-function normalizeTitleForDuplicateCheck(title: string): string {
-  return title.normalize('NFKC').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
-}
-
 export interface ReferenceIssue { referenceId: string | null; message: string }
 export interface ReferenceListCheck { errors: ReferenceIssue[]; warnings: ReferenceIssue[] }
 
-/** Checks the WHOLE reference list (not one reference in isolation): duplicate DOIs/titles,
- *  malformed DOI/URL/year, missing required fields, and - only when `citedIds` is explicitly
- *  supplied (this project has no automatic in-text citation detection, so "cited" is always a
- *  manual, honest signal from the caller, never inferred) - the cross-check between what is
- *  actually cited and what exists in the list. Passing `undefined` skips that cross-check
- *  entirely rather than reporting every reference as "never cited", which would be misleading
- *  when citation usage genuinely was not tracked. Errors and warnings are kept separate (item
- *  7) - a warning never blocks export, an error should be fixed by the user before relying on
- *  the bibliography. */
+/** F13: the single canonical duplicate-identity key for a reference, in priority order - DOI
+ *  first (canonical, URL/prefix-insensitive via the shared normalizeDoi), else normalized
+ *  title + year, else normalized title + first author when year is absent. Two references
+ *  that only share a title (no year, no author, or - when a DOI is present on both - a
+ *  DIFFERENT DOI) are never considered duplicates by this key: "Annual report" 2020 and
+ *  "Annual report" 2021 are genuinely different bibliographic records, not the same one
+ *  entered twice. Shared verbatim with scifinder-import.ts's own duplicate check, so "the same
+ *  reference" means the same thing everywhere in the app (not two independent definitions). */
+export type ReferenceDedupBasis = 'doi' | 'title-year' | 'title-author';
+export interface ReferenceDedupResult { key: string; basis: ReferenceDedupBasis }
+
+export function referenceDedupKey(ref: Pick<Reference, 'doi' | 'title' | 'year' | 'authors'>): ReferenceDedupResult | null {
+  if (ref.doi) {
+    const normalized = normalizeDoi(ref.doi);
+    if (normalized) return { key: `doi:${normalized}`, basis: 'doi' };
+  }
+  const title = ref.title?.trim() ? normalizedTitle(ref.title) : '';
+  if (!title) return null;
+  if (ref.year !== undefined) return { key: `title-year:${title}|${ref.year}`, basis: 'title-year' };
+  if (ref.authors[0]?.trim()) return { key: `title-author:${title}|${normalizedTitle(ref.authors[0])}`, basis: 'title-author' };
+  return null;
+}
+
+const DEDUP_BASIS_LABEL: Record<ReferenceDedupBasis, string> = {
+  doi: 'совпадает DOI',
+  'title-year': 'совпадают название и год',
+  'title-author': 'совпадают название и первый автор (год не указан)',
+};
+
+/** Checks the WHOLE reference list (not one reference in isolation): duplicate references
+ *  (F13 - see referenceDedupKey), malformed DOI/URL/year, missing required fields, and - only
+ *  when `citedIds` is explicitly supplied (this project has no automatic in-text citation
+ *  detection, so "cited" is always a manual, honest signal from the caller, never inferred) -
+ *  the cross-check between what is actually cited and what exists in the list. Passing
+ *  `undefined` skips that cross-check entirely rather than reporting every reference as "never
+ *  cited", which would be misleading when citation usage genuinely was not tracked. Errors and
+ *  warnings are kept separate (item 7) - a warning never blocks export, an error should be
+ *  fixed by the user before relying on the bibliography. */
 export function checkReferenceList(refs: Reference[], citedIds?: string[]): ReferenceListCheck {
   const errors: ReferenceIssue[] = [];
   const warnings: ReferenceIssue[] = [];
 
-  const seenDois = new Map<string, string>();
-  const seenTitles = new Map<string, string>();
+  const seenKeys = new Map<string, string>();
 
   for (const ref of refs) {
     const isEmpty = !ref.title?.trim() && ref.authors.length === 0 && !ref.containerTitle?.trim() && ref.year === undefined && !ref.doi?.trim() && !ref.url?.trim();
@@ -133,24 +166,15 @@ export function checkReferenceList(refs: Reference[], citedIds?: string[]): Refe
     if (!ref.title?.trim()) warnings.push({ referenceId: ref.id, message: 'Не указано название источника.' });
     if (ref.authors.length === 0 && ref.type !== 'website') warnings.push({ referenceId: ref.id, message: 'Не указаны авторы.' });
 
-    if (ref.doi?.trim()) {
-      if (!isValidDoiSyntax(ref.doi)) errors.push({ referenceId: ref.id, message: `Некорректный формат DOI: "${ref.doi}".` });
-      else {
-        const key = ref.doi.trim().toLocaleLowerCase();
-        if (seenDois.has(key)) errors.push({ referenceId: ref.id, message: `Повторяющийся DOI: "${ref.doi}" (совпадает с источником ${seenDois.get(key)}).` });
-        else seenDois.set(key, ref.id);
-      }
-    }
-
+    if (ref.doi?.trim() && !isValidDoiSyntax(ref.doi)) errors.push({ referenceId: ref.id, message: `Некорректный формат DOI: "${ref.doi}".` });
     if (ref.url?.trim() && !isValidUrl(ref.url)) errors.push({ referenceId: ref.id, message: `Некорректный URL: "${ref.url}".` });
     if (ref.year !== undefined && !isValidYear(ref.year)) errors.push({ referenceId: ref.id, message: `Некорректный год: ${ref.year}.` });
 
-    if (ref.title?.trim()) {
-      const key = normalizeTitleForDuplicateCheck(ref.title);
-      if (key) {
-        if (seenTitles.has(key)) errors.push({ referenceId: ref.id, message: `Повторяющееся название источника (совпадает с источником ${seenTitles.get(key)}).` });
-        else seenTitles.set(key, ref.id);
-      }
+    const dedup = referenceDedupKey(ref);
+    if (dedup) {
+      const existingId = seenKeys.get(dedup.key);
+      if (existingId) errors.push({ referenceId: ref.id, message: `Дублирующийся источник (${DEDUP_BASIS_LABEL[dedup.basis]}) - совпадает с источником ${existingId}.` });
+      else seenKeys.set(dedup.key, ref.id);
     }
   }
 

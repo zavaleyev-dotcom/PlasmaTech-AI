@@ -11,7 +11,8 @@ import { filterPublications } from '../src/services/scientific-search/filters';
 import { normalizeDoi, plainText, safeUrl } from '../src/services/scientific-search/normalization';
 import { parseSearchQuery } from '../src/services/scientific-search/validation';
 import { runSearch } from '../src/services/scientific-search/pipeline';
-import type { Publication, ScientificSourceProvider } from '../src/services/scientific-search/types';
+import { buildOpenAlexUrl } from '../src/integrations/openalex';
+import { MAX_SEARCH_OFFSET, type Publication, type ScientificSourceProvider } from '../src/services/scientific-search/types';
 import { POST } from '../src/app/api/scifinder/search/route';
 
 const query = parseSearchQuery({ query: 'AlTiSiN coating cutting tools' });
@@ -198,6 +199,106 @@ test('combined search preserves successful results on partial failure and report
   assert.equal(result.returned, 1); assert.equal(result.warnings.length, 1);
   assert.equal(result.sourceStats[1].total, null); assert.ok(result.sourceStats[1].error);
   await assert.rejects(runSearch(query, [bad]), { code: 'OPENALEX_TIMEOUT' });
+});
+
+// ---------- F20 (LOW): real pagination across Crossref/OpenAlex, bounded and honest ----------
+
+test('F20 request validation: offset defaults to 0, must be a non-negative multiple of limit, and a too-deep (but well-formed) offset is clamped rather than rejected', () => {
+  assert.equal(parseSearchQuery({ query: 'x' }).offset, 0);
+  assert.equal(parseSearchQuery({ query: 'x', limit: 25, offset: 50 }).offset, 50);
+  for (const bad of [{ query: 'x', offset: -10 }, { query: 'x', offset: 5 }, { query: 'x', limit: 25, offset: 30 }, { query: 'x', offset: 1.5 }]) {
+    assert.throws(() => parseSearchQuery(bad), Error, JSON.stringify(bad));
+  }
+  const deep = parseSearchQuery({ query: 'x', limit: 50, offset: 10_000 });
+  assert.ok(deep.offset <= MAX_SEARCH_OFFSET, 'a too-deep offset must be clamped to the bound, never rejected outright');
+  assert.equal(deep.offset % 50, 0, 'the clamped offset must still be a real multiple of limit');
+});
+
+test('F20 Crossref URL: page 1 (offset 0) and page 2 (offset = limit) request genuinely different, correctly-encoded offset params', () => {
+  const page1 = buildCrossrefUrl({ ...query, offset: 0 });
+  const page2 = buildCrossrefUrl({ ...query, offset: 10 });
+  assert.equal(page1.searchParams.get('offset'), '0');
+  assert.equal(page2.searchParams.get('offset'), '10');
+  assert.notEqual(page1.toString(), page2.toString());
+});
+
+test('F20 OpenAlex URL: offset converts to OpenAlex\'s own 1-based `page` param (page = offset/limit + 1) - page 1, 2, 3', () => {
+  const q25 = { ...query, limit: 25 as const };
+  assert.equal(buildOpenAlexUrl({ ...q25, offset: 0 }).searchParams.get('page'), '1');
+  assert.equal(buildOpenAlexUrl({ ...q25, offset: 25 }).searchParams.get('page'), '2');
+  assert.equal(buildOpenAlexUrl({ ...q25, offset: 50 }).searchParams.get('page'), '3');
+});
+
+test('F20 pipeline: offset is echoed back in the result exactly as requested, and reaches the provider unchanged', async () => {
+  let receivedOffset: number | undefined;
+  const provider: ScientificSourceProvider = {
+    id: 'crossref',
+    async search(q) { receivedOffset = q.offset; return { total: 1000, publications: [base] }; },
+  };
+  const response = await runSearch({ ...query, offset: 20 }, provider);
+  assert.equal(receivedOffset, 20, 'the provider must receive the SAME offset the query carried');
+  assert.equal(response.offset, 20);
+});
+
+test('F20 pipeline: hasMore is true only when a successful provider genuinely reports more records beyond this page', async () => {
+  const stillMore: ScientificSourceProvider = { id: 'crossref', async search() { return { total: 100, publications: [base] }; } };
+  const exhausted: ScientificSourceProvider = { id: 'crossref', async search() { return { total: 10, publications: [base] }; } };
+  assert.equal((await runSearch({ ...query, limit: 10, offset: 0 }, stillMore)).hasMore, true, 'offset 0 + limit 10 = 10 < total 100 -> more available');
+  assert.equal((await runSearch({ ...query, limit: 10, offset: 0 }, exhausted)).hasMore, false, 'offset 0 + limit 10 = 10 >= total 10 -> end of results, never claim more');
+  assert.equal((await runSearch({ ...query, limit: 10, offset: 90 }, stillMore)).hasMore, false, 'offset 90 + limit 10 = 100 >= total 100 -> genuinely the last page');
+});
+
+test('F20 pipeline: hasMore never claims more once the deep-pagination bound is reached, even if a provider reports a huge total', async () => {
+  const hugeTotal: ScientificSourceProvider = { id: 'crossref', async search() { return { total: 1_000_000, publications: [base] }; } };
+  const nearBound = MAX_SEARCH_OFFSET - 10;
+  const response = await runSearch({ ...query, limit: 10, offset: nearBound }, hugeTotal);
+  assert.equal(response.hasMore, false, 'the bound must win even against a provider that genuinely has far more records');
+});
+
+test('F20 combined pagination: both providers receive the SAME requested offset, and the aggregated result carries it through', async () => {
+  const offsets: Record<string, number | undefined> = {};
+  const crossref: ScientificSourceProvider = { id: 'crossref', async search(q) { offsets.crossref = q.offset; return { total: 100, publications: [base] }; } };
+  const openalex: ScientificSourceProvider = { id: 'openalex', async search(q) { offsets.openalex = q.offset; return { total: 100, publications: [normalizeOpenAlexWork(openAlexFixture)] }; } };
+  const result = await runSearch({ ...query, source: 'combined', offset: 25 }, [crossref, openalex]);
+  assert.equal(offsets.crossref, 25);
+  assert.equal(offsets.openalex, 25);
+  assert.equal(result.offset, 25);
+});
+
+test('F20 combined pagination: dedup still merges an overlapping DOI correctly on a page OTHER than the first (offset > 0)', async () => {
+  const crossref: ScientificSourceProvider = { id: 'crossref', async search() { return { total: 100, publications: [base] }; } };
+  const openalex: ScientificSourceProvider = { id: 'openalex', async search() { return { total: 100, publications: [normalizeOpenAlexWork(openAlexFixture)] }; } };
+  const result = await runSearch({ ...query, source: 'combined', offset: 50 }, [crossref, openalex]);
+  assert.equal(result.returned, 1, 'the same DOI from both providers must still merge into one record on a later page too');
+  assert.deepEqual(result.publications[0].sources, ['crossref', 'openalex']);
+});
+
+test('F20 back navigation: requesting offset 0 again after having moved to offset > limit is fully deterministic (page 1 comes back identically - stateless pagination)', async () => {
+  const provider: ScientificSourceProvider = { id: 'crossref', async search() { return { total: 100, publications: [base] }; } };
+  const page1First = await runSearch({ ...query, offset: 0 }, provider);
+  await runSearch({ ...query, offset: 10 }, provider); // simulate having navigated forward
+  const page1Again = await runSearch({ ...query, offset: 0 }, provider); // "Назад" back to page 1
+  assert.deepEqual(page1Again.publications, page1First.publications);
+  assert.equal(page1Again.offset, 0);
+});
+
+test('F20 new query resets pagination: a query object built without an explicit offset (exactly what a fresh form submit sends) always starts at 0, regardless of any prior page', () => {
+  assert.equal(parseSearchQuery({ query: 'a completely different topic' }).offset, 0);
+});
+
+test('F20 provider rate limit during pagination: a 429 on a later page (offset > 0) still degrades to a controlled, retryable error - not a crash, not a fabricated page', async () => {
+  const fetcher: typeof fetch = async () => new Response('{}', { status: 429 });
+  await assert.rejects(new CrossrefProvider(fetcher).search({ ...query, offset: 20 }), { code: 'RATE_LIMITED' });
+});
+
+test('F20 provider partial failure during pagination: OpenAlex failing on a later page still lets Crossref\'s page come back, with an honest offset/hasMore', async () => {
+  const good: ScientificSourceProvider = { id: 'crossref', async search() { return { total: 200, publications: [base] }; } };
+  const bad: ScientificSourceProvider = { id: 'openalex', async search() { throw new ScientificSearchError('OPENALEX_RATE_LIMIT', 'OpenAlex rate limited', 429, true); } };
+  const result = await runSearch({ ...query, source: 'combined', offset: 30 }, [good, bad]);
+  assert.equal(result.returned, 1, 'Crossref\'s page must still come back even though OpenAlex failed on this page');
+  assert.equal(result.offset, 30);
+  assert.equal(result.hasMore, true, '30 + limit(10) = 40 < Crossref\'s reported total 200 -> honestly still more available');
+  assert.ok(result.warnings.some(w => w.includes('OpenAlex')));
 });
 
 test('sorting places unavailable values last and OA filter excludes unknown status', () => {

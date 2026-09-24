@@ -8,6 +8,11 @@ export function buildOpenAlexUrl(query: ScientificSearchQuery): URL {
   if (query.doi) return url;
   url.searchParams.set('search', [query.query, query.keywords].filter(Boolean).join(' '));
   url.searchParams.set('per_page', String(query.limit));
+  // F20: OpenAlex has no raw "offset" param for basic pagination - it uses 1-based `page`,
+  // which is exactly offset/per_page + 1 for an offset that is always a multiple of `limit`
+  // (enforced by parseSearchQuery). This is OpenAlex's OWN native shallow-pagination mechanism,
+  // not a fictitious cross-provider abstraction - Crossref keeps using its own raw offset.
+  url.searchParams.set('page', String(Math.floor((query.offset ?? 0) / query.limit) + 1));
   url.searchParams.set('select', 'id,doi,title,authorships,publication_year,primary_location,type,open_access,cited_by_count,abstract_inverted_index');
   const filters: string[] = [];
   if (query.yearFrom) filters.push(`from_publication_date:${query.yearFrom}-01-01`);

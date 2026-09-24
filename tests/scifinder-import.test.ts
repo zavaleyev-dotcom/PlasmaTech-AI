@@ -322,6 +322,51 @@ test('F02: a failed save never clears the pending queue, so a later successful m
   assert.equal(laterMount.length, 1, 'the reference must still be delivered once storage works again');
 });
 
+// ---------- F18 (LOW): queuePublicationForScientificWriter atomic semantics - "queued" is
+// reported ONLY after a confirmed write; a storage failure is its own honest status ----------
+
+test('F18 queuePublicationForScientificWriter: a normal, working store genuinely queues the reference (regression against breaking the happy path)', () => {
+  const store = freshStore();
+  const pub = normalizeCrossrefWork(crossrefWork());
+  const outcome = queuePublicationForScientificWriter(pub, store);
+  assert.equal(outcome.status, 'queued');
+  assert.equal(peekPendingReferences(store).length, 1);
+});
+
+test('F18 queuePublicationForScientificWriter: setItem throwing (quota exceeded / storage unavailable) reports "failed", never "queued"', () => {
+  const throwingStore: KeyValueStore = { getItem: () => null, setItem: () => { throw new Error('QuotaExceededError'); } };
+  const pub = normalizeCrossrefWork(crossrefWork());
+  const outcome = queuePublicationForScientificWriter(pub, throwingStore);
+  assert.equal(outcome.status, 'failed', 'the Codex regression - previously this was falsely reported as "queued"');
+});
+
+test('F18 queuePublicationForScientificWriter: storage genuinely unavailable (null store, e.g. private-mode browsing) also reports "failed"', () => {
+  const outcome = queuePublicationForScientificWriter(normalizeCrossrefWork(crossrefWork()), null);
+  assert.equal(outcome.status, 'failed');
+});
+
+test('F18 queuePublicationForScientificWriter: after a failed write, retrying the SAME publication against a now-working store succeeds - never permanently stuck', () => {
+  const pub = normalizeCrossrefWork(crossrefWork());
+  const throwingStore: KeyValueStore = { getItem: () => null, setItem: () => { throw new Error('quota'); } };
+  const failedAttempt = queuePublicationForScientificWriter(pub, throwingStore);
+  assert.equal(failedAttempt.status, 'failed');
+
+  const workingStore = freshStore();
+  const retry = queuePublicationForScientificWriter(pub, workingStore);
+  assert.equal(retry.status, 'queued', 'a retry against working storage must succeed - the failed attempt left nothing behind to block it');
+});
+
+test('F18 queuePublicationForScientificWriter: a failed write never creates a false "duplicate" report for the very next attempt', () => {
+  const pub = normalizeCrossrefWork(crossrefWork());
+  const throwingStore: KeyValueStore = { getItem: () => null, setItem: () => { throw new Error('quota'); } };
+  queuePublicationForScientificWriter(pub, throwingStore);
+  // Retry against the SAME (still-throwing) store - since nothing was ever durably written,
+  // the dedup check must find no existing match; the outcome must be "failed" again, not
+  // "duplicate" (which would incorrectly imply a real, saved copy already exists).
+  const secondAttempt = queuePublicationForScientificWriter(pub, throwingStore);
+  assert.equal(secondAttempt.status, 'failed');
+});
+
 // ---------- citation formatting after import (item 11/14) ----------
 
 test('APA/IEEE/GOST-style formatting works immediately on an imported reference, without any separate SciFinder-specific formatter', () => {

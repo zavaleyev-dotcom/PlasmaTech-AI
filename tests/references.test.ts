@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createReference, addReference, removeReference, updateReference, duplicateReference, moveReference,
-  isValidDoiSyntax, isValidUrl, isValidYear, checkReferenceList,
+  isValidDoiSyntax, isValidUrl, isValidYear, checkReferenceList, referenceDedupKey,
   formatReferenceApa, formatReferenceIeee, formatReferenceGost, buildBibliography,
   formatInTextApa, formatInTextNumeric, formatInText, referenceNumber,
   FORMATTING_PROFILES, JOURNAL_PRESETS,
   type Reference,
 } from '../src/services/workspace/references';
+import { normalizeDoi } from '../src/services/scientific-search/normalization';
 
 // A fixed, clearly synthetic/test-only dataset (item 13) - never to be used as real production
 // bibliographic evidence. Covers all 7 reference types with at least: 2 journal articles, 1
@@ -109,7 +110,7 @@ test('isValidUrl / isValidYear: basic sanity checks', () => {
   assert.equal(isValidYear(NaN), false);
 });
 
-test('checkReferenceList: flags malformed DOI, duplicate DOI, duplicate title, invalid year, invalid URL, empty reference, missing title/authors', () => {
+test('checkReferenceList: flags duplicate (same DOI on both), malformed DOI, invalid year, invalid URL, empty reference, missing title/authors', () => {
   const refs: Reference[] = [
     { id: 'a', type: 'journal_article', authors: ['X'], title: 'Same Title', doi: '10.1234/aaa', year: 2020 },
     { id: 'b', type: 'journal_article', authors: ['Y'], title: 'Same Title', doi: '10.1234/aaa' },
@@ -118,8 +119,7 @@ test('checkReferenceList: flags malformed DOI, duplicate DOI, duplicate title, i
   ];
   const { errors, warnings } = checkReferenceList(refs);
   const errorText = errors.map(e => e.message).join(' | ');
-  assert.ok(errorText.includes('Повторяющийся DOI'));
-  assert.ok(errorText.includes('Повторяющееся название'));
+  assert.ok(errorText.includes('Дублирующийся источник') && errorText.includes('совпадает DOI'), 'a and b share the same DOI - flagged as duplicate via DOI, the highest-priority rule');
   assert.ok(errorText.includes('Некорректный формат DOI'));
   assert.ok(errorText.includes('Некорректный год'));
   assert.ok(errorText.includes('Некорректный URL'));
@@ -127,6 +127,96 @@ test('checkReferenceList: flags malformed DOI, duplicate DOI, duplicate title, i
   const warningText = warnings.map(w => w.message).join(' | ');
   assert.ok(warningText.includes('Не указано название'));
   assert.ok(warningText.includes('Не указаны авторы'));
+});
+
+// ---------- F13 (LOW): duplicate detection is DOI > title+year > title+first-author, never
+// "same title alone" ----------
+
+test('F13 referenceDedupKey: same title, different year -> genuinely different keys (NOT a duplicate) - the exact Codex regression ("Annual report" 2020 vs 2021)', () => {
+  const a = referenceDedupKey({ doi: undefined, title: 'Annual report', year: 2020, authors: [] });
+  const b = referenceDedupKey({ doi: undefined, title: 'Annual report', year: 2021, authors: [] });
+  assert.ok(a && b);
+  assert.notEqual(a!.key, b!.key);
+});
+
+test('F13 checkReferenceList: same title + different year across two real references produces NO duplicate error', () => {
+  const refs: Reference[] = [
+    { id: 'a', type: 'report', authors: [], title: 'Annual report', year: 2020 },
+    { id: 'b', type: 'report', authors: [], title: 'Annual report', year: 2021 },
+  ];
+  const { errors } = checkReferenceList(refs);
+  assert.equal(errors.some(e => e.message.includes('Дублирующийся')), false);
+});
+
+test('F13 checkReferenceList: same title + same year -> duplicate', () => {
+  const refs: Reference[] = [
+    { id: 'a', type: 'report', authors: [], title: 'Annual report', year: 2020 },
+    { id: 'b', type: 'report', authors: [], title: 'Annual report', year: 2020 },
+  ];
+  const { errors } = checkReferenceList(refs);
+  assert.ok(errors.some(e => e.referenceId === 'b' && e.message.includes('Дублирующийся источник') && e.message.includes('название и год')));
+});
+
+test('F13 checkReferenceList: same DOI (bare vs doi.org URL form) -> duplicate, even though the raw text differs', () => {
+  const refs: Reference[] = [
+    { id: 'a', type: 'journal_article', authors: [], title: 'X', doi: '10.1234/test' },
+    { id: 'b', type: 'journal_article', authors: [], title: 'Y (different title on purpose)', doi: 'https://doi.org/10.1234/TEST' },
+  ];
+  const { errors } = checkReferenceList(refs);
+  assert.ok(errors.some(e => e.referenceId === 'b' && e.message.includes('совпадает DOI')), 'canonical DOI must match case-insensitively and regardless of URL wrapping');
+});
+
+test('F13 checkReferenceList: same title, no year on either, same first author -> duplicate (rule 3, the year-absent fallback)', () => {
+  const refs: Reference[] = [
+    { id: 'a', type: 'report', authors: ['Smith'], title: 'Field survey' },
+    { id: 'b', type: 'report', authors: ['Smith', 'Jones'], title: 'Field survey' },
+  ];
+  const { errors } = checkReferenceList(refs);
+  assert.ok(errors.some(e => e.referenceId === 'b' && e.message.includes('название и первый автор')));
+});
+
+test('F13 checkReferenceList: same title, no year on either, DIFFERENT first author -> NOT a duplicate ("correct behavior" for a genuinely different pair of records)', () => {
+  const refs: Reference[] = [
+    { id: 'a', type: 'report', authors: ['Smith'], title: 'Field survey' },
+    { id: 'b', type: 'report', authors: ['Jones'], title: 'Field survey' },
+  ];
+  const { errors } = checkReferenceList(refs);
+  assert.equal(errors.some(e => e.message.includes('Дублирующийся')), false);
+});
+
+test('F13 checkReferenceList: title alone (no year, no author on either side) is never enough to call two references duplicates', () => {
+  const refs: Reference[] = [
+    { id: 'a', type: 'website', authors: [], title: 'Untitled series' },
+    { id: 'b', type: 'website', authors: [], title: 'Untitled series' },
+  ];
+  const { errors } = checkReferenceList(refs);
+  assert.equal(errors.some(e => e.message.includes('Дублирующийся')), false);
+});
+
+test('F13 checkReferenceList: case and whitespace differences in title/DOI still normalize to the same duplicate key', () => {
+  const refs: Reference[] = [
+    { id: 'a', type: 'journal_article', authors: [], title: '  Field   Survey  ', year: 2020 },
+    { id: 'b', type: 'journal_article', authors: [], title: 'FIELD SURVEY', year: 2020 },
+  ];
+  const { errors } = checkReferenceList(refs);
+  assert.ok(errors.some(e => e.referenceId === 'b' && e.message.includes('Дублирующийся')));
+});
+
+// ---------- F19 (LOW): manual DOI normalization reuses the shared implementation ----------
+
+test('F19 isValidDoiSyntax: also accepts doi: prefix and doi.org/dx.doi.org URL forms (not only the bare canonical form)', () => {
+  assert.equal(isValidDoiSyntax('doi:10.1234/test'), true);
+  assert.equal(isValidDoiSyntax('https://doi.org/10.1234/test'), true);
+  assert.equal(isValidDoiSyntax('http://doi.org/10.1234/test'), true);
+  assert.equal(isValidDoiSyntax('https://dx.doi.org/10.1234/test'), true);
+  assert.equal(isValidDoiSyntax('http://dx.doi.org/10.1234/test'), true);
+  assert.equal(isValidDoiSyntax('not a doi at all'), false);
+});
+
+test('F19: normalizeDoi (the shared implementation references.ts and the manual editor both use) reduces every accepted form to the same canonical DOI', () => {
+  const forms = ['10.1234/test', 'doi:10.1234/test', 'https://doi.org/10.1234/test', 'http://doi.org/10.1234/test', 'https://dx.doi.org/10.1234/test', 'http://dx.doi.org/10.1234/test', '  10.1234/TEST  '];
+  for (const form of forms) assert.equal(normalizeDoi(form), '10.1234/test', `"${form}" must normalize to the canonical DOI`);
+  assert.equal(normalizeDoi('not a doi'), null);
 });
 
 test('checkReferenceList: cited-but-absent and present-but-uncited are reported only when citedIds is explicitly supplied', () => {

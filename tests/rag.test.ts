@@ -48,7 +48,7 @@ function fixedChunk(overrides: Partial<RetrievedChunk> = {}): RetrievedChunk {
 }
 
 function fixedCitation(index: number): Citation {
-  return { index, chunkId: `c${index}`, documentId: `d${index}`, title: 'Title', authors: [], year: null, doi: null, filename: 'f.pdf', relativePath: 'f.pdf', pageStart: 1, pageEnd: 1 };
+  return { index, chunkId: `c${index}`, documentId: `d${index}`, title: 'Title', authors: [], year: null, doi: null, filename: 'f.pdf', relativePath: 'f.pdf', pageStart: 1, pageEnd: 1, snippet: 'text', score: 1 };
 }
 
 function fakeContext(): RagContext {
@@ -249,6 +249,65 @@ test('validateAnswerGrounding still accepts a normal claim with real text and va
     assert.deepEqual(result.claims[0].citationIds, [1, 2]);
   }
 });
+
+// ---------- F21 (INFO/design limitation): honest evidence/provenance contract, and the
+// explicit distinction between "retrieved" and "semantically verified" (never produced here) ----------
+
+test('F21 validateAnswerGrounding: every accepted claim carries BOTH "retrieved" and "semantic_verification_not_run" - never one without the other, and never "verified"/"contradicted"', () => {
+  const citations = [fixedCitation(1)];
+  const result = validateAnswerGrounding({ claims: [{ text: 'A grounded statement.', citationIds: [1] }] }, citations);
+  assert.equal(result.valid, true);
+  if (result.valid) {
+    const claim = result.claims[0];
+    assert.deepEqual(claim.evidenceStatuses, ['retrieved', 'semantic_verification_not_run']);
+    assert.ok(!claim.evidenceStatuses.includes('verified'), 'this codebase must never produce "verified" - no entailment check has run');
+    assert.ok(!claim.evidenceStatuses.includes('contradicted'), 'nor "contradicted" - same reason');
+  }
+});
+
+test('F21 Citation: carries a real supporting excerpt (snippet) and retrieval score, not just bare metadata', () => {
+  const chunk = fixedChunk({ snippet: 'Coating thickness reached 2.5 µm after 60 minutes.', score: 0.82 });
+  const context = buildContext([chunk]);
+  assert.equal(context.citations.length, 1);
+  const citation = context.citations[0];
+  assert.equal(citation.snippet, 'Coating thickness reached 2.5 µm after 60 minutes.', 'the excerpt a user can actually read to judge the citation for themselves');
+  assert.equal(citation.score, 0.82);
+  // page/chunk/document provenance, all still present alongside the new fields
+  assert.equal(citation.chunkId, chunk.chunkId);
+  assert.equal(citation.documentId, chunk.documentId);
+  assert.equal(citation.pageStart, chunk.pageStart);
+  assert.equal(citation.pageEnd, chunk.pageEnd);
+  assert.equal(citation.index, 1, 'citationId (the "index" field) is present and is what claims actually cite');
+});
+
+test('F21: askLibrary\'s insufficient_evidence status is reported honestly (retrieval found nothing) - distinct from a grounding rejection, but both are the SAME typed status, never silently turned into a fabricated answer', () => fixture(async (root, indexFile, store, dbFile) => {
+  await writeFile(path.join(root, 'unrelated.pdf'), 'unrelated');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Совершенно не связанный текст про кулинарию и рецепты.' }] }) });
+  const result = await askLibrary(
+    { question: 'a question with no matching chunks anywhere in this fixture' },
+    { openStore: askStoreFor(dbFile) },
+  );
+  assert.equal(result.status, 'insufficient_evidence');
+  assert.equal(result.citations.length, 0);
+  assert.equal(result.answer.claims.length, 0);
+}));
+
+test('F21: no claim in this codebase can ever carry "verified" or "contradicted" - those are reserved for a future provider-based semantic-entailment stage that does not exist here', () => fixture(async (root, indexFile, store, dbFile) => {
+  await writeFile(path.join(root, 'x.pdf'), 'x');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Deposition ran at four hundred degrees for sixty minutes in this fixture.' }] }) });
+  const provider: AnswerProvider = {
+    id: 'test', configured: () => true,
+    async generate({ context }) { return { claims: [{ text: 'Deposition ran at four hundred degrees for sixty minutes.', citationIds: [context.citations[0].index] }] }; },
+  };
+  const result = await askLibrary({ question: 'What was the deposition temperature and duration?' }, { openStore: askStoreFor(dbFile), provider });
+  assert.equal(result.status, 'answered');
+  assert.ok(result.answer.claims.length >= 1);
+  for (const claim of result.answer.claims) {
+    assert.ok(!claim.evidenceStatuses.includes('verified'));
+    assert.ok(!claim.evidenceStatuses.includes('contradicted'));
+    assert.ok(claim.evidenceStatuses.includes('semantic_verification_not_run'), 'must always be explicit, never just omitted');
+  }
+}));
 
 // ---------- edge case 2: range/composite bracket forms must not survive as visual citations ----------
 

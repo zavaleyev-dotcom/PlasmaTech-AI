@@ -1,8 +1,19 @@
-import type { AnswerClaim, RagContext } from '../types';
+import type { RagContext } from '../types';
 
 export interface AnswerProviderInput {
   question: string;
   context: RagContext;
+}
+
+/** The provider's own claim shape, BEFORE validation - deliberately narrower than the fully
+ *  validated `AnswerClaim` (types.ts): it has no `evidenceStatuses`, because that field only
+ *  has a meaning once validateAnswerGrounding() (citations.ts) has actually confirmed the
+ *  claim is grounded. citationIds is typed optimistically here for a well-behaved provider,
+ *  but citations.ts always re-checks the real (possibly malformed) value at runtime as
+ *  `unknown` - this type is not itself a trust boundary. */
+export interface RawAnswerClaim {
+  text: string;
+  citationIds: number[];
 }
 
 /** Structured, claim-level provider output. There is no free-text citation syntax anywhere
@@ -11,7 +22,7 @@ export interface AnswerProviderInput {
  *  provider's prose can never itself become a trusted citation marker (citations.ts strips
  *  any bracket sequence that looks like one from a claim's text before it is trusted). */
 export interface AnswerProviderOutput {
-  claims: AnswerClaim[];
+  claims: RawAnswerClaim[];
 }
 
 /** Narrow generation boundary, deliberately independent of any specific vendor SDK, so

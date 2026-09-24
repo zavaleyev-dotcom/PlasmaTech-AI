@@ -71,7 +71,11 @@ export function validateAnswerGrounding(output: unknown, citations: readonly Cit
     // (b) evidence presence: every cited id must reference a source whose evidence text was
     // actually included in the context that was sent - never a source outside it.
     if (!(citationIds as number[]).every(id => validIndices.has(id))) return { valid: false, reason: 'unknown-citation' };
-    validated.push({ text: sanitizedText, citationIds: citationIds as number[] });
+    // F21: every claim that passes (a)+(b) is 'retrieved' (a real, included source backs it)
+    // AND 'semantic_verification_not_run' (no entailment check ran, and none ever will
+    // without a future, explicitly provider-based stage) - both stated plainly, together,
+    // never just one or the other, so nothing here can be read as a correctness proof.
+    validated.push({ text: sanitizedText, citationIds: citationIds as number[], evidenceStatuses: ['retrieved', 'semantic_verification_not_run'] });
   }
   return { valid: true, claims: validated };
 }

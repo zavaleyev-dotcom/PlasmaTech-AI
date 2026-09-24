@@ -74,11 +74,21 @@ export function SciFinderSearch() {
       setError({ code: 'INVALID_QUERY', message: 'Год «от» не может быть больше года «до».', retryable: false });
       return;
     }
+    // F20: any NEW search (the form itself, not a page navigation) always starts at offset 0 -
+    // a fresh query resets pagination state, it never continues from wherever the previous
+    // query happened to leave off.
     void search({
-      query, keywords, doi, limit, source, sort, openAccessOnly, type, journalOnly, hasDoi, hasAbstract,
+      query, keywords, doi, limit, source, sort, openAccessOnly, type, journalOnly, hasDoi, hasAbstract, offset: 0,
       yearFrom: yearFrom ? Number(yearFrom) : undefined,
       yearTo: yearTo ? Number(yearTo) : undefined,
     });
+  }
+
+  // F20: Previous/Next re-issue the EXACT same query, only the offset changes - so filters,
+  // sort and source stay fixed while paging (this is a page navigation, not a new search).
+  function goToOffset(offset: number) {
+    if (!lastRequest.current) return;
+    void search({ ...lastRequest.current, offset });
   }
 
   function example() {
@@ -156,8 +166,14 @@ export function SciFinderSearch() {
         {result && result.warnings.length > 0 && <div className="notice" role="status"><div>{result.warnings.map(warning => <p key={warning}>{warning}</p>)}<button className="button secondary mt-4" disabled={busy} onClick={() => lastRequest.current && void search(lastRequest.current)}>Повторить запрос</button></div></div>}
         {error && <div className={`${styles.status} ${styles.error}`} role="alert"><p>{error.message}</p>{error.retryable && <button className="button secondary mt-4" disabled={busy} onClick={() => lastRequest.current && void search(lastRequest.current)}>Повторить запрос</button>}</div>}
         {!busy && !error && !result && <p className={styles.status}>Введите тему, ключевые слова или DOI и нажмите «Найти публикации».</p>}
-        {result && result.returned === 0 && <p className={`${styles.status} mt-4`}>Ничего не найдено. Уточните запрос, проверьте DOI или ослабьте фильтры.</p>}
+        {result && result.returned === 0 && result.offset === 0 && <p className={`${styles.status} mt-4`}>Ничего не найдено. Уточните запрос, проверьте DOI или ослабьте фильтры.</p>}
+        {result && result.returned === 0 && result.offset > 0 && <p className={`${styles.status} mt-4`}>На этой странице результатов больше нет.</p>}
         {result && <div className={styles.list}>{result.publications.map((publication, index) => <PublicationCard key={publication.id} publication={publication} index={index} />)}</div>}
+        {result && (result.offset > 0 || result.hasMore) && <div className={`${styles.actions} ${styles.full} mt-4`}>
+          <button type="button" className="button secondary" disabled={busy || result.offset === 0} onClick={() => goToOffset(Math.max(0, result.offset - result.query.limit))}>← Назад</button>
+          <span className="muted small">Страница {Math.floor(result.offset / result.query.limit) + 1}</span>
+          <button type="button" className="button secondary" disabled={busy || !result.hasMore} onClick={() => goToOffset(result.offset + result.query.limit)}>Далее →</button>
+        </div>}
       </section>
     </>
   );

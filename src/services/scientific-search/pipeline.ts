@@ -2,7 +2,7 @@ import { deduplicatePublications } from './deduplicate';
 import { filterPublications } from './filters';
 import { sortPublications } from './sort';
 import { ScientificSearchError } from './errors';
-import type { ScientificSearchQuery, ScientificSearchResult, ScientificSourceProvider, Publication } from './types';
+import { MAX_SEARCH_OFFSET, type ScientificSearchQuery, type ScientificSearchResult, type ScientificSourceProvider, type Publication } from './types';
 
 export async function runSearch(
   query: ScientificSearchQuery,
@@ -35,10 +35,17 @@ export async function runSearch(
   const unique = deduplicatePublications(records);
   const filtered = filterPublications(unique, query);
   const publications = sortPublications(filtered, query.sort).slice(0, query.limit);
+  const offset = query.offset ?? 0;
+  // F20: "more available" is honest per-provider - true only if a successful provider's own
+  // reported total genuinely extends past this page's window, and never true once the next
+  // page would cross the deep-pagination bound (so the UI's "Next" naturally disables there
+  // instead of the backend silently walking further).
+  const hasMore = offset + query.limit < MAX_SEARCH_OFFSET
+    && sourceStats.some(item => item.total !== null && offset + query.limit < item.total);
   return {
     publications, total: sourceStats.reduce((sum, item) => sum + (item.total ?? 0), 0), source: query.source, query,
     retrieved: records.length, duplicatesRemoved: records.length - unique.length,
     uniqueRetrieved: unique.length, filteredOut: unique.length - filtered.length,
-    returned: publications.length, sourceStats, warnings,
+    returned: publications.length, sourceStats, warnings, offset, hasMore,
   };
 }

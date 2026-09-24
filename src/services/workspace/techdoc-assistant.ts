@@ -501,7 +501,14 @@ export function buildInstructionView(doc: TechnicalProcessDocument): string {
   lines.push('## F. Контроль качества');
   if (doc.qualityChecks.length === 0) lines.push(NOT_SET);
   for (const qc of doc.qualityChecks) {
-    lines.push(`- ${qc.parameter}: метод — ${fmtStr(qc.method)}, критерий — ${fmtStr(qc.criterion)}, результат — ${fmtStr(qc.result)}, статус — ${fmtStr(qc.status)}`);
+    // F17: unit must appear here exactly as it does in the export QC table
+    // (document-export.ts's buildQualityChecks) - never invented when qc.unit is unset, only
+    // ever shown when the user actually entered one, and attached to criterion/result (both
+    // of which are the numeric-looking fields a unit actually qualifies).
+    const unit = qc.unit?.trim() ? ` ${qc.unit.trim()}` : '';
+    const criterion = qc.criterion?.trim() ? `${qc.criterion.trim()}${unit}` : fmtStr(qc.criterion);
+    const result = qc.result?.trim() ? `${qc.result.trim()}${unit}` : fmtStr(qc.result);
+    lines.push(`- ${qc.parameter}: метод — ${fmtStr(qc.method)}, критерий — ${criterion}, результат — ${result}, статус — ${fmtStr(qc.status)}`);
   }
   lines.push('');
   lines.push('## G. Требования безопасности');

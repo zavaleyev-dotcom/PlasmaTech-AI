@@ -8,6 +8,9 @@ import {
   checkReferenceList, buildBibliography, formatInText, referenceNumber,
   type Reference, type ReferenceType, type CitationStyle, type DocumentProfileId,
 } from '@/services/workspace/references';
+// F19: the SAME shared DOI normalizer used everywhere else (SciFinder search dedup,
+// scifinder-import.ts, references.ts's own duplicate check) - never a second regexp.
+import { normalizeDoi } from '@/services/scientific-search/normalization';
 
 interface ReferenceManagerProps {
   references: Reference[];
@@ -137,7 +140,9 @@ export function ReferenceManager({ references, onChangeReferences, citationStyle
         <label className="text-sm">Том<input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={draft.volume ?? ''} onChange={e => setDraftField('volume', e.target.value || undefined)} /></label>
         <label className="text-sm">Номер (issue)<input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={draft.issue ?? ''} onChange={e => setDraftField('issue', e.target.value || undefined)} /></label>
         <label className="text-sm">Страницы<input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={draft.pages ?? ''} onChange={e => setDraftField('pages', e.target.value || undefined)} /></label>
-        <label className="text-sm">DOI<input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={draft.doi ?? ''} onChange={e => setDraftField('doi', e.target.value || undefined)} placeholder="10.xxxx/..." /></label>
+        <label className="text-sm">DOI<input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={draft.doi ?? ''} onChange={e => setDraftField('doi', e.target.value || undefined)}
+          onBlur={() => { const normalized = draft.doi ? normalizeDoi(draft.doi) : null; if (normalized) setDraftField('doi', normalized); }}
+          placeholder="10.xxxx/... (также принимает doi: и ссылки doi.org - будут приведены к каноническому виду)" /></label>
         <label className="text-sm">URL<input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={draft.url ?? ''} onChange={e => setDraftField('url', e.target.value || undefined)} /></label>
         <label className="text-sm">Дата обращения<input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={draft.accessDate ?? ''} onChange={e => setDraftField('accessDate', e.target.value || undefined)} /></label>
         <label className="text-sm">Язык<input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={draft.language ?? ''} onChange={e => setDraftField('language', e.target.value || undefined)} /></label>

@@ -21,7 +21,12 @@ export interface RetrievedChunk {
   score: number;
 }
 
-/** What a citation exposes to the UI; never includes raw chunk/document text. */
+/** What a citation exposes to the UI; never the raw full chunk/document text, only:
+ *  - `snippet`: the SAME short, already-safe-to-render FTS excerpt as RetrievedChunk.snippet -
+ *    the actual supporting text a user can read to judge the citation for themselves (F21:
+ *    "показывать supporting excerpt"), never the full (possibly much longer) chunk content.
+ *  - `score`: the SAME retrieval score as RetrievedChunk.score - relative rank-based
+ *    relevance, not a calibrated probability and never a correctness/verification signal. */
 export interface Citation {
   index: number;
   chunkId: string;
@@ -34,7 +39,29 @@ export interface Citation {
   relativePath: string;
   pageStart: number;
   pageEnd: number;
+  snippet: string;
+  score: number;
 }
+
+/** F21: an explicit, typed contract for what kind of check a claim's evidence has actually
+ *  been through - so the UI/API can never blur "this claim cites a real retrieved source"
+ *  with "this claim's truth was checked". Only the first three values are ever produced by
+ *  this codebase today, and only without any external LLM entailment call:
+ *    - 'retrieved': at least one citationId resolves to a real source whose evidence text was
+ *      actually included in the context sent to the provider (citation integrity + evidence
+ *      presence, per validateAnswerGrounding) - this is the ONLY thing a passing claim proves.
+ *    - 'insufficient_evidence': retrieval/grounding found nothing usable for this question -
+ *      see RagStatus's own 'insufficient_evidence' member, which this mirrors at claim level.
+ *    - 'semantic_verification_not_run': the honest, permanent status of every 'retrieved'
+ *      claim in THIS codebase - no logical-entailment check ("does the evidence text actually
+ *      say what the claim says") has run, because that would require an LLM call this project
+ *      does not make (no OPENAI_API_KEY is configured or used for this). Every 'answered'
+ *      claim gets this value, always, alongside 'retrieved' - never silently omitted.
+ *    - 'verified' / 'contradicted': RESERVED for a future, explicitly provider-based semantic
+ *      grounding stage (an LLM entailment check comparing claim text against cited evidence
+ *      text) - this codebase MUST NEVER produce either value today. Kept here only so a
+ *      future stage has a typed status to grow into, without a breaking contract change. */
+export type EvidenceVerificationStatus = 'retrieved' | 'insufficient_evidence' | 'semantic_verification_not_run' | 'verified' | 'contradicted';
 
 /** The bounded, JSON-serialized prompt block built from retrieved chunks, plus the citation
  *  list a source only ever joins once its own evidence text actually made it into `block`
@@ -49,10 +76,16 @@ export interface RagContext {
 
 /** One self-contained statement plus the sources that support it. Only ever constructed by
  *  validateAnswerGrounding() (citations.ts) from an already-checked AnswerProviderOutput -
- *  the UI/service layer builds any [n] marker FROM citationIds, never from provider prose. */
+ *  the UI/service layer builds any [n] marker FROM citationIds, never from provider prose.
+ *
+ *  `evidenceStatuses` is always exactly `['retrieved', 'semantic_verification_not_run']` for
+ *  every claim this codebase ever constructs (see EvidenceVerificationStatus) - present as a
+ *  real array field, not a comment, so the UI/API contract makes the distinction explicit
+ *  and machine-checkable rather than merely documented. */
 export interface AnswerClaim {
   text: string;
   citationIds: number[];
+  evidenceStatuses: EvidenceVerificationStatus[];
 }
 
 export interface AnswerResult {

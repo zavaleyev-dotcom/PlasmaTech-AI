@@ -32,6 +32,9 @@ function toCitation(chunk: RetrievedChunk, index: number): Citation {
     index, chunkId: chunk.chunkId, documentId: chunk.documentId, title: chunk.title, authors: chunk.authors,
     year: chunk.year, doi: chunk.doi, filename: chunk.filename, relativePath: chunk.relativePath,
     pageStart: chunk.pageStart, pageEnd: chunk.pageEnd,
+    // F21: the same real, already-safe excerpt/score the underlying chunk carries - so a user
+    // can see supporting evidence text next to each citation, not just its bare metadata.
+    snippet: chunk.snippet, score: chunk.score,
   };
 }
 

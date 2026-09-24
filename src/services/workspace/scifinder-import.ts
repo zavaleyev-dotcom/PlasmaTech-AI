@@ -6,9 +6,8 @@
  *  this browser's own localStorage only - never sent to a server, never shared across devices,
  *  matching the pattern already used by TechDoc Assistant's own draft persistence. */
 
-import { normalizeDoi, normalizedTitle } from '@/services/scientific-search/normalization';
 import type { Publication } from '@/services/scientific-search/types';
-import { generateReferenceId, type Reference, type ReferenceType, type ReferenceProvenance } from './references';
+import { generateReferenceId, referenceDedupKey, type Reference, type ReferenceType, type ReferenceProvenance } from './references';
 import { loadReferences as loadCanonicalReferences } from './scientific-writer-references-store';
 
 const STORAGE_KEY = 'plasmatech.scifinder-import.pending.v1';
@@ -60,17 +59,13 @@ export function mapPublicationToReference(pub: Publication): Reference {
   };
 }
 
-// ---------- duplicate detection (item 8): DOI > title+year > title+first author ----------
+// ---------- duplicate detection (item 8): DOI > title+year > title+first author - reuses
+// references.ts's referenceDedupKey (F13), the SAME priority cascade the Reference Manager's
+// own list-level duplicate check uses, so "the same reference" means the same thing on both
+// sides of this integration, not two independent definitions. ----------
 
 function bestDedupKey(ref: Pick<Reference, 'doi' | 'title' | 'year' | 'authors'>): string | null {
-  if (ref.doi) {
-    const normalized = normalizeDoi(ref.doi);
-    if (normalized) return `doi:${normalized}`;
-  }
-  const title = ref.title ? normalizedTitle(ref.title) : '';
-  if (title && ref.year !== undefined) return `title-year:${title}|${ref.year}`;
-  if (title && ref.authors[0]) return `title-author:${title}|${normalizedTitle(ref.authors[0])}`;
-  return null;
+  return referenceDedupKey(ref)?.key ?? null;
 }
 
 // ---------- the transfer queue itself (item 6) ----------
@@ -114,22 +109,37 @@ function readPending(store: KeyValueStore | null): Reference[] {
   } catch { return []; }
 }
 
-function writePending(store: KeyValueStore | null, refs: Reference[]): void {
-  if (!store) return;
-  try { store.setItem(STORAGE_KEY, JSON.stringify(refs.slice(-MAX_PENDING_ENTRIES))); }
-  catch { /* storage unavailable (quota/private mode) - nothing to fall back to */ }
+/** F18: returns true ONLY if the write genuinely reached durable storage - the initial
+ *  detectWorkingLocalStorage() probe writes a single byte and can succeed even when the REAL
+ *  payload then blows the browser's storage quota, so the actual write must be checked at the
+ *  call site too, never assumed from the earlier probe alone. */
+function writePending(store: KeyValueStore | null, refs: Reference[]): boolean {
+  if (!store) return false;
+  try { store.setItem(STORAGE_KEY, JSON.stringify(refs.slice(-MAX_PENDING_ENTRIES))); return true; }
+  catch { return false; }
 }
 
 export type ImportOutcome =
   | { status: 'queued'; reference: Reference }
-  | { status: 'duplicate'; existingReference: Reference };
+  | { status: 'duplicate'; existingReference: Reference }
+  /** F18: the write to browser storage did not succeed (quota exceeded, storage unavailable,
+   *  private-mode restrictions, setItem throwing) - the reference was never durably queued, so
+   *  the caller must not treat this as delivered. Carries no internal error detail (path,
+   *  exception message) - only the fact that it failed, safe to show the user as-is. */
+  | { status: 'failed' };
 
 /** Called from the SciFinder "Добавить в Scientific Writer" action. Never adds a silent
  *  duplicate (item 5/8): if the same publication (by DOI, else title+year, else title+first
  *  author) already exists in Scientific Writer's REAL, currently-saved reference list, or is
  *  still sitting in this queue waiting to be merged, this reports it instead of queuing a copy -
  *  so a reference the user deleted can always be re-imported, and one that is merely queued
- *  (Writer not opened yet) is not queued twice. */
+ *  (Writer not opened yet) is not queued twice.
+ *
+ *  F18: "queued" is returned ONLY after the write is confirmed durable - a storage failure
+ *  (quota exceeded, unavailable, setItem throwing) reports "failed" instead, and since nothing
+ *  was actually written, nothing is marked consumed/queued anywhere - a later retry for the
+ *  SAME publication sees no matching pending/canonical entry and can succeed normally, and a
+ *  failed attempt never creates a false "duplicate" report either. */
 export function queuePublicationForScientificWriter(pub: Publication, store: KeyValueStore | null = detectWorkingLocalStorage()): ImportOutcome {
   const reference = mapPublicationToReference(pub);
   const pending = readPending(store);
@@ -138,7 +148,8 @@ export function queuePublicationForScientificWriter(pub: Publication, store: Key
     const existing = [...loadCanonicalReferences(store), ...pending].find(existingRef => bestDedupKey(existingRef) === key);
     if (existing) return { status: 'duplicate', existingReference: existing };
   }
-  writePending(store, [...pending, reference]);
+  const saved = writePending(store, [...pending, reference]);
+  if (!saved) return { status: 'failed' };
   return { status: 'queued', reference };
 }
 

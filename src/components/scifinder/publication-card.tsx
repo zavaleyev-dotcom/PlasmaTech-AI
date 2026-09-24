@@ -6,14 +6,18 @@ import { doiUrl } from '@/services/scientific-search/normalization';
 import { queuePublicationForScientificWriter } from '@/services/workspace/scifinder-import';
 import styles from './search.module.css';
 
-type ImportState = 'idle' | 'added' | 'duplicate';
+type ImportState = 'idle' | 'added' | 'duplicate' | 'failed';
 
 export function PublicationCard({ publication, index }: { publication: Publication; index: number }) {
   const [importState, setImportState] = useState<ImportState>('idle');
 
+  // F18: a storage failure (quota exceeded, unavailable, private mode) is its own controlled
+  // state, distinct from "duplicate" - and, unlike added/duplicate, leaves the button enabled
+  // so the user can simply retry (queuePublicationForScientificWriter never wrote anything on
+  // a failed attempt, so a retry is always safe, never a false duplicate).
   function addToScientificWriter() {
     const outcome = queuePublicationForScientificWriter(publication);
-    setImportState(outcome.status === 'queued' ? 'added' : 'duplicate');
+    setImportState(outcome.status === 'queued' ? 'added' : outcome.status);
   }
 
   const fields = [
@@ -44,11 +48,12 @@ export function PublicationCard({ publication, index }: { publication: Publicati
         {publication.abstract.length > 700 && <details><summary>Показать abstract полностью</summary><p>{publication.abstract}</p></details>}
       </div>}
       <div className="mt-2">
-        <button type="button" className="button secondary" onClick={addToScientificWriter} disabled={importState !== 'idle'}>
-          Добавить в Scientific Writer
+        <button type="button" className="button secondary" onClick={addToScientificWriter} disabled={importState === 'added' || importState === 'duplicate'}>
+          {importState === 'failed' ? 'Повторить попытку' : 'Добавить в Scientific Writer'}
         </button>
         {importState === 'added' && <p role="status" className="muted small mt-1">Добавлено в список источников Scientific Writer - откройте модуль Scientific Writer, чтобы увидеть его.</p>}
         {importState === 'duplicate' && <p role="alert" className="muted small mt-1">Такой источник (по DOI/названию) уже был добавлен ранее - повторно не добавлен.</p>}
+        {importState === 'failed' && <p role="alert" className="muted small mt-1">Не удалось сохранить источник: хранилище браузера недоступно или переполнено. Источник не был добавлен - попробуйте снова.</p>}
       </div>
     </article>
   );

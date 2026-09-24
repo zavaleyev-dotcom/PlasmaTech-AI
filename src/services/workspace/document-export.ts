@@ -208,15 +208,7 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
 
       const chunks: Buffer[] = [];
       doc.on('data', chunk => chunks.push(chunk));
-      doc.on('end', () => {
-        const pages = doc.bufferedPageRange();
-        for (let i = 0; i < pages.count; i++) {
-          doc.switchToPage(pages.start + i);
-          doc.font('Body').fontSize(8).fillColor('#666666')
-            .text(`Страница ${i + 1} из ${pages.count}`, margins.left, doc.page.height - margins.bottom + 20, { width: doc.page.width - margins.left - margins.right, align: 'center' });
-        }
-        resolve(Buffer.concat(chunks));
-      });
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
       const contentWidth = doc.page.width - margins.left - margins.right;
@@ -260,6 +252,24 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
       }
       doc.moveDown(0.5);
       doc.font('Body').fontSize(8).fillColor('#666666').text(viewModel.footer, { width: contentWidth });
+
+      // F16: page numbers must be stamped onto the buffered pages BEFORE doc.end() finalizes
+      // the document - switchToPage()/text() calls made after end() (e.g. inside the 'end'
+      // stream event) happen once PDFKit has already flushed and closed each page, so they
+      // never reach the actual output. This must run for every document, single-page included.
+      // Writing INTO the bottom margin also needs PDFKit's own documented workaround: with the
+      // real bottom margin still in effect, .text() sees the target y as being past the usable
+      // content area and silently triggers an extra addPage() instead of drawing there - so the
+      // margin is zeroed only for the duration of this one stamp, then restored.
+      const pages = doc.bufferedPageRange();
+      for (let i = 0; i < pages.count; i++) {
+        doc.switchToPage(pages.start + i);
+        const restoreBottomMargin = doc.page.margins.bottom;
+        doc.page.margins.bottom = 0;
+        doc.font('Body').fontSize(8).fillColor('#666666')
+          .text(`Страница ${i + 1} из ${pages.count}`, margins.left, doc.page.height - margins.bottom + 20, { width: doc.page.width - margins.left - margins.right, align: 'center', lineBreak: false });
+        doc.page.margins.bottom = restoreBottomMargin;
+      }
 
       doc.end();
     } catch (error) {

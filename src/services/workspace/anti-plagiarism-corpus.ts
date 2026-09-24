@@ -53,45 +53,41 @@ export async function checkSimilarity(inputText: string, options: CheckSimilarit
   try {
     const corpusStats = store.stats();
     const corpusSize = { documents: corpusStats.documents, chunks: corpusStats.chunks };
-    if (corpusSize.chunks === 0) {
-      return {
-        matches: [],
-        scope: {
-          corpusSize, corpusEmpty: true, documentsChecked: 0, chunksChecked: 0,
-          sentencesChecked: 0, paragraphsChecked: 0, exactMatches: 0, nearExactMatches: 0, similarMatches: 0, selfRepeats: 0,
-          coveredFraction: 0,
-        },
-        disclaimer: SCOPE_DISCLAIMER,
-      };
-    }
+    const corpusEmpty = corpusSize.chunks === 0;
 
     const sentences = segmentSentences(inputText).slice(0, MAX_SEGMENTS_SENTENCES);
     const paragraphs = segmentParagraphs(inputText).slice(0, MAX_SEGMENTS_PARAGRAPHS);
+
+    // F14: self-repeat analysis looks only at the pasted text itself and must run regardless
+    // of whether an external corpus exists - an empty corpus means zero EXTERNAL matches, it
+    // says nothing about whether the user repeated a sentence within their own text.
+    const selfRepeats = findSelfRepeats(sentences);
 
     const seenDocumentIds = new Set<string>();
     const seenChunkIds = new Set<string>();
     const rawMatches: SimilarityMatch[] = [];
 
-    for (const sentence of sentences) {
-      if (wordCount(sentence) < MIN_SEGMENT_WORDS) continue;
-      const { chunks } = retrieveChunks(store, sentence, CANDIDATES_PER_SEGMENT);
-      for (const chunk of chunks) { seenDocumentIds.add(chunk.documentId); seenChunkIds.add(chunk.chunkId); }
-      rawMatches.push(...matchesAgainstCandidates(sentence, chunks));
-    }
-    for (const paragraph of paragraphs) {
-      if (wordCount(paragraph) < MIN_SEGMENT_WORDS) continue;
-      const { chunks } = retrieveChunks(store, paragraph, CANDIDATES_PER_SEGMENT);
-      for (const chunk of chunks) { seenDocumentIds.add(chunk.documentId); seenChunkIds.add(chunk.chunkId); }
-      rawMatches.push(...matchesAgainstCandidates(paragraph, chunks));
+    if (!corpusEmpty) {
+      for (const sentence of sentences) {
+        if (wordCount(sentence) < MIN_SEGMENT_WORDS) continue;
+        const { chunks } = retrieveChunks(store, sentence, CANDIDATES_PER_SEGMENT);
+        for (const chunk of chunks) { seenDocumentIds.add(chunk.documentId); seenChunkIds.add(chunk.chunkId); }
+        rawMatches.push(...matchesAgainstCandidates(sentence, chunks));
+      }
+      for (const paragraph of paragraphs) {
+        if (wordCount(paragraph) < MIN_SEGMENT_WORDS) continue;
+        const { chunks } = retrieveChunks(store, paragraph, CANDIDATES_PER_SEGMENT);
+        for (const chunk of chunks) { seenDocumentIds.add(chunk.documentId); seenChunkIds.add(chunk.chunkId); }
+        rawMatches.push(...matchesAgainstCandidates(paragraph, chunks));
+      }
     }
 
-    const selfRepeats = findSelfRepeats(sentences);
     const deduped = dedupMatches([...rawMatches, ...selfRepeats]);
     const sorted = sortMatches(deduped);
     const reported = sorted.slice(0, MAX_REPORTED_MATCHES);
 
     const scope: SimilarityScope = {
-      corpusSize, corpusEmpty: false,
+      corpusSize, corpusEmpty,
       documentsChecked: seenDocumentIds.size, chunksChecked: seenChunkIds.size,
       sentencesChecked: sentences.length, paragraphsChecked: paragraphs.length,
       exactMatches: deduped.filter(m => m.type === 'exact').length,

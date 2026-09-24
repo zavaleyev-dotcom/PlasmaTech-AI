@@ -12,6 +12,8 @@ export function buildCrossrefUrl(query: ScientificSearchQuery, contactEmail?: st
   if (!query.doi) {
     url.searchParams.set('query.bibliographic', [query.query, query.keywords].filter(Boolean).join(' '));
     url.searchParams.set('rows', String(query.limit));
+    // F20: Crossref's own native offset-based pagination - "skip N, return the next `rows`".
+    url.searchParams.set('offset', String(query.offset ?? 0));
     url.searchParams.set('sort', 'relevance');
     url.searchParams.set('select', 'DOI,title,author,published,issued,container-title,abstract,publisher,URL,type');
     const filters: string[] = [];

@@ -44,7 +44,18 @@ export interface ScientificSearchQuery extends PublicationFilters {
   limit: 10 | 25 | 50;
   source: 'crossref' | 'openalex' | 'combined';
   sort: 'relevance' | 'year' | 'citations' | 'open-access';
+  /** F20: 0-based record offset - Crossref applies this directly (its own native `offset`
+   *  param); OpenAlex converts it to its own `page` param (page = offset/limit + 1). Always a
+   *  multiple of `limit` in a well-formed request (the UI only ever moves by whole pages).
+   *  Clamped server-side to MAX_SEARCH_OFFSET - deep pagination is intentionally bounded, never
+   *  fetched all at once. */
+  offset: number;
 }
+
+/** F20: the deepest record offset this app will ever request from a provider - a deliberate,
+ *  honest bound (not every provider page is reliably rankable arbitrarily deep, and nothing
+ *  here auto-walks every page), never silently exceeded. */
+export const MAX_SEARCH_OFFSET = 500;
 
 export interface SourceSearchResult {
   publications: Publication[];
@@ -67,6 +78,14 @@ export interface ScientificSearchResult extends SourceSearchResult {
   sourceStats: { source: PublicationSource; total: number | null; retrieved: number; error?: string }[];
   warnings: string[];
   uniqueRetrieved: number;
+  /** F20: the offset ACTUALLY used for this response (after clamping to MAX_SEARCH_OFFSET) -
+   *  the UI must show this, not just echo back whatever it requested, so a clamp is always
+   *  visible rather than silently ignored. */
+  offset: number;
+  /** F20: honestly derived from each successful provider's own reported total vs this page's
+   *  offset+limit (and the MAX_SEARCH_OFFSET bound) - never assumed true just because this page
+   *  came back full, and never true past the deep-pagination bound. */
+  hasMore: boolean;
 }
 
 export interface SearchErrorBody {

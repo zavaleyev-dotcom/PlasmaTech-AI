@@ -167,6 +167,65 @@ test('checkSimilarity: an empty local corpus is reported honestly - no matches, 
   );
 });
 
+// ---------- F14 (LOW): self-repeat detection must run independently of corpus emptiness ----------
+
+test('F14 checkSimilarity: empty corpus + a repeated sentence -> self-repeat is still found (the exact Codex regression - previously the empty-corpus branch returned before self-repeat analysis ran)', async () => {
+  await withFixtureStore(
+    () => { /* seed nothing - empty corpus */ },
+    async openStore => {
+      const repeated = 'The sample was annealed at three hundred degrees for two hours in vacuum. Something else in between here today. The sample was annealed at three hundred degrees for two hours in vacuum.';
+      const report = await checkSimilarity(repeated, { openStore });
+      assert.equal(report.scope.corpusEmpty, true, 'corpus emptiness must still be reported honestly');
+      const selfRepeat = report.matches.find(m => m.type === 'self_repeat');
+      assert.ok(selfRepeat, 'self-repeat must be found even though the external corpus is empty');
+      assert.equal(selfRepeat!.documentId, null);
+      assert.ok(report.scope.selfRepeats >= 1);
+      assert.equal(report.scope.exactMatches, 0);
+      assert.equal(report.scope.nearExactMatches, 0);
+      assert.equal(report.scope.similarMatches, 0);
+    },
+  );
+});
+
+test('F14 checkSimilarity: empty corpus + no repeated sentence -> zero self-repeats, zero matches, still honest about the empty corpus', async () => {
+  await withFixtureStore(
+    () => { /* seed nothing - empty corpus */ },
+    async openStore => {
+      const noRepeat = 'This sentence is entirely distinct from every other sentence in this short paragraph. Nothing here repeats at all in any way whatsoever.';
+      const report = await checkSimilarity(noRepeat, { openStore });
+      assert.equal(report.scope.corpusEmpty, true);
+      assert.equal(report.scope.selfRepeats, 0);
+      assert.equal(report.matches.length, 0);
+    },
+  );
+});
+
+test('F14 checkSimilarity: a NON-empty corpus + a repeated sentence still finds the self-repeat exactly as before (regression against breaking the normal-corpus path)', async () => {
+  await withFixtureStore(
+    store => store.replace(fakeDoc('doc-en'), [fakeChunk('doc-en', 0, 'Completely unrelated corpus content about something else entirely different from the input.')]),
+    async openStore => {
+      const repeated = 'The sample was annealed at three hundred degrees for two hours in vacuum. Something else in between here today. The sample was annealed at three hundred degrees for two hours in vacuum.';
+      const report = await checkSimilarity(repeated, { openStore });
+      assert.equal(report.scope.corpusEmpty, false);
+      assert.ok(report.scope.selfRepeats >= 1);
+    },
+  );
+});
+
+test('F14 checkSimilarity: empty corpus + a repeated CYRILLIC sentence -> self-repeat still found', async () => {
+  await withFixtureStore(
+    () => { /* seed nothing - empty corpus */ },
+    async openStore => {
+      const repeatedRu = `${SOURCE_TEXT_RU} Промежуточное предложение здесь. ${SOURCE_TEXT_RU}`;
+      const report = await checkSimilarity(repeatedRu, { openStore });
+      assert.equal(report.scope.corpusEmpty, true);
+      const selfRepeat = report.matches.find(m => m.type === 'self_repeat');
+      assert.ok(selfRepeat, 'Cyrillic self-repeat must be found even with an empty corpus');
+      assert.ok(report.scope.selfRepeats >= 1);
+    },
+  );
+});
+
 // ---------- honest scope reporting / disclaimer ----------
 
 test('checkSimilarity: always includes the mandated local-corpus-only disclaimer, and never a fake "originality %"', async () => {
