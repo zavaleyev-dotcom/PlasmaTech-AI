@@ -167,3 +167,71 @@ test('F15 computeCoveredFraction: a span that cannot be located in the input is 
   const matches: SimilarityMatch[] = [fakeMatch({ inputSpan: 'not present anywhere in the alphabet text 123' })];
   assert.equal(computeCoveredFraction(matches, ALPHABET), 0);
 });
+
+// ---------- F15 (MEDIUM) Codex regression #2: the SAME matched text at genuinely DIFFERENT
+// positions must be treated as separate intervals - a plain indexOf() always resolving to the
+// FIRST occurrence previously collapsed two real, separate covered regions into one ----------
+
+const REPEATED_TEXT = ALPHABET + ALPHABET; // 52 chars: "abc...xyz" twice back to back
+
+test('F15 computeCoveredFraction: the identical span text at two DIFFERENT real positions (inputStart/inputEnd supplied) counts both, not just the one indexOf() would find', () => {
+  const matches: SimilarityMatch[] = [
+    fakeMatch({ inputSpan: 'abcde', inputStart: 0, inputEnd: 5 }),
+    fakeMatch({ inputSpan: 'abcde', inputStart: 26, inputEnd: 31, chunkId: 'chunk-2' }),
+  ];
+  // Union of [0,5) and [26,31) = 10 covered chars out of 52 - NOT 5 (which a first-occurrence
+  // indexOf() would have produced by resolving both matches to the SAME [0,5) interval).
+  assert.equal(computeCoveredFraction(matches, REPEATED_TEXT), 10 / REPEATED_TEXT.length);
+});
+
+test('F15 computeCoveredFraction: three identical-text matches at three distinct real positions all count separately', () => {
+  const triple = ALPHABET + ALPHABET + ALPHABET; // 78 chars
+  const matches: SimilarityMatch[] = [
+    fakeMatch({ inputSpan: 'abc', inputStart: 0, inputEnd: 3 }),
+    fakeMatch({ inputSpan: 'abc', inputStart: 26, inputEnd: 29, chunkId: 'chunk-2' }),
+    fakeMatch({ inputSpan: 'abc', inputStart: 52, inputEnd: 55, chunkId: 'chunk-3' }),
+  ];
+  assert.equal(computeCoveredFraction(matches, triple), 9 / triple.length);
+});
+
+test('F15 computeCoveredFraction: a repeated identical span (two real, far-apart occurrences) PLUS a child span nested inside only the first occurrence - the child adds nothing, the second occurrence still counts fully', () => {
+  const matches: SimilarityMatch[] = [
+    fakeMatch({ inputSpan: 'abcdefghij', inputStart: 0, inputEnd: 10 }),       // occurrence 1, 10 chars
+    fakeMatch({ inputSpan: 'bcd', inputStart: 1, inputEnd: 4, chunkId: 'chunk-2' }), // nested INSIDE occurrence 1
+    fakeMatch({ inputSpan: 'abcdefghij', inputStart: 26, inputEnd: 36, chunkId: 'chunk-3' }), // occurrence 2, far apart
+  ];
+  // Union: [0,10) (nested child adds nothing) + [26,36) = 20 covered chars.
+  assert.equal(computeCoveredFraction(matches, REPEATED_TEXT), 20 / REPEATED_TEXT.length);
+});
+
+test('F15 computeCoveredFraction: a Unicode/Cyrillic repeated span at two distinct real positions still counts both occurrences', () => {
+  const word = 'покрытие';
+  const cyrillicText = `${word} остальной текст здесь для разделения ${word}`;
+  const firstStart = cyrillicText.indexOf(word);
+  const secondStart = cyrillicText.lastIndexOf(word);
+  assert.notEqual(firstStart, secondStart, 'sanity: the two occurrences must be at different positions');
+  const matches: SimilarityMatch[] = [
+    fakeMatch({ inputSpan: word, inputStart: firstStart, inputEnd: firstStart + word.length }),
+    fakeMatch({ inputSpan: word, inputStart: secondStart, inputEnd: secondStart + word.length, chunkId: 'chunk-2' }),
+  ];
+  assert.equal(computeCoveredFraction(matches, cyrillicText), (2 * word.length) / cyrillicText.length);
+});
+
+test('F15 dedupMatches: two matches with identical (type, chunk, text) but DIFFERENT real positions are kept as separate findings, never collapsed into one', () => {
+  const matches: SimilarityMatch[] = [
+    fakeMatch({ inputSpan: 'abcde', inputStart: 0, inputEnd: 5, score: 0.9 }),
+    fakeMatch({ inputSpan: 'abcde', inputStart: 26, inputEnd: 31, score: 0.9 }),
+  ];
+  const deduped = dedupMatches(matches);
+  assert.equal(deduped.length, 2, 'two genuinely separate occurrences must both survive dedup');
+});
+
+test('F15 dedupMatches: a true re-detection of the EXACT SAME occurrence (identical position too) still collapses to the best score, exactly as before', () => {
+  const matches: SimilarityMatch[] = [
+    fakeMatch({ inputSpan: 'abcde', inputStart: 0, inputEnd: 5, score: 0.6 }),
+    fakeMatch({ inputSpan: 'abcde', inputStart: 0, inputEnd: 5, score: 0.9 }),
+  ];
+  const deduped = dedupMatches(matches);
+  assert.equal(deduped.length, 1);
+  assert.equal(deduped[0].score, 0.9);
+});

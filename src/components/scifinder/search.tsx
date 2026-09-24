@@ -29,11 +29,23 @@ export function SciFinderSearch() {
   const [result, setResult] = useState<ScientificSearchResult | null>(null);
   const [error, setError] = useState<SearchErrorBody['error'] | null>(null);
   const [busy, setBusy] = useState(false);
+  const [page, setPage] = useState(0);
   const lastRequest = useRef<ScientificSearchQuery | null>(null);
   const activeRequest = useRef<AbortController | null>(null);
+  // F20: combined-mode-only continuation history, one entry per page - this app is fully
+  // stateless server-side, so the state that makes combined (Crossref + OpenAlex) pagination
+  // correct (each provider's own cursor/exhaustion, and the carry-over buffer of already-
+  // fetched-but-not-yet-shown unique records) has to be cached somewhere between requests,
+  // and the client is the only place that persists across them. `combinedHistory.current[i]`
+  // is the token to send when REQUESTING page i (index 0 is always undefined - a fresh
+  // start); after fetching page i, its response's own `continuation` becomes the token for
+  // page i+1. "Назад" simply replays the ALREADY-CACHED token for the previous page instead
+  // of trying to invert the forward continuation arithmetic (which combined pagination does
+  // not support - only the client's own page history makes "back" deterministic here).
+  const combinedHistory = useRef<Array<ScientificSearchResult['continuation']>>([undefined]);
   useEffect(() => () => activeRequest.current?.abort(), []);
 
-  async function search(request: ScientificSearchQuery) {
+  async function search(request: ScientificSearchQuery, targetPage = 0) {
     activeRequest.current?.abort();
     const controller = new AbortController();
     activeRequest.current = controller;
@@ -53,6 +65,8 @@ export function SciFinderSearch() {
         setError('error' in body ? body.error : { code: 'SEARCH_ERROR', message: 'Не удалось выполнить поиск. Повторите запрос.', retryable: true });
       } else {
         setResult(body);
+        setPage(targetPage);
+        if (request.source === 'combined') combinedHistory.current[targetPage + 1] = body.continuation;
       }
     } catch (error) {
       if (controller.signal.aborted) return;
@@ -74,27 +88,37 @@ export function SciFinderSearch() {
       setError({ code: 'INVALID_QUERY', message: 'Год «от» не может быть больше года «до».', retryable: false });
       return;
     }
-    // F20: any NEW search (the form itself, not a page navigation) always starts at offset 0 -
-    // a fresh query resets pagination state, it never continues from wherever the previous
-    // query happened to leave off.
+    // F20: any NEW search (the form itself, not a page navigation) always starts at offset 0
+    // (single-provider) / a fresh, empty continuation (combined) - a fresh query resets
+    // pagination state entirely, it never continues from wherever the previous query left off.
+    combinedHistory.current = [undefined];
     void search({
       query, keywords, doi, limit, source, sort, openAccessOnly, type, journalOnly, hasDoi, hasAbstract, offset: 0,
       yearFrom: yearFrom ? Number(yearFrom) : undefined,
       yearTo: yearTo ? Number(yearTo) : undefined,
-    });
+    }, 0);
   }
 
   // F20: Previous/Next re-issue the EXACT same query, only the offset changes - so filters,
   // sort and source stay fixed while paging (this is a page navigation, not a new search).
+  // Single-provider (crossref/openalex) only - combined mode uses goToCombinedPage below.
   function goToOffset(offset: number) {
     if (!lastRequest.current) return;
     void search({ ...lastRequest.current, offset });
+  }
+
+  // F20: combined-mode page navigation - replays the cached continuation for `targetPage`
+  // (already known for "back", or the one just received for "next"), never recomputes it.
+  function goToCombinedPage(targetPage: number) {
+    if (!lastRequest.current) return;
+    void search({ ...lastRequest.current, continuation: combinedHistory.current[targetPage] }, targetPage);
   }
 
   function example() {
     setQuery('AlTiSiN coating cutting tools'); setKeywords(''); setDoi('');
     setYearFrom(''); setYearTo(''); setType(''); setJournalOnly(false);
     setOpenAccessOnly(false); setSort('relevance'); setHasDoi(false); setHasAbstract(false); setLimit(10); setError(null); setResult(null);
+    combinedHistory.current = [undefined]; setPage(0);
   }
 
   return (
@@ -166,10 +190,18 @@ export function SciFinderSearch() {
         {result && result.warnings.length > 0 && <div className="notice" role="status"><div>{result.warnings.map(warning => <p key={warning}>{warning}</p>)}<button className="button secondary mt-4" disabled={busy} onClick={() => lastRequest.current && void search(lastRequest.current)}>Повторить запрос</button></div></div>}
         {error && <div className={`${styles.status} ${styles.error}`} role="alert"><p>{error.message}</p>{error.retryable && <button className="button secondary mt-4" disabled={busy} onClick={() => lastRequest.current && void search(lastRequest.current)}>Повторить запрос</button>}</div>}
         {!busy && !error && !result && <p className={styles.status}>Введите тему, ключевые слова или DOI и нажмите «Найти публикации».</p>}
-        {result && result.returned === 0 && result.offset === 0 && <p className={`${styles.status} mt-4`}>Ничего не найдено. Уточните запрос, проверьте DOI или ослабьте фильтры.</p>}
-        {result && result.returned === 0 && result.offset > 0 && <p className={`${styles.status} mt-4`}>На этой странице результатов больше нет.</p>}
+        {result && result.returned === 0 && page === 0 && <p className={`${styles.status} mt-4`}>Ничего не найдено. Уточните запрос, проверьте DOI или ослабьте фильтры.</p>}
+        {result && result.returned === 0 && page > 0 && <p className={`${styles.status} mt-4`}>На этой странице результатов больше нет.</p>}
         {result && <div className={styles.list}>{result.publications.map((publication, index) => <PublicationCard key={publication.id} publication={publication} index={index} />)}</div>}
-        {result && (result.offset > 0 || result.hasMore) && <div className={`${styles.actions} ${styles.full} mt-4`}>
+        {/* F20: combined mode pages by its own client-cached continuation (goToCombinedPage);
+            single-provider mode keeps its simpler offset-based navigation (goToOffset) -
+            these are genuinely different pagination mechanisms, never forced into one. */}
+        {result && result.source === 'combined' && (page > 0 || result.hasMore) && <div className={`${styles.actions} ${styles.full} mt-4`}>
+          <button type="button" className="button secondary" disabled={busy || page === 0} onClick={() => goToCombinedPage(page - 1)}>← Назад</button>
+          <span className="muted small">Страница {page + 1}</span>
+          <button type="button" className="button secondary" disabled={busy || !result.hasMore} onClick={() => goToCombinedPage(page + 1)}>Далее →</button>
+        </div>}
+        {result && result.source !== 'combined' && (result.offset > 0 || result.hasMore) && <div className={`${styles.actions} ${styles.full} mt-4`}>
           <button type="button" className="button secondary" disabled={busy || result.offset === 0} onClick={() => goToOffset(Math.max(0, result.offset - result.query.limit))}>← Назад</button>
           <span className="muted small">Страница {Math.floor(result.offset / result.query.limit) + 1}</span>
           <button type="button" className="button secondary" disabled={busy || !result.hasMore} onClick={() => goToOffset(result.offset + result.query.limit)}>Далее →</button>

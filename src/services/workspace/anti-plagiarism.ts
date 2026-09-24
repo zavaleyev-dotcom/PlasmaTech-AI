@@ -57,6 +57,18 @@ export interface SimilarityMatch {
   pageEnd: number | null;
   /** Local containment score for this specific pair, 0..1 - NEVER an "originality %". */
   score: number;
+  /** F15: `inputSpan`'s own real character offsets within the normalized input text (see
+   *  normalizeText) - the ACTUAL occurrence this specific match came from, resolved once at
+   *  match-creation time (anti-plagiarism-corpus.ts), never re-derived later by searching for
+   *  the text again. This is what makes two matches that happen to share identical inputSpan
+   *  TEXT, but come from two SEPARATE places in the input (the same sentence appearing twice,
+   *  each independently matching the corpus), count as two distinct covered intervals instead
+   *  of collapsing onto whichever occurrence a plain indexOf() happens to find first.
+   *  Undefined only for matches nothing needs a real position for (self_repeat, or a
+   *  hand-built match in a test) - computeCoveredFraction falls back to a best-effort
+   *  indexOf() search only when these are absent. */
+  inputStart?: number;
+  inputEnd?: number;
 }
 
 export interface CorpusSize { documents: number; chunks: number }
@@ -205,7 +217,12 @@ const TYPE_SEVERITY: Record<MatchType, number> = { exact: 3, near_exact: 2, simi
 export function dedupMatches(matches: SimilarityMatch[]): SimilarityMatch[] {
   const bestByKey = new Map<string, SimilarityMatch>();
   for (const match of matches) {
-    const key = `${match.type}:${match.chunkId ?? `self:${normalizeText(match.sourceSpan).toLocaleLowerCase()}`}:${normalizeText(match.inputSpan).toLocaleLowerCase()}`;
+    // F15: the key includes the real occurrence position (`inputStart`) so that the SAME
+    // sentence appearing TWICE in the input, each independently matching the same corpus
+    // chunk, is kept as two distinct findings - not collapsed into one just because their
+    // type/chunk/text happen to be identical. A true re-detection of the exact same
+    // occurrence (identical position too) still correctly collapses to its best score.
+    const key = `${match.type}:${match.chunkId ?? `self:${normalizeText(match.sourceSpan).toLocaleLowerCase()}`}:${normalizeText(match.inputSpan).toLocaleLowerCase()}:${match.inputStart ?? ''}`;
     const existing = bestByKey.get(key);
     if (!existing || match.score > existing.score) bestByKey.set(key, match);
   }
@@ -232,8 +249,19 @@ export function computeCoveredFraction(matches: SimilarityMatch[], inputText: st
   const totalChars = normalizedInput.length;
   if (totalChars === 0) return 0;
 
+  // F15: a match's REAL occurrence position (inputStart/inputEnd, resolved once at match
+  // creation - see anti-plagiarism-corpus.ts) is used whenever present. Only a match built
+  // without one (a hand-constructed test fixture, or a future caller) falls back to a
+  // best-effort indexOf() search - which is exactly the OLD behavior this replaces, and its
+  // known limitation: it always resolves to the FIRST occurrence of that text, so if the
+  // identical span genuinely appears more than once in the input, only ONE of those real
+  // occurrences would be found this way (still far better than silently mis-locating it).
   const intervals: Array<[number, number]> = [];
   for (const match of corpusMatches) {
+    if (match.inputStart !== undefined && match.inputEnd !== undefined) {
+      intervals.push([match.inputStart, match.inputEnd]);
+      continue;
+    }
     const span = normalizeText(match.inputSpan).toLocaleLowerCase();
     if (!span) continue;
     const start = normalizedInput.indexOf(span);

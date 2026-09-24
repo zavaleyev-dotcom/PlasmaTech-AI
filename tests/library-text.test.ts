@@ -191,6 +191,39 @@ test('search() (Codex regression) reports offsetCapped so a caller can never sil
   assert.deepEqual(alsoBeyondCap.hits.map(h => h.chunkId), beyondCap.hits.map(h => h.chunkId));
 }));
 
+test('search() (F09) exposes the offset it ACTUALLY served, and a UI-transition sequence 480 -> 500 -> (Next disabled) never reaches a fabricated 501-520-labeled-as-521-540 page', () => fixture(async (root, indexFile, store) => {
+  await writeFile(path.join(root, 'a.pdf'), 'a');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'A single real document establishing one real documentId for the bulk-insert fixture.' }] }) });
+  const documentId = store.records()[0].id;
+  bulkInsertChunks(store, documentId, 2000, 'paginationword');
+
+  // Client requests offset=480 (a real, unclamped page) - the frontend must know the actual
+  // offset served (not just trust its own requested value), and this page is not yet at the
+  // ceiling: "Next" should stay enabled.
+  const page480 = store.search('paginationword', 480);
+  assert.equal(page480.offset, 480);
+  assert.equal(page480.atMaxOffset, false, 'offset 480 is not yet the last reachable page');
+
+  // Client clicks "Next" -> requests offset=500, exactly the cap boundary. This is a
+  // legitimate, non-clamped page (offsetCapped=false), but it IS the last reachable one -
+  // atMaxOffset must already be true HERE, so a real UI disables "Next" on THIS response,
+  // before ever attempting to request offset=520.
+  const page500 = store.search('paginationword', 500);
+  assert.equal(page500.offset, 500);
+  assert.equal(page500.offsetCapped, false, 'the exact boundary itself is a real, non-clamped page');
+  assert.equal(page500.atMaxOffset, true, 'this is nonetheless the LAST reachable page - the UI must disable Next here');
+
+  // Even if a stale/misbehaving client still issues the request for 520 anyway, the backend
+  // must report the REAL offset it served (500, not 520) - a caller building "N-M of total"
+  // from this response, rather than from what it originally asked for, can never show a
+  // fabricated "521-540" label over rows that are really "501-520".
+  const page520Request = store.search('paginationword', 520);
+  assert.equal(page520Request.offset, 500, 'the backend must report the offset it actually served, never the caller\'s out-of-bound request');
+  assert.equal(page520Request.offsetCapped, true);
+  assert.equal(page520Request.atMaxOffset, true);
+  assert.deepEqual(page520Request.hits.map(h => h.chunkId), page500.hits.map(h => h.chunkId), 'the honestly-reported page is identical to the real offset=500 page - never a distinct-looking but actually duplicate page');
+}));
+
 test('search() rejects malformed/adversarial FTS syntax safely regardless of the new candidate-budget logic (no crash, no injection)', () => fixture(async (root, indexFile, store) => {
   await writeFile(path.join(root, 'a.pdf'), 'a');
   await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating hardness malformed-syntax regression test.' }] }) });

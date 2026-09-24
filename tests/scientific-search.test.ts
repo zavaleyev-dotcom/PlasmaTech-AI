@@ -12,7 +12,7 @@ import { normalizeDoi, plainText, safeUrl } from '../src/services/scientific-sea
 import { parseSearchQuery } from '../src/services/scientific-search/validation';
 import { runSearch } from '../src/services/scientific-search/pipeline';
 import { buildOpenAlexUrl } from '../src/integrations/openalex';
-import { MAX_SEARCH_OFFSET, type Publication, type ScientificSourceProvider } from '../src/services/scientific-search/types';
+import { MAX_SEARCH_OFFSET, type Publication, type ScientificSourceProvider, type ScientificSearchResult } from '../src/services/scientific-search/types';
 import { POST } from '../src/app/api/scifinder/search/route';
 
 const query = parseSearchQuery({ query: 'AlTiSiN coating cutting tools' });
@@ -255,14 +255,15 @@ test('F20 pipeline: hasMore never claims more once the deep-pagination bound is 
   assert.equal(response.hasMore, false, 'the bound must win even against a provider that genuinely has far more records');
 });
 
-test('F20 combined pagination: both providers receive the SAME requested offset, and the aggregated result carries it through', async () => {
+test('F20 combined pagination: a fresh combined query (no continuation) starts both providers at offset 0, and returns a continuation for the next page', async () => {
   const offsets: Record<string, number | undefined> = {};
   const crossref: ScientificSourceProvider = { id: 'crossref', async search(q) { offsets.crossref = q.offset; return { total: 100, publications: [base] }; } };
   const openalex: ScientificSourceProvider = { id: 'openalex', async search(q) { offsets.openalex = q.offset; return { total: 100, publications: [normalizeOpenAlexWork(openAlexFixture)] }; } };
-  const result = await runSearch({ ...query, source: 'combined', offset: 25 }, [crossref, openalex]);
-  assert.equal(offsets.crossref, 25);
-  assert.equal(offsets.openalex, 25);
-  assert.equal(result.offset, 25);
+  const result = await runSearch({ ...query, source: 'combined', limit: 25 }, [crossref, openalex]);
+  assert.equal(offsets.crossref, 0);
+  assert.equal(offsets.openalex, 0);
+  assert.equal(result.offset, 0);
+  assert.ok(result.continuation, 'combined mode must return a continuation token for the next page');
 });
 
 test('F20 combined pagination: dedup still merges an overlapping DOI correctly on a page OTHER than the first (offset > 0)', async () => {
@@ -299,6 +300,169 @@ test('F20 provider partial failure during pagination: OpenAlex failing on a late
   assert.equal(result.offset, 30);
   assert.equal(result.hasMore, true, '30 + limit(10) = 40 < Crossref\'s reported total 200 -> honestly still more available');
   assert.ok(result.warnings.some(w => w.includes('OpenAlex')));
+});
+
+// ---------- F20 (MEDIUM) Codex regression #2: combined-search pagination must never lose a
+// unique record - carry-over buffer + independent per-provider continuation state ----------
+
+/** A stub provider backed by a fixed, ordered list of records - serves them exactly like a
+ *  real paginated API would: `records.slice(offset, offset + limit)`, with `total` honestly
+ *  reflecting the full list length. `search` calls are counted so a test can assert exactly
+ *  how many round-trips a given scenario needed. */
+function makeListProvider(id: 'crossref' | 'openalex', records: Publication[]): ScientificSourceProvider & { callCount: number } {
+  const p = {
+    id, callCount: 0,
+    async search(q: Parameters<ScientificSourceProvider['search']>[0]) {
+      p.callCount++;
+      const offset = q.offset ?? 0;
+      return { total: records.length, publications: records.slice(offset, offset + q.limit) };
+    },
+  };
+  return p;
+}
+
+function makeUniqueRecords(prefix: string, count: number): Publication[] {
+  return Array.from({ length: count }, (_, i) => publication({ doi: `10.9999/${prefix}-${i}`, title: `${prefix} record ${i}`, year: 2020 + (i % 5) }));
+}
+
+test('F20 combined pagination: 20 unique Crossref + 20 unique OpenAlex records, limit 25 -> page 1 + page 2 together expose ALL 40 unique results (the exact Codex reproduction - 2 providers x 20 unique, previously page 2 skipped straight past the un-emitted half and lost it forever)', async () => {
+  const crossref = makeListProvider('crossref', makeUniqueRecords('cr', 20));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('oa', 20));
+
+  const page1 = await runSearch({ ...query, source: 'combined', limit: 25 }, [crossref, openalex]);
+  assert.equal(page1.returned, 25);
+  assert.ok(page1.continuation);
+
+  const page2 = await runSearch({ ...query, source: 'combined', limit: 25, continuation: page1.continuation }, [crossref, openalex]);
+  assert.equal(page2.returned, 15, 'the remaining 15 unique records must still be reachable, not lost');
+
+  const allIds = new Set([...page1.publications, ...page2.publications].map(p => p.doi));
+  assert.equal(allIds.size, 40, `expected all 40 unique DOIs across both pages, got ${allIds.size}`);
+});
+
+test('F20 combined pagination: partial overlap between providers - overlapping records merge (sources badge shows both), and no unique record is lost across pages', async () => {
+  const shared = Array.from({ length: 5 }, (_, i) => publication({ doi: `10.9999/shared-${i}`, title: `Shared record ${i}`, year: 2021 }));
+  const crossrefOnly = makeUniqueRecords('cr-only', 15);
+  const openalexOnly = makeUniqueRecords('oa-only', 15);
+  const crossref = makeListProvider('crossref', [...shared, ...crossrefOnly]);
+  const openalex = makeListProvider('openalex', [...shared, ...openalexOnly]);
+
+  let continuation: ScientificSearchResult['continuation'];
+  const allDois = new Set<string>();
+  let totalReturned = 0;
+  for (let page = 0; page < 6; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit: 10, continuation }, [crossref, openalex]);
+    totalReturned += result.returned;
+    for (const pub of result.publications) if (pub.doi) allDois.add(pub.doi);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  // 5 shared (merged, each provider lists them too) + 15 crossref-only + 15 openalex-only =
+  // 35 genuinely unique works.
+  assert.equal(allDois.size, 35, `expected 35 unique DOIs total, got ${allDois.size}`);
+  assert.equal(totalReturned, 35, 'no record emitted twice across pages');
+});
+
+test('F20 combined pagination: FULL overlap between providers (both return the exact same records) - every record merges into one, none duplicated across pages', async () => {
+  const shared = makeUniqueRecords('dup', 30);
+  const crossref = makeListProvider('crossref', shared);
+  const openalex = makeListProvider('openalex', shared);
+
+  let continuation: ScientificSearchResult['continuation'];
+  const allDois = new Set<string>();
+  let totalReturned = 0;
+  for (let page = 0; page < 4; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit: 10, continuation }, [crossref, openalex]);
+    totalReturned += result.returned;
+    for (const pub of result.publications) if (pub.doi) allDois.add(pub.doi);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.equal(allDois.size, 30, 'exactly 30 unique works, even though both providers returned all 30 each');
+  assert.equal(totalReturned, 30, 'no record emitted twice across pages');
+});
+
+test('F20 combined pagination: provider A exhausted earlier than provider B - pagination continues correctly using only B\'s remaining records', async () => {
+  const crossref = makeListProvider('crossref', makeUniqueRecords('cr', 5)); // exhausted after page 1
+  const openalex = makeListProvider('openalex', makeUniqueRecords('oa', 25));
+
+  let continuation: ScientificSearchResult['continuation'];
+  const allDois = new Set<string>();
+  for (let page = 0; page < 4; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit: 10, continuation }, [crossref, openalex]);
+    for (const pub of result.publications) if (pub.doi) allDois.add(pub.doi);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.equal(allDois.size, 30, `expected all 30 unique records (5 + 25) across pages, got ${allDois.size}`);
+  assert.equal(continuation?.crossrefExhausted, true);
+});
+
+test('F20 combined pagination: OpenAlex returns 429 on the SECOND page - Crossref\'s own remaining records still page through correctly via the buffer/continuation, nothing lost', async () => {
+  const crossref = makeListProvider('crossref', makeUniqueRecords('cr', 30));
+  let openalexCalls = 0;
+  const openalexRecords = makeUniqueRecords('oa', 30);
+  const openalex: ScientificSourceProvider = {
+    id: 'openalex',
+    async search(q) {
+      openalexCalls++;
+      if (openalexCalls === 2) throw new ScientificSearchError('OPENALEX_RATE_LIMIT', 'OpenAlex rate limited', 429, true);
+      const offset = q.offset ?? 0;
+      return { total: openalexRecords.length, publications: openalexRecords.slice(offset, offset + q.limit) };
+    },
+  };
+
+  const page1 = await runSearch({ ...query, source: 'combined', limit: 10 }, [crossref, openalex]);
+  assert.equal(page1.returned, 10);
+
+  const page2 = await runSearch({ ...query, source: 'combined', limit: 10, continuation: page1.continuation }, [crossref, openalex]);
+  assert.equal(page2.returned, 10, 'Crossref alone must still fill the page even though OpenAlex failed this round');
+  assert.ok(page2.warnings.some(w => w.includes('OpenAlex')));
+
+  // OpenAlex recovers on page 3 (a transient failure never permanently strands it).
+  const page3 = await runSearch({ ...query, source: 'combined', limit: 10, continuation: page2.continuation }, [crossref, openalex]);
+  const allDois = new Set([...page1.publications, ...page2.publications, ...page3.publications].map(p => p.doi));
+  assert.ok(allDois.size >= 20, 'no record lost even across the failed round');
+});
+
+test('F20 combined pagination: back navigation restores a deterministic previous page by replaying its cached continuation', async () => {
+  const crossref = makeListProvider('crossref', makeUniqueRecords('cr', 20));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('oa', 20));
+
+  const page1 = await runSearch({ ...query, source: 'combined', limit: 10 }, [crossref, openalex]);
+  const page2 = await runSearch({ ...query, source: 'combined', limit: 10, continuation: page1.continuation }, [crossref, openalex]);
+  // "Back" = the client replays the continuation it cached BEFORE requesting page 2 (i.e. the
+  // one page 1 itself returned) - never tries to invert page2's continuation arithmetically.
+  const backToPage1 = await runSearch({ ...query, source: 'combined', limit: 10, continuation: page1.continuation }, [crossref, openalex]);
+  assert.deepEqual(backToPage1.publications.map(p => p.doi), page2.publications.map(p => p.doi), 'replaying the same cached continuation must deterministically reproduce the same page');
+});
+
+test('F20 combined pagination: a new query (no continuation) always resets pagination state, even after previous pages advanced deep', async () => {
+  const crossref = makeListProvider('crossref', makeUniqueRecords('cr', 40));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('oa', 40));
+  let continuation: ScientificSearchResult['continuation'];
+  for (let page = 0; page < 3; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit: 10, continuation }, [crossref, openalex]);
+    continuation = result.continuation;
+  }
+  // A fresh query (a new search box submission) omits `continuation` entirely.
+  const fresh = await runSearch({ ...query, source: 'combined', limit: 10 }, [crossref, openalex]);
+  assert.equal(fresh.offset, 0);
+  assert.equal(fresh.publications[0]?.doi, '10.9999/cr-0', 'a fresh query must restart from the very beginning, not continue from the deep page reached before');
+});
+
+test('F20 combined pagination: hasMore reflects the ACTUAL combined continuation (buffer + provider exhaustion), not just whichever provider happened to respond on this exact call', async () => {
+  // Both providers exhausted (5 records each, all fit on page 1) -> hasMore must be false.
+  const smallCrossref = makeListProvider('crossref', makeUniqueRecords('cr', 5));
+  const smallOpenalex = makeListProvider('openalex', makeUniqueRecords('oa', 5));
+  const exhausted = await runSearch({ ...query, source: 'combined', limit: 25 }, [smallCrossref, smallOpenalex]);
+  assert.equal(exhausted.hasMore, false, 'both providers fully exhausted on page 1 - nothing more to page into');
+
+  // One provider still has more even though the buffer alone filled this exact page.
+  const bigCrossref = makeListProvider('crossref', makeUniqueRecords('cr', 100));
+  const smallOpenalex2 = makeListProvider('openalex', makeUniqueRecords('oa', 5));
+  const stillMore = await runSearch({ ...query, source: 'combined', limit: 10 }, [bigCrossref, smallOpenalex2]);
+  assert.equal(stillMore.hasMore, true, 'Crossref alone still has far more to give');
 });
 
 test('sorting places unavailable values last and OA filter excludes unknown status', () => {

@@ -274,3 +274,63 @@ test('F03: a protected term is never matched as a substring of an unrelated word
   assert.equal(result.ok, false);
   assert.ok(result.missingTerms.includes('RF'));
 });
+
+// ---------- F03 (HIGH) Codex regression: scientific/exponent notation tokenizer ----------
+//
+// Root cause: the old NUMBER_TOKEN_RE had no exponent group, so "1e-3 Pa" matched only its own
+// trailing "-3 Pa" substring (the "1e" mantissa prefix was silently dropped, since "e" is a
+// letter the old pattern never consumed) - and "9e-3 Pa" reduced to the exact same substring,
+// so a genuinely 9x-different value went completely undetected.
+
+test('F03: 1e-3 Pa -> 9e-3 Pa MUST warn - a genuinely different value, not merely a different mantissa digit lost to the old "-3 Pa" substring bug', () => {
+  const result = checkPreservation('Давление составило 1e-3 Pa.', 'Давление составило 9e-3 Pa.');
+  assert.equal(result.ok, false);
+  assert.ok(result.missingNumbers.includes('1e-3 Pa'), `expected "1e-3 Pa" missing, got: ${result.missingNumbers.join(', ')}`);
+});
+
+test('F03: 1E3 Pa -> 1000 Pa is a correct EQUIVALENT (same real value, different literal notation) - safe numeric normalization, not a false "missing number"', () => {
+  const result = checkPreservation('Давление составило 1E3 Pa.', 'Давление составило 1000 Pa.');
+  assert.equal(result.ok, true, `1E3 and 1000 are the same value and must be treated as preserved: ${result.missingNumbers.join(', ')}`);
+  assert.ok(result.preservedNumbers.includes('1E3 Pa'));
+});
+
+test('F03: 1.0e3 W == 1000 W (decimal mantissa + exponent, still the same real value)', () => {
+  const result = checkPreservation('Мощность 1.0e3 W.', 'Мощность составила 1000 W.');
+  assert.equal(result.ok, true, result.missingNumbers.join(', '));
+});
+
+test('F03: negative exponent notation is tokenized as one atomic number (2.5e-3 Pa survives verbatim)', () => {
+  const result = checkPreservation('Давление 2.5e-3 Pa.', 'Итоговое давление составило 2.5e-3 Pa.');
+  assert.equal(result.ok, true, result.missingNumbers.join(', '));
+  assert.ok(result.preservedNumbers.includes('2.5e-3 Pa'));
+});
+
+test('F03: positive exponent notation (1E+6 W) is tokenized as one atomic number and a real value change is still caught', () => {
+  const result = checkPreservation('Мощность 1E+6 W.', 'Мощность 9E+6 W.');
+  assert.equal(result.ok, false);
+  assert.ok(result.missingNumbers.includes('1E+6 W'));
+});
+
+test('F03: decimal exponent (2.5e-3) round-trips correctly through checkNoInventedNumbers as a supplied, not invented, value', () => {
+  const input = draftInput({ results: 'Давление в камере составило 2.5e-3 Pa.' });
+  const check = checkNoInventedNumbers(input, 'Достигнутое давление 2.5e-3 Pa подтверждает расчёт.');
+  assert.equal(check.ok, true, check.invented.join(', '));
+});
+
+test('F03: an invented value expressed in exponent notation is still caught by checkNoInventedNumbers, not hidden by the notation itself', () => {
+  const input = draftInput({ results: 'Давление в камере составило 1e-3 Pa.' });
+  const check = checkNoInventedNumbers(input, 'Давление в камере составило 9e-3 Pa.');
+  assert.equal(check.ok, false);
+  assert.ok(check.invented.includes('9e-3 Pa'));
+});
+
+test('F03: a Cyrillic scientific sentence using exponent notation is tokenized correctly end to end', () => {
+  const result = checkPreservation('Давление в камере составило 1e-3 Па во время осаждения.', 'Давление в камере составило 9e-3 Па во время осаждения.');
+  assert.equal(result.ok, false);
+  assert.ok(result.missingNumbers.includes('1e-3 Па'), `expected "1e-3 Па" missing, got: ${result.missingNumbers.join(', ')}`);
+});
+
+test('F03: 5 µm != 15 nm and 10 °C != 10 K still hold exactly as before (no regression from the exponent-notation fix)', () => {
+  assert.equal(checkPreservation('Толщина 5 µm.', 'Толщина 15 nm.').ok, false);
+  assert.equal(checkPreservation('Отжиг при 10 °C.', 'Отжиг при 10 K.').ok, false);
+});

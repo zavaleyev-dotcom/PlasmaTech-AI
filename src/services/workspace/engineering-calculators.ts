@@ -70,6 +70,21 @@ function requireFiniteResult(value: number, label: string): number {
   return value;
 }
 
+/** F04: for a result the underlying formula GUARANTEES is strictly positive whenever its
+ *  inputs are (every calculation below is a product/quotient of already-validated positive
+ *  finite numbers) - catches both overflow (Infinity/NaN, via requireFiniteResult) AND
+ *  underflow: an intermediate value, or a unit conversion applied to it afterwards, that
+ *  rounds all the way down to exactly 0 (or below) due to floating-point precision limits at
+ *  the extreme end of the input range. A silent 0 here would misreport a genuinely tiny but
+ *  positive physical quantity as "no thickness/no time/no mean free path", which is not a
+ *  real answer - it is reported as the same controlled calculation-range error as overflow,
+ *  never as a normal (if surprising) result. */
+function requirePositiveFiniteResult(value: number, label: string): number {
+  requireFiniteResult(value, label);
+  if (value <= 0) throw new Error(`${label}: результат расчёта слишком мал для представления (потеря точности/underflow при данных входных величинах) - проверьте введённые значения.`);
+  return value;
+}
+
 /** Runtime guard for the string-literal unit/preset fields (solveFor, thicknessUnit,
  *  rateUnit, timeUnit, pressureUnit, gas). TypeScript enforces these at compile time for
  *  callers written in TS, but nothing stopped an unexpected runtime value (e.g. a stray
@@ -91,21 +106,21 @@ export function solveDeposition(input: DepositionInput): DepositionResult {
   if (input.solveFor === 'thickness') {
     const rateNmMin = requirePositiveFinite(input.rate, 'Скорость осаждения') * RATE_TO_NM_PER_MIN[input.rateUnit];
     const timeMin = requirePositiveFinite(input.time, 'Время осаждения') * TIME_TO_MIN[input.timeUnit];
-    const thicknessNm = requireFiniteResult(rateNmMin * timeMin, 'Толщина покрытия');
-    const value = requireFiniteResult(thicknessNm / THICKNESS_TO_NM[input.thicknessUnit], 'Толщина покрытия');
+    const thicknessNm = requirePositiveFiniteResult(rateNmMin * timeMin, 'Толщина покрытия');
+    const value = requirePositiveFiniteResult(thicknessNm / THICKNESS_TO_NM[input.thicknessUnit], 'Толщина покрытия');
     return { solveFor: 'thickness', value, unit: input.thicknessUnit, formula: `d = v × t = ${rateNmMin.toFixed(4)} нм/мин × ${timeMin.toFixed(4)} мин` };
   }
   if (input.solveFor === 'rate') {
     const thicknessNm = requirePositiveFinite(input.thickness, 'Толщина покрытия') * THICKNESS_TO_NM[input.thicknessUnit];
     const timeMin = requirePositiveFinite(input.time, 'Время осаждения') * TIME_TO_MIN[input.timeUnit];
-    const rateNmMin = requireFiniteResult(thicknessNm / timeMin, 'Скорость осаждения');
-    const value = requireFiniteResult(rateNmMin / RATE_TO_NM_PER_MIN[input.rateUnit], 'Скорость осаждения');
+    const rateNmMin = requirePositiveFiniteResult(thicknessNm / timeMin, 'Скорость осаждения');
+    const value = requirePositiveFiniteResult(rateNmMin / RATE_TO_NM_PER_MIN[input.rateUnit], 'Скорость осаждения');
     return { solveFor: 'rate', value, unit: input.rateUnit, formula: `v = d / t = ${thicknessNm.toFixed(4)} нм / ${timeMin.toFixed(4)} мин` };
   }
   const thicknessNm = requirePositiveFinite(input.thickness, 'Толщина покрытия') * THICKNESS_TO_NM[input.thicknessUnit];
   const rateNmMin = requirePositiveFinite(input.rate, 'Скорость осаждения') * RATE_TO_NM_PER_MIN[input.rateUnit];
-  const timeMin = requireFiniteResult(thicknessNm / rateNmMin, 'Время осаждения');
-  const value = requireFiniteResult(timeMin / TIME_TO_MIN[input.timeUnit], 'Время осаждения');
+  const timeMin = requirePositiveFiniteResult(thicknessNm / rateNmMin, 'Время осаждения');
+  const value = requirePositiveFiniteResult(timeMin / TIME_TO_MIN[input.timeUnit], 'Время осаждения');
   return { solveFor: 'time', value, unit: input.timeUnit, formula: `t = d / v = ${thicknessNm.toFixed(4)} нм / ${rateNmMin.toFixed(4)} нм/мин` };
 }
 
@@ -159,12 +174,16 @@ export function calculateMeanFreePath(input: MeanFreePathInput): MeanFreePathRes
   const diameterPm = input.gas === 'custom' ? requirePositiveFinite(input.customDiameterPm, 'Диаметр молекулы газа') : GAS_DIAMETER_PM[input.gas];
   const pressureInPa = pressurePa * PRESSURE_TO_PA[input.pressureUnit];
   const diameterM = diameterPm * 1e-12;
-  const meanFreePathM = requireFiniteResult(
+  const meanFreePathM = requirePositiveFiniteResult(
     (BOLTZMANN_J_PER_K * temperatureK) / (Math.SQRT2 * Math.PI * diameterM * diameterM * pressureInPa),
     'Средняя длина свободного пробега',
   );
+  // F04: the mm conversion is its own arithmetic step (×1000) and can overflow to Infinity
+  // even when meanFreePathM itself was a valid finite number - checked independently, never
+  // assumed safe just because the metre value passed.
+  const meanFreePathMm = requirePositiveFiniteResult(meanFreePathM * 1000, 'Средняя длина свободного пробега (мм)');
   return {
-    meanFreePathM, meanFreePathMm: meanFreePathM * 1000,
+    meanFreePathM, meanFreePathMm,
     formula: `λ = kT / (√2·π·d²·p) при T = ${temperatureK.toFixed(2)} К, p = ${pressureInPa.toExponential(3)} Па, d = ${diameterPm} пм`,
   };
 }

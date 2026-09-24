@@ -119,3 +119,56 @@ test('solveDeposition (F04): a normal, representative calculation is completely 
   assert.ok(Number.isFinite(result.value));
   assert.ok(Math.abs(result.value - 100) < 1e-9);
 });
+
+// ---------- F04 (LOW) Codex regression: intermediate/converted results, not just inputs ----------
+
+test('solveDeposition (F04): an extreme deposition rate combined with a tiny thickness underflows the intermediate quotient to exactly 0 - rejected as a controlled range error, never returned as "0 min"', () => {
+  // thicknessNm=1e-300, rateNmMin=1e300 -> 1e-300/1e300 = 1e-600, which floating-point cannot
+  // represent as anything but exactly 0 - a real, mathematically positive answer, silently
+  // reported as "no time needed at all" is worse than an honest range error.
+  assert.throws(
+    () => solveDeposition({ solveFor: 'time', thickness: 1e-300, thicknessUnit: 'nm', rate: 1e300, rateUnit: 'nm_per_min', timeUnit: 'min' }),
+    /слишком мал.*(underflow|потеря точности)/i,
+  );
+});
+
+test('solveDeposition (F04): rate * time overflowing to Infinity in the "thickness" branch is rejected, never returned as Infinity nm', () => {
+  assert.throws(
+    () => solveDeposition({ solveFor: 'thickness', rate: 1e200, rateUnit: 'nm_per_min', time: 1e200, timeUnit: 'min', thicknessUnit: 'nm' }),
+    /результат расчёта не является конечным числом/,
+  );
+});
+
+test('solveDeposition (F04): thickness/time overflowing to Infinity in the "rate" branch is rejected the same way', () => {
+  assert.throws(
+    () => solveDeposition({ solveFor: 'rate', thickness: 1e250, thicknessUnit: 'nm', time: 1e-250, timeUnit: 'min', rateUnit: 'nm_per_min' }),
+    /результат расчёта не является конечным числом/,
+  );
+});
+
+test('calculateMeanFreePath (F04): an extreme but individually-finite low pressure that overflows the formula is rejected, never returned as Infinity', () => {
+  assert.throws(
+    () => calculateMeanFreePath({ pressure: 1e-306, pressureUnit: 'pa', temperatureC: 25, gas: 'argon' }),
+    /не является конечным числом|слишком мал/,
+  );
+});
+
+test('calculateMeanFreePath (F04): the metre-to-millimetre conversion is checked as its own step, not just meanFreePathM - a value on the edge of overflow is never silently returned as an inconsistent (finite-in-metres, Infinity-in-millimetres) result', () => {
+  const result = calculateMeanFreePath({ pressure: 1e-9, pressureUnit: 'pa', temperatureC: 25, gas: 'argon' });
+  assert.ok(Number.isFinite(result.meanFreePathM));
+  assert.ok(Number.isFinite(result.meanFreePathMm));
+  assert.ok(result.meanFreePathMm > 0);
+});
+
+test('calculateMeanFreePath (F04): extreme but genuinely finite/valid temperature and pressure (e.g. deep cryogenic + very low process pressure) still compute a normal, finite, positive result - no arbitrary technological ceiling invented', () => {
+  const result = calculateMeanFreePath({ pressure: 1e-6, pressureUnit: 'pa', temperatureC: -270, gas: 'nitrogen' });
+  assert.ok(Number.isFinite(result.meanFreePathM) && result.meanFreePathM > 0);
+  assert.ok(Number.isFinite(result.meanFreePathMm) && result.meanFreePathMm > 0);
+});
+
+test('solveDeposition/calculateMeanFreePath (F04): ordinary scientific values used throughout this project stay byte-for-byte unaffected by the new range guards', () => {
+  const deposition = solveDeposition({ solveFor: 'thickness', rate: 10, rateUnit: 'nm_per_min', time: 100, timeUnit: 'min', thicknessUnit: 'nm' });
+  assert.equal(deposition.value, 1000);
+  const mfp = calculateMeanFreePath({ pressure: 1, pressureUnit: 'pa', temperatureC: 25, gas: 'argon' });
+  assert.ok(mfp.meanFreePathMm > 0 && Number.isFinite(mfp.meanFreePathMm));
+});

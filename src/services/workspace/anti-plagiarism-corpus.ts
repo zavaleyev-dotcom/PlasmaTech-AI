@@ -11,7 +11,7 @@ import { openTextStore } from '@/services/library-text';
 import { retrieveChunks } from '@/services/rag/retrieve';
 import type { RetrievedChunk } from '@/services/rag/types';
 import {
-  validateSimilarityInput, segmentSentences, segmentParagraphs, containmentScore, classifyMatch,
+  validateSimilarityInput, normalizeText, segmentSentences, segmentParagraphs, containmentScore, classifyMatch,
   pickBestSourceSentence, findSelfRepeats, dedupMatches, sortMatches, computeCoveredFraction,
   MAX_SEGMENTS_SENTENCES, MAX_SEGMENTS_PARAGRAPHS, MIN_SEGMENT_WORDS, CANDIDATES_PER_SEGMENT, MAX_REPORTED_MATCHES,
   SCOPE_DISCLAIMER,
@@ -22,7 +22,31 @@ function wordCount(text: string): number {
   return (text.match(/[\p{L}\p{N}]+/gu) ?? []).length;
 }
 
-function matchesAgainstCandidates(segment: string, candidates: RetrievedChunk[]): SimilarityMatch[] {
+interface SegmentPosition { start: number; end: number }
+
+/** F15: resolves each segment's REAL occurrence position within the normalized input text, in
+ *  the same left-to-right order segmentSentences()/segmentParagraphs() themselves already
+ *  produce them - a single forward-only cursor is enough (and correct) because of that
+ *  ordering guarantee, so the SAME sentence/paragraph repeated later in the input resolves to
+ *  its OWN later position, never the same first occurrence a plain indexOf() would keep
+ *  finding. Position `null` (segment not locatable from the cursor onward, e.g. a Unicode
+ *  normalization edge case) means the resulting match simply carries no position - never a
+ *  guessed/wrong one - and computeCoveredFraction falls back to its own best-effort search. */
+function resolveSegmentPositions(normalizedInput: string, segments: readonly string[]): (SegmentPosition | null)[] {
+  let cursor = 0;
+  return segments.map(segment => {
+    const normalizedSegment = normalizeText(segment).toLocaleLowerCase();
+    if (!normalizedSegment) return null;
+    let start = normalizedInput.indexOf(normalizedSegment, cursor);
+    if (start === -1) start = normalizedInput.indexOf(normalizedSegment); // defensive fallback only
+    if (start === -1) return null;
+    const end = start + normalizedSegment.length;
+    cursor = end;
+    return { start, end };
+  });
+}
+
+function matchesAgainstCandidates(segment: string, candidates: RetrievedChunk[], position: SegmentPosition | null): SimilarityMatch[] {
   const found: SimilarityMatch[] = [];
   for (const chunk of candidates) {
     const score = containmentScore(segment, chunk.text);
@@ -32,6 +56,7 @@ function matchesAgainstCandidates(segment: string, candidates: RetrievedChunk[])
       type, inputSpan: segment, sourceSpan: pickBestSourceSentence(chunk.text, segment),
       documentId: chunk.documentId, documentTitle: chunk.title || chunk.filename, relativePath: chunk.relativePath,
       chunkId: chunk.chunkId, pageStart: chunk.pageStart, pageEnd: chunk.pageEnd, score,
+      ...(position ? { inputStart: position.start, inputEnd: position.end } : {}),
     });
   }
   return found;
@@ -63,22 +88,31 @@ export async function checkSimilarity(inputText: string, options: CheckSimilarit
     // says nothing about whether the user repeated a sentence within their own text.
     const selfRepeats = findSelfRepeats(sentences);
 
+    // F15: resolve each sentence's/paragraph's real occurrence position ONCE, up front, in
+    // their own natural document order - independent cursors, since sentences and paragraphs
+    // are two separate (nested) segmentations of the same text.
+    const normalizedInputForPositions = normalizeText(inputText).toLocaleLowerCase();
+    const sentencePositions = resolveSegmentPositions(normalizedInputForPositions, sentences);
+    const paragraphPositions = resolveSegmentPositions(normalizedInputForPositions, paragraphs);
+
     const seenDocumentIds = new Set<string>();
     const seenChunkIds = new Set<string>();
     const rawMatches: SimilarityMatch[] = [];
 
     if (!corpusEmpty) {
-      for (const sentence of sentences) {
+      for (let i = 0; i < sentences.length; i++) {
+        const sentence = sentences[i];
         if (wordCount(sentence) < MIN_SEGMENT_WORDS) continue;
         const { chunks } = retrieveChunks(store, sentence, CANDIDATES_PER_SEGMENT);
         for (const chunk of chunks) { seenDocumentIds.add(chunk.documentId); seenChunkIds.add(chunk.chunkId); }
-        rawMatches.push(...matchesAgainstCandidates(sentence, chunks));
+        rawMatches.push(...matchesAgainstCandidates(sentence, chunks, sentencePositions[i]));
       }
-      for (const paragraph of paragraphs) {
+      for (let i = 0; i < paragraphs.length; i++) {
+        const paragraph = paragraphs[i];
         if (wordCount(paragraph) < MIN_SEGMENT_WORDS) continue;
         const { chunks } = retrieveChunks(store, paragraph, CANDIDATES_PER_SEGMENT);
         for (const chunk of chunks) { seenDocumentIds.add(chunk.documentId); seenChunkIds.add(chunk.chunkId); }
-        rawMatches.push(...matchesAgainstCandidates(paragraph, chunks));
+        rawMatches.push(...matchesAgainstCandidates(paragraph, chunks, paragraphPositions[i]));
       }
     }
 

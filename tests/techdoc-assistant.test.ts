@@ -118,6 +118,39 @@ test('validateDocument (F08): an unusual but physically possible high temperatur
   assert.doesNotThrow(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { temperatureC: -196 }) }), 'a real cryogenic sub-zero temperature is also not an error');
 });
 
+// ---------- F08 (MEDIUM) Codex regression: temperature must never go below absolute zero ----------
+
+test('validateDocument (F08): -500 °C (physically impossible, far below absolute zero) is rejected - the exact Codex reproduction', () => {
+  let doc = withName(createBlankDocument());
+  doc = { ...doc, steps: addStep(doc.steps, 'main_coating') };
+  assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { temperatureC: -500 }) }), /абсолютного нуля/);
+});
+
+test('validateDocument (F08): -273.16 °C (one hundredth of a degree below absolute zero) is rejected', () => {
+  let doc = withName(createBlankDocument());
+  doc = { ...doc, steps: addStep(doc.steps, 'main_coating') };
+  assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { temperatureC: -273.16 }) }), /абсолютного нуля/);
+});
+
+test('validateDocument (F08): -273.15 °C (exactly absolute zero, 0 K) is accepted at the boundary, not rejected by an off-by-a-hair floating-point comparison', () => {
+  let doc = withName(createBlankDocument());
+  doc = { ...doc, steps: addStep(doc.steps, 'main_coating') };
+  assert.doesNotThrow(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { temperatureC: -273.15 }) }));
+});
+
+test('validateDocument (F08): 900 °C and other high positive temperatures remain unbounded - no arbitrary technological ceiling was introduced alongside the absolute-zero floor', () => {
+  let doc = withName(createBlankDocument());
+  doc = { ...doc, steps: addStep(doc.steps, 'main_coating') };
+  assert.doesNotThrow(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { temperatureC: 900 }) }));
+  assert.doesNotThrow(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { temperatureC: 5000 }) }), 'an extreme but not physically impossible temperature is still never capped');
+});
+
+test('validateDocument (F08): "Допустимая температура" (initialData.allowedTemperatureC) gets the same absolute-zero floor as a per-step temperature', () => {
+  const doc = withName(createBlankDocument());
+  assert.throws(() => validateDocument({ ...doc, initialData: { ...doc.initialData, allowedTemperatureC: -300 } }), /абсолютного нуля/);
+  assert.doesNotThrow(() => validateDocument({ ...doc, initialData: { ...doc.initialData, allowedTemperatureC: 850 } }));
+});
+
 test('validateDocument: rejects a duplicate step order and an empty process name', () => {
   const doc = withName(createBlankDocument());
   const withSteps = { ...doc, steps: [
@@ -536,25 +569,74 @@ test('F06: editing an UNRELATED field never clears a different field\'s calculat
   assert.equal(step.temperatureC, 350);
 });
 
-test('F06: copy a calculated step -> the copy never inherits the "calculated" stamp (it is a fresh, user-created row, even though its initial value came from the original\'s calculation)', () => {
+test('F06 (Codex regression #2): copy a calculated step -> the copy KEEPS the "calculated" stamp for the field whose value was copied unchanged - `origin` (step-level: "created as a user copy") and `calculatedFields` (field-level: "this value came from a calculator") are different facts, and copying a step must never erase the second just because it always sets the first', () => {
   let doc = withName(createDocumentFromPreset('magnetron-pvd'));
   doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
   doc = { ...doc, steps: duplicateStep(doc.steps, 6) };
   const copy = doc.steps.find(s => s.order === 7)!;
   assert.equal(copy.durationMin, 100, 'the copy starts with the same value...');
-  assert.deepEqual(copy.calculatedFields, [], '...but is never falsely claimed to still be a live calculated result');
-  assert.equal(copy.origin, 'user');
+  assert.deepEqual(copy.calculatedFields, ['durationMin'], '...and the calculated-field provenance for that UNCHANGED value must survive the copy, not be wiped just because the step itself is a new user-created row');
+  assert.equal(copy.origin, 'user', 'the step itself is still correctly marked as a user copy, never as still coming from a preset');
   // the ORIGINAL is untouched by copying it
   assert.deepEqual(doc.steps.find(s => s.order === 6)!.calculatedFields, ['durationMin']);
 });
 
-test('F06: edit the copied step -> a manual edit on the copy behaves normally (nothing was falsely stamped to begin with)', () => {
+test('F06: edit the copied step\'s calculated value -> the stamp is removed ONLY from the edited field, exactly like editing the original would', () => {
   let doc = withName(createDocumentFromPreset('magnetron-pvd'));
   doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
   doc = { ...doc, steps: duplicateStep(doc.steps, 6) };
   doc = { ...doc, steps: updateStep(doc.steps, 7, { durationMin: 42 }) };
   const editedCopy = doc.steps.find(s => s.order === 7)!;
   assert.equal(editedCopy.durationMin, 42);
-  assert.deepEqual(editedCopy.calculatedFields, []);
+  assert.deepEqual(editedCopy.calculatedFields, [], 'the value is now genuinely user-typed, so the stamp must be gone');
+});
+
+test('F06: editing an UNRELATED field on the copy never clears the copied calculated-field stamp', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
+  doc = { ...doc, steps: duplicateStep(doc.steps, 6) };
+  doc = { ...doc, steps: updateStep(doc.steps, 7, { temperatureC: 350 }) };
+  const copy = doc.steps.find(s => s.order === 7)!;
+  assert.deepEqual(copy.calculatedFields, ['durationMin']);
+  assert.equal(copy.temperatureC, 350);
+});
+
+test('F06 full flow (Codex reproduction): calculate 100 min -> duplicate -> provenance still says calculated -> edit copied duration -> provenance removed only from the edited field -> save/restore -> semantics retained', () => {
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
+  assert.ok(Math.abs(doc.steps.find(s => s.order === 6)!.durationMin! - 100) < 1e-9);
+
+  doc = { ...doc, steps: duplicateStep(doc.steps, 6) };
+  let copy = doc.steps.find(s => s.order === 7)!;
+  assert.equal(copy.durationMin, 100);
+  assert.deepEqual(copy.calculatedFields, ['durationMin'], 'copy still says calculated/copied-from-calculated');
+
+  doc = { ...doc, steps: updateStep(doc.steps, 7, { durationMin: 77 }) };
+  copy = doc.steps.find(s => s.order === 7)!;
+  assert.equal(copy.durationMin, 77);
+  assert.deepEqual(copy.calculatedFields, [], 'provenance removed only from the edited field');
+  // the original (order 6) must be completely unaffected by editing its copy
+  assert.deepEqual(doc.steps.find(s => s.order === 6)!.calculatedFields, ['durationMin']);
+
+  const restored = tryRestoreDocument(JSON.stringify(doc));
+  assert.ok(restored);
+  const restoredOriginal = restored!.steps.find(s => s.order === 6)!;
+  const restoredCopy = restored!.steps.find(s => s.order === 7)!;
+  assert.deepEqual(restoredOriginal.calculatedFields, ['durationMin'], 'save/restore retains the original\'s calculated provenance');
+  assert.deepEqual(restoredCopy.calculatedFields, [], 'save/restore retains the edited copy\'s cleared provenance');
+  assert.equal(restoredCopy.durationMin, 77);
+});
+
+test('F06: UI/export consistency - buildInstructionView and the export view model read the SAME copied-and-preserved calculated provenance', async () => {
+  const { buildDocumentViewModel } = await import('../src/services/workspace/techdoc-export');
+  let doc = withName(createDocumentFromPreset('magnetron-pvd'));
+  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
+  doc = { ...doc, steps: duplicateStep(doc.steps, 6) };
+  const copy = doc.steps.find(s => s.order === 7)!;
+  assert.deepEqual(copy.calculatedFields, ['durationMin']);
+  // Both read the same underlying document - there is no second, independent provenance model.
+  const viewModel = buildDocumentViewModel(doc, 'instruction');
+  assert.ok(viewModel.traceability.calculatedFieldsNote.includes('№6 (durationMin)'), viewModel.traceability.calculatedFieldsNote);
+  assert.ok(viewModel.traceability.calculatedFieldsNote.includes('№7 (durationMin)'), viewModel.traceability.calculatedFieldsNote);
 });
 

@@ -96,7 +96,7 @@ export function calculateCapex(input: CapexInput): CapexResult {
     { label: 'Оснастка / комплектующие', value: optionalNonNegative(input.tooling, 'Оснастка / комплектующие') },
     { label: 'Прочие единовременные затраты', value: optionalNonNegative(input.otherOneTime, 'Прочие единовременные затраты') },
   ];
-  const total = lineItems.reduce((sum, item) => sum + item.value, 0);
+  const total = requireFiniteResult(lineItems.reduce((sum, item) => sum + item.value, 0), 'CAPEX (сумма статей)');
   return { total, lineItems, formula: lineItems.map(i => i.label).join(' + ') };
 }
 
@@ -138,8 +138,8 @@ export function calculateOpex(input: OpexInput): OpexResult {
     { label: 'Утилизация', value: optionalNonNegative(input.disposal, 'Утилизация') },
     { label: 'Прочие эксплуатационные расходы', value: optionalNonNegative(input.otherOperating, 'Прочие эксплуатационные расходы') },
   ];
-  const totalPerPeriod = lineItems.reduce((sum, item) => sum + item.value, 0);
-  const annualTotal = input.period === 'month' ? totalPerPeriod * 12 : totalPerPeriod;
+  const totalPerPeriod = requireFiniteResult(lineItems.reduce((sum, item) => sum + item.value, 0), 'OPEX (сумма статей)');
+  const annualTotal = requireFiniteResult(input.period === 'month' ? totalPerPeriod * 12 : totalPerPeriod, 'OPEX (годовой итог)');
   return { totalPerPeriod, period: input.period, annualTotal, lineItems, formula: input.period === 'month' ? 'год = сумма за месяц × 12' : 'год = сумма введённых годовых статей' };
 }
 
@@ -204,7 +204,7 @@ export interface UnitCostResult {
 export function calculateUnitCost(annualOperatingCost: number, annualOutput: number, capex?: number, depreciationYears?: number): UnitCostResult {
   assertValid(annualOperatingCost, 'Годовые эксплуатационные затраты', { allowZero: true });
   const output = assertValid(annualOutput, 'Годовой выпуск продукции');
-  const withoutDepreciation = annualOperatingCost / output;
+  const withoutDepreciation = requireFiniteResult(annualOperatingCost / output, 'Себестоимость без амортизации');
   // The deciding factor is whether a depreciation PERIOD was given, not whether capex itself
   // was passed - in the full pipeline (runAssessment), capex is always known (it is itself
   // computed), so keying this on capex's presence would make "no depreciation requested"
@@ -214,8 +214,8 @@ export function calculateUnitCost(annualOperatingCost: number, annualOutput: num
   }
   const capexValue = assertValid(capex ?? 0, 'CAPEX для амортизации', { allowZero: true });
   const years = assertValid(depreciationYears ?? 0, 'Срок амортизации, лет');
-  const annualDepreciation = capexValue / years;
-  const withDepreciation = (annualOperatingCost + annualDepreciation) / output;
+  const annualDepreciation = requireFiniteResult(capexValue / years, 'Годовая амортизация');
+  const withDepreciation = requireFiniteResult((annualOperatingCost + annualDepreciation) / output, 'Себестоимость с амортизацией');
   return {
     withoutDepreciation, withDepreciation, annualDepreciation,
     formula: `с амортизацией = (OPEX/год + CAPEX/срок) / выпуск/год = (${annualOperatingCost.toFixed(2)} + ${capexValue.toFixed(2)}/${years}) / ${output.toFixed(2)}`,
@@ -245,12 +245,14 @@ export function calculateEconomicEffect(input: EconomicEffectInput): EconomicEff
     const currentUnitCost = assertValid(input.currentUnitCost ?? NaN, 'Текущая себестоимость единицы', { allowZero: true });
     const newUnitCost = assertValid(input.newUnitCost ?? NaN, 'Новая себестоимость единицы', { allowZero: true });
     const annualOutput = assertValid(input.annualOutput ?? NaN, 'Годовой выпуск продукции');
-    const savingsPerUnit = currentUnitCost - newUnitCost;
-    return { savingsPerUnit, annualSavings: savingsPerUnit * annualOutput, formula: `экономия/ед. = ${currentUnitCost.toFixed(2)} − ${newUnitCost.toFixed(2)}; годовая экономия = экономия/ед. × ${annualOutput.toFixed(2)}` };
+    const savingsPerUnit = requireFiniteResult(currentUnitCost - newUnitCost, 'Экономия на единицу');
+    const annualSavings = requireFiniteResult(savingsPerUnit * annualOutput, 'Годовая экономия');
+    return { savingsPerUnit, annualSavings, formula: `экономия/ед. = ${currentUnitCost.toFixed(2)} − ${newUnitCost.toFixed(2)}; годовая экономия = экономия/ед. × ${annualOutput.toFixed(2)}` };
   }
   const currentAnnualCost = assertValid(input.currentAnnualCost ?? NaN, 'Текущие внешние затраты в год', { allowZero: true });
   const newAnnualCost = assertValid(input.newAnnualCost ?? NaN, 'Затраты после внедрения в год', { allowZero: true });
-  return { savingsPerUnit: null, annualSavings: currentAnnualCost - newAnnualCost, formula: `годовая экономия = ${currentAnnualCost.toFixed(2)} − ${newAnnualCost.toFixed(2)}` };
+  const annualSavings = requireFiniteResult(currentAnnualCost - newAnnualCost, 'Годовая экономия');
+  return { savingsPerUnit: null, annualSavings, formula: `годовая экономия = ${currentAnnualCost.toFixed(2)} − ${newAnnualCost.toFixed(2)}` };
 }
 
 /** Simple (non-discounted) cumulative savings for each of `years` years - a running sum,
@@ -259,7 +261,11 @@ export function calculateCumulativeSavings(annualSavings: number, years: number)
   assertFinite(annualSavings, 'Годовая экономия');
   const n = Math.floor(assertValid(years, 'Число лет для накопленной экономии'));
   const result: number[] = [];
-  for (let i = 1; i <= n; i++) result.push(annualSavings * i);
+  // F05 (Codex regression): calculateCumulativeSavings(1e308, 2) previously returned
+  // [1e308, Infinity] - the FIRST year's value (1e308 × 1) is finite and passed silently,
+  // but the second (1e308 × 2) overflows; every entry must be checked on its own, not just
+  // the input, since overflow can appear partway through the series, not only at year 1.
+  for (let i = 1; i <= n; i++) result.push(requireFiniteResult(annualSavings * i, `Накопленная экономия за год ${i}`));
   return result;
 }
 
@@ -279,8 +285,13 @@ export function calculatePayback(capex: number, annualEffect: number): PaybackRe
   if (annualEffect <= 0) {
     return { years: null, months: null, message: 'Окупаемость не определена: годовой экономический эффект не положителен.', formula: 'payback = CAPEX / годовой эффект (не определено при эффекте ≤ 0)' };
   }
-  const years = requireFiniteResult(capex / annualEffect, 'Окупаемость');
-  return { years, months: years * 12, message: null, formula: `payback = CAPEX / годовой эффект = ${capex.toFixed(2)} / ${annualEffect.toFixed(2)}` };
+  const years = requireFiniteResult(capex / annualEffect, 'Окупаемость (лет)');
+  // F05 (Codex regression): calculatePayback(1e308, 1) previously returned years=1e308
+  // (itself finite, so it passed the check above) but months = years * 12 = 1.2e309, which
+  // silently overflows to Infinity - checked here as its OWN arithmetic step, not assumed
+  // safe just because `years` was fine.
+  const months = requireFiniteResult(years * 12, 'Окупаемость (месяцев)');
+  return { years, months, message: null, formula: `payback = CAPEX / годовой эффект = ${capex.toFixed(2)} / ${annualEffect.toFixed(2)}` };
 }
 
 // ---------- G. ROI ----------
@@ -322,7 +333,8 @@ export function calculateBreakEven(input: BreakEvenInput): BreakEvenResult {
   if (contributionMargin <= 0) {
     return { volumeUnits: null, message: 'Точка безубыточности не определена: цена продажи не превышает переменную себестоимость.', formula: 'break-even = фикс. затраты / (цена − переменные затраты) (не определено при марже ≤ 0)' };
   }
-  return { volumeUnits: fixedCosts / contributionMargin, message: null, formula: `break-even = ${fixedCosts.toFixed(2)} / (${price.toFixed(2)} − ${variableCost.toFixed(2)})` };
+  const volumeUnits = requireFiniteResult(fixedCosts / contributionMargin, 'Точка безубыточности');
+  return { volumeUnits, message: null, formula: `break-even = ${fixedCosts.toFixed(2)} / (${price.toFixed(2)} − ${variableCost.toFixed(2)})` };
 }
 
 // ---------- full pipeline: one assessment (used directly, per-scenario, and per A/B variant) ----------

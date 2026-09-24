@@ -37,6 +37,33 @@ export interface PublicationFilters {
   openAccessOnly: boolean;
 }
 
+/** F20: combined-search continuation state - the client's own opaque token, echoed back
+ *  verbatim on the NEXT page request (and cached locally per page for "back" navigation). This
+ *  app is fully stateless server-side (no session store), so the state that makes combined
+ *  pagination correct - each provider's own next offset/exhaustion, and the carry-over buffer
+ *  of already-fetched-but-not-yet-shown unique records - has to live somewhere, and the client
+ *  is the only place that persists between requests here.
+ *
+ *  `buffer` is what actually fixes the lost-results bug: when a page's combined, deduplicated,
+ *  filtered result set has MORE unique records than `limit`, the leftover is carried here
+ *  instead of being silently discarded - the next page drains this FIRST, only fetching more
+ *  from a provider when the buffer alone cannot fill a page. `emittedKeys` (DOI/title+year
+ *  identity, matching deduplicatePublications's own notion of "the same work") prevents a
+ *  record already shown on an earlier page from ever being re-emitted, even if a later fetch
+ *  from either provider happens to return it again. Bounded by construction: `buffer` never
+ *  exceeds one page's worth of records, and `emittedKeys` never exceeds MAX_SEARCH_OFFSET
+ *  entries (this app never pages deeper than that). */
+export interface SearchContinuation {
+  crossrefOffset: number;
+  openalexOffset: number;
+  crossrefTotal: number | null;
+  openalexTotal: number | null;
+  crossrefExhausted: boolean;
+  openalexExhausted: boolean;
+  buffer: Publication[];
+  emittedKeys: string[];
+}
+
 export interface ScientificSearchQuery extends PublicationFilters {
   query: string;
   keywords: string;
@@ -48,8 +75,15 @@ export interface ScientificSearchQuery extends PublicationFilters {
    *  param); OpenAlex converts it to its own `page` param (page = offset/limit + 1). Always a
    *  multiple of `limit` in a well-formed request (the UI only ever moves by whole pages).
    *  Clamped server-side to MAX_SEARCH_OFFSET - deep pagination is intentionally bounded, never
-   *  fetched all at once. */
+   *  fetched all at once. Meaningful for `source: 'crossref'|'openalex'` only - combined mode
+   *  uses `continuation` instead (see below), since a single shared offset is exactly what
+   *  previously caused combined pagination to silently drop results. */
   offset: number;
+  /** F20: combined-mode-only continuation from a PREVIOUS response's own `continuation` field
+   *  - omitted (or provided as `undefined`) for a fresh query, which always starts both
+   *  providers at offset 0 with an empty buffer, exactly like `offset: 0` does for a
+   *  single-provider search. Ignored entirely for `source: 'crossref'|'openalex'`. */
+  continuation?: SearchContinuation;
 }
 
 /** F20: the deepest record offset this app will ever request from a provider - a deliberate,
@@ -84,8 +118,15 @@ export interface ScientificSearchResult extends SourceSearchResult {
   offset: number;
   /** F20: honestly derived from each successful provider's own reported total vs this page's
    *  offset+limit (and the MAX_SEARCH_OFFSET bound) - never assumed true just because this page
-   *  came back full, and never true past the deep-pagination bound. */
+   *  came back full, and never true past the deep-pagination bound. For combined mode, reflects
+   *  the ACTUAL combined continuation (buffer + provider exhaustion), never just one provider's
+   *  own response. */
   hasMore: boolean;
+  /** F20: combined-mode-only - the client must cache this (e.g. one entry per page, for "back"
+   *  navigation) and echo it back verbatim as the NEXT request's `continuation` to keep paging
+   *  forward without losing or re-emitting a result. Absent for single-provider searches, which
+   *  use the simpler `offset` contract above instead. */
+  continuation?: SearchContinuation;
 }
 
 export interface SearchErrorBody {

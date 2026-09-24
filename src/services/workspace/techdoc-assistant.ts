@@ -26,6 +26,23 @@ function checkOptionalFinite(value: number | undefined, label: string): void {
   if (value !== undefined) assertFinite(value, label);
 }
 
+/** F08: the one universally-safe physical floor for a Celsius temperature - nothing in this
+ *  universe is colder than absolute zero, regardless of process type. Unlike an invented
+ *  technological ceiling (deliberately never added - see the 900 °C test below), this is not
+ *  a guess about what a real PVD/CVD process needs; it is a physical law, so it applies to
+ *  every process type this app supports. The comparison itself is written in a way that never
+ *  rejects the exact boundary (-273.15 °C === 0 K) due to floating-point rounding - `value <
+ *  ABSOLUTE_ZERO_C` a hair below the constant would silently reject -273.15 itself if the
+ *  constant were computed rather than a literal, so it is compared to the same literal used
+ *  everywhere else in this project (engineering-calculators.ts's own `+ 273.15` conversion). */
+const ABSOLUTE_ZERO_C = -273.15;
+
+function checkOptionalAboveAbsoluteZero(value: number | undefined, label: string): void {
+  if (value === undefined) return;
+  assertFinite(value, label);
+  if (value < ABSOLUTE_ZERO_C) throw new Error(`${label}: значение не может быть ниже абсолютного нуля (${ABSOLUTE_ZERO_C} °C).`);
+}
+
 function checkOptionalNonNegative(value: number | undefined, label: string): void {
   if (value !== undefined) assertNonNegative(value, label);
 }
@@ -110,7 +127,19 @@ export function duplicateStep(steps: ProcessStep[], order: number): ProcessStep[
   if (index === -1) throw new Error(`Этап №${order} не найден.`);
   // Duplicating is itself an explicit user action, regardless of whether the ORIGINAL step
   // came from a preset - the copy must never keep claiming origin: 'preset' (Codex regression).
-  const copy: ProcessStep = { ...steps[index], gasUsage: steps[index].gasUsage.map(g => ({ ...g })), origin: 'user', calculatedFields: [] };
+  //
+  // F06 (second Codex regression): `origin` and `calculatedFields` answer two DIFFERENT
+  // questions and must not be conflated - `origin` is "was this STEP created as a user copy"
+  // (always 'user' for a duplicate, correct above), while `calculatedFields` is "did a
+  // calculator ACTUALLY produce this field's current value" (a fact about the value itself,
+  // unchanged by copying it verbatim). Wiping calculatedFields to [] here previously made a
+  // freshly-copied calculated duration (e.g. 100 min from calculateStepDurationFromDeposition)
+  // look exactly like a value the user had typed by hand, destroying real provenance for a
+  // value nothing about the copy operation actually changed. It is carried over unchanged; the
+  // EXISTING updateStep() already clears the stamp correctly the moment the user edits that
+  // field on the copy (see the "edit the copied step" test), so provenance still updates the
+  // instant the value stops being the calculator's own output.
+  const copy: ProcessStep = { ...steps[index], gasUsage: steps[index].gasUsage.map(g => ({ ...g })), origin: 'user', calculatedFields: [...steps[index].calculatedFields] };
   const next = [...steps.slice(0, index + 1), copy, ...steps.slice(index + 1)];
   return renumber(next);
 }
@@ -384,7 +413,7 @@ export function validateDocument(doc: TechnicalProcessDocument): void {
     seenOrders.add(step.order);
 
     checkOptionalNonNegative(step.durationMin, `Этап №${step.order}: длительность`);
-    checkOptionalFinite(step.temperatureC, `Этап №${step.order}: температура`);
+    checkOptionalAboveAbsoluteZero(step.temperatureC, `Этап №${step.order}: температура`);
     checkOptionalNonNegative(step.pressureMbar, `Этап №${step.order}: давление`);
     checkOptionalNonNegative(step.powerW, `Этап №${step.order}: мощность`);
     checkOptionalNonNegative(step.currentA, `Этап №${step.order}: ток`);
@@ -411,7 +440,7 @@ export function validateDocument(doc: TechnicalProcessDocument): void {
   checkOptionalNonNegative(doc.initialData.partSizeMm, 'Размер изделия');
   checkOptionalNonNegative(doc.initialData.quantity, 'Количество');
   checkOptionalNonNegative(doc.initialData.requiredThicknessUm, 'Требуемая толщина');
-  checkOptionalFinite(doc.initialData.allowedTemperatureC, 'Допустимая температура');
+  checkOptionalAboveAbsoluteZero(doc.initialData.allowedTemperatureC, 'Допустимая температура');
 }
 
 // ---------- formatting helper: never invent a value, always show "не задано" / "—" ----------

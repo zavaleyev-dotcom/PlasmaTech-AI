@@ -239,3 +239,104 @@ test('checkSimilarity: always includes the mandated local-corpus-only disclaimer
     },
   );
 });
+
+// ---------- F15 (MEDIUM) Codex regression: the SAME matched text at TWO SEPARATE positions
+// in the input must count as two distinct covered intervals, not collapse onto whichever
+// occurrence a plain indexOf() happens to find first ----------
+
+function normalizedLength(text: string): number {
+  return text.normalize('NFKC').replace(/\s+/g, ' ').trim().length;
+}
+
+test('F15 checkSimilarity: the same matched sentence appearing TWICE, far apart, both count toward coverage - covered characters roughly double vs. a single occurrence', async () => {
+  await withFixtureStore(
+    store => store.replace(fakeDoc('doc-en'), [fakeChunk('doc-en', 0, SOURCE_TEXT_EN)]),
+    async openStore => {
+      const filler = 'Промежуточный несвязанный текст для явного разделения двух вхождений одного и того же предложения в этом документе, не имеющий отношения к корпусу.';
+      const single = `Введение. ${SOURCE_TEXT_EN} Заключение.`;
+      const double = `Введение. ${SOURCE_TEXT_EN} ${filler} ${SOURCE_TEXT_EN} Заключение.`;
+
+      const singleReport = await checkSimilarity(single, { openStore });
+      const doubleReport = await checkSimilarity(double, { openStore });
+
+      const singleCoveredChars = singleReport.scope.coveredFraction * normalizedLength(single);
+      const doubleCoveredChars = doubleReport.scope.coveredFraction * normalizedLength(double);
+
+      assert.ok(singleCoveredChars > 0, 'sanity: the single occurrence must be covered at all');
+      // The Codex regression: with a first-occurrence-only indexOf(), doubleCoveredChars would
+      // equal singleCoveredChars (both occurrences collapsing onto the same first position).
+      // With real per-occurrence positions, it must be close to double.
+      assert.ok(
+        doubleCoveredChars > singleCoveredChars * 1.8,
+        `expected roughly double the covered characters (single=${singleCoveredChars}, double=${doubleCoveredChars})`,
+      );
+    },
+  );
+});
+
+test('F15 checkSimilarity: the same matched PARAGRAPH appearing twice (as two separate paragraphs) both count toward coverage', async () => {
+  await withFixtureStore(
+    store => store.replace(fakeDoc('doc-en'), [fakeChunk('doc-en', 0, SOURCE_TEXT_EN)]),
+    async openStore => {
+      const single = SOURCE_TEXT_EN;
+      const double = `${SOURCE_TEXT_EN}\n\n${SOURCE_TEXT_EN}`;
+
+      const singleReport = await checkSimilarity(single, { openStore });
+      const doubleReport = await checkSimilarity(double, { openStore });
+
+      const singleCoveredChars = singleReport.scope.coveredFraction * normalizedLength(single);
+      const doubleCoveredChars = doubleReport.scope.coveredFraction * normalizedLength(double);
+
+      assert.ok(singleCoveredChars > 0);
+      assert.ok(
+        doubleCoveredChars > singleCoveredChars * 1.8,
+        `expected roughly double the covered characters (single=${singleCoveredChars}, double=${doubleCoveredChars})`,
+      );
+    },
+  );
+});
+
+test('F15 checkSimilarity: three identical occurrences of the same matched sentence all count toward coverage (not just the first two)', async () => {
+  await withFixtureStore(
+    store => store.replace(fakeDoc('doc-en'), [fakeChunk('doc-en', 0, SOURCE_TEXT_EN)]),
+    async openStore => {
+      const filler = 'Отдельный несвязанный абзац между повторениями, чтобы гарантировать разделение вхождений.';
+      const single = SOURCE_TEXT_EN;
+      const triple = `${SOURCE_TEXT_EN} ${filler} ${SOURCE_TEXT_EN} ${filler} ${SOURCE_TEXT_EN}`;
+
+      const singleReport = await checkSimilarity(single, { openStore });
+      const tripleReport = await checkSimilarity(triple, { openStore });
+
+      const singleCoveredChars = singleReport.scope.coveredFraction * normalizedLength(single);
+      const tripleCoveredChars = tripleReport.scope.coveredFraction * normalizedLength(triple);
+
+      assert.ok(
+        tripleCoveredChars > singleCoveredChars * 2.7,
+        `expected roughly triple the covered characters (single=${singleCoveredChars}, triple=${tripleCoveredChars})`,
+      );
+    },
+  );
+});
+
+test('F15 checkSimilarity: a Cyrillic sentence repeated twice, far apart, still resolves both occurrences (not just the first)', async () => {
+  await withFixtureStore(
+    store => store.replace(fakeDoc('doc-ru'), [fakeChunk('doc-ru', 0, SOURCE_TEXT_RU)]),
+    async openStore => {
+      const filler = 'Совершенно не связанный текст про кулинарию и рецепты для разделения двух вхождений совпадающего предложения.';
+      const single = `Введение. ${SOURCE_TEXT_RU} Заключение.`;
+      const double = `Введение. ${SOURCE_TEXT_RU} ${filler} ${SOURCE_TEXT_RU} Заключение.`;
+
+      const singleReport = await checkSimilarity(single, { openStore });
+      const doubleReport = await checkSimilarity(double, { openStore });
+
+      const singleCoveredChars = singleReport.scope.coveredFraction * normalizedLength(single);
+      const doubleCoveredChars = doubleReport.scope.coveredFraction * normalizedLength(double);
+
+      assert.ok(singleCoveredChars > 0);
+      assert.ok(
+        doubleCoveredChars > singleCoveredChars * 1.8,
+        `expected roughly double the covered characters (single=${singleCoveredChars}, double=${doubleCoveredChars})`,
+      );
+    },
+  );
+});

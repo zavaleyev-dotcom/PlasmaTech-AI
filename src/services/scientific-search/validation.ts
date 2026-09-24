@@ -1,9 +1,42 @@
 import { ScientificSearchError } from './errors';
 import { normalizeDoi } from './normalization';
-import { publicationTypes, MAX_SEARCH_OFFSET, type ScientificSearchQuery } from './types';
+import { publicationTypes, MAX_SEARCH_OFFSET, type ScientificSearchQuery, type SearchContinuation, type Publication } from './types';
 
 function invalid(message: string): never {
   throw new ScientificSearchError('INVALID_QUERY', message, 400);
+}
+
+/** F20: minimal structural check on a buffered record - this data was produced and echoed
+ *  back by THIS app's own previous response, so it is not re-validated as untrusted user
+ *  input field-by-field; only checked enough to guarantee the pipeline (dedup/filter/sort)
+ *  never crashes on a malformed/tampered value. Anything that fails is dropped from the
+ *  buffer rather than failing the whole request - a corrupted continuation degrades to "a few
+ *  fewer carried-over records", never a hard error. */
+function isPublicationLike(value: unknown): value is Publication {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.id === 'string' && typeof v.title === 'string' && Array.isArray(v.authors)
+    && Array.isArray(v.sources) && typeof v.source === 'string';
+}
+
+/** F20: the client's own continuation token from a previous response, echoed back verbatim.
+ *  Parsed leniently - a missing/malformed continuation is never a 400, it just means "start
+ *  this combined search fresh" (offset 0, empty buffer), so a client bug or a stale/foreign
+ *  token can never hard-fail a search, only reset its pagination state. */
+function parseContinuation(value: unknown): SearchContinuation | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const v = value as Record<string, unknown>;
+  const num = (x: unknown): number => typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : 0;
+  const numOrNull = (x: unknown): number | null => typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : null;
+  const bool = (x: unknown): boolean => x === true;
+  const buffer = Array.isArray(v.buffer) ? v.buffer.filter(isPublicationLike).slice(0, 50) : [];
+  const emittedKeys = Array.isArray(v.emittedKeys) ? v.emittedKeys.filter((k): k is string => typeof k === 'string').slice(0, MAX_SEARCH_OFFSET) : [];
+  return {
+    crossrefOffset: num(v.crossrefOffset), openalexOffset: num(v.openalexOffset),
+    crossrefTotal: numOrNull(v.crossrefTotal), openalexTotal: numOrNull(v.openalexTotal),
+    crossrefExhausted: bool(v.crossrefExhausted), openalexExhausted: bool(v.openalexExhausted),
+    buffer, emittedKeys,
+  };
 }
 
 export function parseSearchQuery(input: unknown): ScientificSearchQuery {
@@ -56,8 +89,11 @@ export function parseSearchQuery(input: unknown): ScientificSearchQuery {
   if (type && !publicationTypes.some(item => item === type)) invalid('Неизвестный тип публикации.');
   const journalOnly = flag('journalOnly');
   if (journalOnly && type && type !== 'journal-article') invalid('Фильтр journal article несовместим с выбранным типом публикации.');
+  // F20: only meaningful for source: 'combined' - parsed regardless of `source` (harmless if
+  // present but unused for a single-provider search), never required.
+  const continuation = source === 'combined' ? parseContinuation(data.continuation) : undefined;
   return {
-    query, keywords, doi: doi || '', yearFrom, yearTo, limit, source, sort, offset,
+    query, keywords, doi: doi || '', yearFrom, yearTo, limit, source, sort, offset, continuation,
     type: type as ScientificSearchQuery['type'], journalOnly,
     hasDoi: flag('hasDoi'), hasAbstract: flag('hasAbstract'), openAccessOnly: flag('openAccessOnly'),
   };

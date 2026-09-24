@@ -8,6 +8,20 @@ function titleKey(publication: Publication): string | null {
     ? `${title}|${publication.year}` : null;
 }
 
+/** F20: the SAME "is this the same work" notion deduplicatePublications uses internally (DOI
+ *  first, else normalized title+year), exposed as a single per-record key - used by combined-
+ *  search pagination (pipeline.ts) to track which records have already been shown across
+ *  pages, so a later fetch returning a record already emitted on an earlier page is recognized
+ *  and skipped rather than re-emitted as if it were new. Returns null when a record cannot be
+ *  identified reliably (no DOI, no usable title/year) - such a record is never deduplicated
+ *  against anything, exactly like deduplicatePublications treats it. */
+export function publicationIdentityKey(publication: Publication): string | null {
+  const doi = normalizeDoi(publication.doi);
+  if (doi) return `doi:${doi}`;
+  const title = titleKey(publication);
+  return title ? `title:${title}` : null;
+}
+
 function merge(first: Publication, second: Publication): Publication {
   const preferred = first.doi ? first : second.doi ? second : first;
   const other = preferred === first ? second : first;

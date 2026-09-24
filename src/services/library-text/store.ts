@@ -112,14 +112,14 @@ export class TextStore {
     if (progress?.running) { try { process.kill(progress.pid, 0); } catch { progress.running = false; progress.error = 'Предыдущий процесс остановлен. Запустите обновление для продолжения.'; } }
     return { progress, stats: this.stats(), errors: this.db.prepare("SELECT relativePath,json_extract(metadata,'$.filename') filename,status,error FROM documents WHERE status!='success' ORDER BY relativePath").all() as unknown as TextOverview['errors'] };
   }
-  search(query: string, offset = 0): { total: number; hits: ContentHit[]; rankingDegraded: boolean; offsetCapped: boolean } {
+  search(query: string, offset = 0): { total: number; hits: ContentHit[]; rankingDegraded: boolean; offsetCapped: boolean; offset: number; atMaxOffset: boolean } {
     if (query.length > 500) throw new Error('Запрос длиннее 500 символов.');
     // Quotes express phrases; all other input is literal Unicode words, never FTS syntax.
     const rawTerms = [...query.matchAll(/"([^"]+)"|([\p{L}\p{N}_-]+)/gu)].map(m => m[1] ?? m[2]).filter(t => /[\p{L}\p{N}]/u.test(t));
     // A repeated token (accidental or pasted noise) adds nothing to selectivity but doubles
     // the work of finding/scoring it - drop duplicates before building the query at all.
     const terms = [...new Set(rawTerms)];
-    if (!terms.length || terms.length > 30) return { hits: [], total: 0, rankingDegraded: false, offsetCapped: false };
+    if (!terms.length || terms.length > 30) return { hits: [], total: 0, rankingDegraded: false, offsetCapped: false, offset: 0, atMaxOffset: false };
     const match = terms.map(t => `"${t.replaceAll('"', '""')}"`).join(' AND ');
     const total = Number(this.db.prepare('SELECT count(*) n FROM content_search WHERE content_search MATCH ?').get(match)!.n);
 
@@ -148,6 +148,18 @@ export class TextStore {
     // way to know the requested offset was clamped, so it kept incrementing its own displayed
     // "X-Y of total" range while the actual returned rows silently stayed frozen at the cap).
     const offsetCapped = cappedOffset !== normalizedOffset;
+    // F09: the caller must be told the offset ACTUALLY served (`cappedOffset`), not merely
+    // whether capping happened - a boolean alone let the UI go on computing its displayed
+    // range from the OFFSET IT REQUESTED (e.g. 520) even though the rows returned were really
+    // from the cap (500), producing a fabricated "521-540 of N" label over rows that are
+    // really "501-520 of N" (a silent duplicate page, never surfaced as such).
+    //
+    // `atMaxOffset` additionally lets the UI disable "Next" the moment the LAST reachable page
+    // is shown (offset===500, even when this exact request needed no clamping at all), so a
+    // "Next" click can never even attempt to request the first out-of-bound offset (520) in
+    // the first place - `offsetCapped` alone cannot do this, since the boundary page itself
+    // (offset=500 requested) is not "capped", it is the last page that is legitimately valid.
+    const atMaxOffset = cappedOffset >= MAX_SEARCH_OFFSET;
     // F09: this decision must depend ONLY on facts that are the same for every page of the
     // SAME query (candidateBudget/total) - NEVER on `offset` itself. It previously also
     // triggered on `cappedOffset > 0`, which meant page 1 (offset=0) of a query with total >
@@ -168,6 +180,6 @@ export class TextStore {
     const orderBy = rankingDegraded ? 'content_search.rowid' : 'bm25(content_search), c.id';
     const rows = this.db.prepare(`SELECT d.metadata, c.id chunkId,c.pageStart,c.pageEnd,snippet(content_search,0,'','',' … ',48) snippet FROM content_search JOIN chunks c ON c.rowid=content_search.rowid JOIN documents d ON d.id=c.documentId WHERE content_search MATCH ? ORDER BY ${orderBy} LIMIT 20 OFFSET ?`).all(match, cappedOffset);
     const hits = rows.map(({ metadata, ...row }) => ({ ...JSON.parse(metadata as string), ...row })) as ContentHit[];
-    return { total, hits, rankingDegraded, offsetCapped };
+    return { total, hits, rankingDegraded, offsetCapped, offset: cappedOffset, atMaxOffset };
   }
 }

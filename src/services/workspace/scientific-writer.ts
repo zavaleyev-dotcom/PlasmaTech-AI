@@ -286,22 +286,41 @@ const KNOWN_UNITS = [
 ].sort((a, b) => b.length - a.length);
 
 const UNIT_ALTERNATION = KNOWN_UNITS.map(escapeRegExp).join('|');
-/** Captures a number, and - only if immediately followed (after optional whitespace, allowing
- *  "5мкм" with no space at all) by one of KNOWN_UNITS and then a non-letter/digit - that unit
- *  too. The trailing lookahead also stops a bare number from matching as a prefix of an
- *  unrelated alphanumeric token (e.g. "5G" is never read as the number 5). */
-const NUMBER_TOKEN_RE = new RegExp(`([-+]?\\d+(?:[.,]\\d+)?)(?:\\s*(${UNIT_ALTERNATION}))?(?![\\p{L}\\p{N}])`, 'gu');
+/** Captures a full numeric literal - including scientific/exponent notation ("1e-3", "9e-3",
+ *  "1E+6", "2.5e-3") as ONE atomic mantissa+exponent token, never split into a bare mantissa
+ *  digit run - and, only if immediately followed (after optional whitespace, allowing "5мкм"
+ *  with no space at all) by one of KNOWN_UNITS and then a non-letter/digit, that unit too.
+ *
+ *  F03 (Codex regression): the previous pattern had no exponent group at all, so "1e-3 Pa"
+ *  matched only its OWN trailing "-3 Pa" substring (the "1e" mantissa prefix was silently
+ *  dropped, because "e" is a letter, not a digit/sign the old pattern recognized) - and since
+ *  "9e-3 Pa" reduces the exact same way, a genuinely 9x-different value went completely
+ *  undetected. The exponent group below is matched as part of the SAME capture as the
+ *  mantissa, so "1e-3" is read as one token, never re-split at the "-3" that happens to
+ *  follow the "e".
+ *
+ *  The trailing lookahead also stops a bare number from matching as a prefix of an unrelated
+ *  alphanumeric token (e.g. "5G" is never read as the number 5). */
+const NUMBER_TOKEN_RE = new RegExp(`([-+]?\\d+(?:[.,]\\d+)?(?:[eE][-+]?\\d+)?)(?:\\s*(${UNIT_ALTERNATION}))?(?![\\p{L}\\p{N}])`, 'gu');
 
 interface NumericToken { raw: string; key: string }
 
 /** Every number (optionally paired with its unit) in `text`, as both a human-readable form
- *  (`raw`, exactly as written - for display in warnings) and a comparison key (`key`, with the
- *  decimal separator normalized so "2,5" and "2.5" are treated as the same value). */
+ *  (`raw`, exactly as written - for display in warnings) and a comparison key (`key`).
+ *
+ *  The key is built from the number's actual PARSED numeric value (`Number(...).toString()`),
+ *  not from its literal source text: this is what makes "1.0e3 W" and "1000 W" compare as the
+ *  SAME scientific quantity (a safe, narrow normalization - only mathematically-equal-valued
+ *  numbers ever collapse to the same key, via JS's own number parser, never a heuristic string
+ *  rewrite), while "1e-3 Pa" and "9e-3 Pa" - genuinely different values, not a formatting
+ *  difference - still produce different keys ("0.001Pa" vs "0.009Pa"). Comma is treated as the
+ *  same decimal separator as a period ("2,5" and "2.5" are the same value) before parsing. */
 function extractNumericTokens(text: string): NumericToken[] {
   return Array.from(text.matchAll(NUMBER_TOKEN_RE)).map(match => {
     const [raw, number, unit] = match;
     const normalizedNumber = number.replace(',', '.');
-    return { raw: raw.trim(), key: unit ? `${normalizedNumber}${unit}` : normalizedNumber };
+    const canonicalNumber = Number(normalizedNumber).toString();
+    return { raw: raw.trim(), key: unit ? `${canonicalNumber}${unit}` : canonicalNumber };
   });
 }
 
@@ -357,7 +376,10 @@ export function summarizeChanges(original: string, edited: string): string[] {
  *  routinely fall in that range). */
 function structuralListMarkerKeys(text: string): Set<string> {
   const keys = new Set<string>();
-  for (const match of text.matchAll(/(?:^|\n)[ \t]*(\d{1,3})[.):]\s/g)) keys.add(match[1]);
+  // Canonicalized the same way as extractNumericTokens's own keys (e.g. a "05." marker must
+  // key as "5", matching how a bare "05" value would canonicalize too) - otherwise a leading-
+  // zero marker could fail to match its own generated token's key and be falsely flagged.
+  for (const match of text.matchAll(/(?:^|\n)[ \t]*(\d{1,3})[.):]\s/g)) keys.add(Number(match[1]).toString());
   return keys;
 }
 

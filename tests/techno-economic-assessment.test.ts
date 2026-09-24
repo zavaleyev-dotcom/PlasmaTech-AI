@@ -286,3 +286,56 @@ test('calculateCumulativeSavings (F05): a NaN annual savings figure is rejected 
 test('calculateRoi (F05): a genuinely negative annual benefit (a real loss) is still accepted, not rejected just for being negative', () => {
   assert.doesNotThrow(() => calculateRoi(-50_000, 0, 1_000_000));
 });
+
+// ---------- F05 (LOW) Codex regression: OUTPUT overflow, not just input validation - finite
+// inputs whose ARITHMETIC overflows must never be returned as a valid economic result ----------
+
+test('calculatePayback (F05): calculatePayback(1e308, 1) must be a controlled range error, never { months: Infinity } - years alone is finite, but years*12 overflows', () => {
+  assert.throws(() => calculatePayback(1e308, 1), /не является конечным числом/);
+});
+
+test('calculateCumulativeSavings (F05): calculateCumulativeSavings(1e308, 2) must be a controlled range error, never [1e308, Infinity] - the SECOND year overflows even though the first does not', () => {
+  assert.throws(() => calculateCumulativeSavings(1e308, 2), /не является конечным числом/);
+});
+
+test('calculateCapex (F05): summing several individually-valid, extreme line items that overflow the total is rejected, never returned as CAPEX = Infinity', () => {
+  assert.throws(() => calculateCapex({ equipment: 1e308, infrastructure: 1e308 }), /не является конечным числом/);
+});
+
+test('calculateOpex (F05): a monthly total that overflows once annualized (×12) is rejected, never returned as an Infinity annual OPEX', () => {
+  assert.throws(() => calculateOpex({ period: 'month', electricity: 1.7e308 }), /не является конечным числом/);
+});
+
+test('calculateUnitCost (F05): an extreme operating cost over a vanishingly small (but valid, positive) output overflowing to Infinity is rejected, never returned as a valid unit cost', () => {
+  assert.throws(() => calculateUnitCost(1e300, 1e-300), /не является конечным числом/);
+});
+
+test('calculateUnitCost (F05): depreciation-with-amortization overflow (CAPEX/years, or the combined with-depreciation figure) is rejected the same way', () => {
+  assert.throws(() => calculateUnitCost(1, 1, 1e308, 1e-300), /не является конечным числом/);
+});
+
+test('calculateEconomicEffect (F05): a unit_cost-mode annualized multiplication (savings/unit x annual output) overflowing to Infinity is rejected, never returned as a valid savings figure', () => {
+  assert.throws(() => calculateEconomicEffect({ mode: 'unit_cost', currentUnitCost: 1e300, newUnitCost: 0, annualOutput: 1e10 }), /не является конечным числом/);
+});
+
+test('calculateBreakEven (F05): an extreme fixed cost divided by a vanishingly small (but positive) contribution margin overflowing to Infinity is rejected, never returned as a valid break-even volume', () => {
+  assert.throws(() => calculateBreakEven({ sellingPricePerUnit: 1e-300 + 1e-310, variableCostPerUnit: 1e-300, fixedCosts: 1e300 }), /не является конечным числом/);
+});
+
+test('runAssessment (F05): an overflow anywhere in the pipeline (e.g. CAPEX total) surfaces as the SAME controlled error, never a partially-computed result with Infinity/NaN fields', () => {
+  const base = {
+    capex: { equipment: 1e308, infrastructure: 1e308 },
+    opex: { period: 'year' as const, electricity: 100_000 },
+    capacity: { shiftsPerDay: 2, hoursPerShift: 8, workingDaysPerYear: 250, utilizationPercent: 90, cycleTimeMinutes: 15, unitsPerCycle: 1 },
+    economicEffect: { mode: 'total_external_cost' as const, currentAnnualCost: 500_000, newAnnualCost: 300_000 },
+  };
+  assert.throws(() => runAssessment(base), /не является конечным числом/);
+});
+
+test('calculateCapex/calculateOpex/calculateUnitCost/calculateEconomicEffect/calculateBreakEven (F05): ordinary, non-extreme values used throughout this project are completely unaffected by the new overflow guards', () => {
+  assert.equal(calculateCapex({ equipment: 1_000_000, installation: 50_000 }).total, 1_050_000);
+  assert.equal(calculateOpex({ period: 'month', electricity: 10_000 }).annualTotal, 120_000);
+  assert.equal(calculateUnitCost(500_000, 10_000).withoutDepreciation, 50);
+  assert.equal(calculateEconomicEffect({ mode: 'total_external_cost', currentAnnualCost: 500_000, newAnnualCost: 300_000 }).annualSavings, 200_000);
+  assert.equal(calculateBreakEven({ sellingPricePerUnit: 100, variableCostPerUnit: 60, fixedCosts: 400_000 }).volumeUnits, 10_000);
+});
