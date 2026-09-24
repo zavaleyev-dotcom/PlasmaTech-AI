@@ -286,12 +286,20 @@ const KNOWN_UNITS = [
 ].sort((a, b) => b.length - a.length);
 
 const UNIT_ALTERNATION = KNOWN_UNITS.map(escapeRegExp).join('|');
+/** Every character real scientific text uses as a numeric minus/plus sign - not just the
+ *  ASCII hyphen-minus. Text pasted from Word/LaTeX/PDF exports (and LLM output, which tends
+ *  to use proper math typography) very commonly renders a negative exponent with U+2212
+ *  MINUS SIGN ("−") rather than U+002D HYPHEN-MINUS, and autocorrect/OCR can substitute
+ *  the Unicode hyphen/en dash/em dash for the same role. Placed first inside the character
+ *  class below so the literal "-" needs no escaping. */
+const SIGN_CHARS = '-\\u2010\\u2011\\u2012\\u2013\\u2014\\u2212+';
+const SIGN_VARIANT_RE = /[‐‑‒–—−]/g;
 /** Captures a full numeric literal - including scientific/exponent notation ("1e-3", "9e-3",
  *  "1E+6", "2.5e-3") as ONE atomic mantissa+exponent token, never split into a bare mantissa
  *  digit run - and, only if immediately followed (after optional whitespace, allowing "5мкм"
  *  with no space at all) by one of KNOWN_UNITS and then a non-letter/digit, that unit too.
  *
- *  F03 (Codex regression): the previous pattern had no exponent group at all, so "1e-3 Pa"
+ *  F03 (Codex regression #1): the previous pattern had no exponent group at all, so "1e-3 Pa"
  *  matched only its OWN trailing "-3 Pa" substring (the "1e" mantissa prefix was silently
  *  dropped, because "e" is a letter, not a digit/sign the old pattern recognized) - and since
  *  "9e-3 Pa" reduces the exact same way, a genuinely 9x-different value went completely
@@ -299,9 +307,16 @@ const UNIT_ALTERNATION = KNOWN_UNITS.map(escapeRegExp).join('|');
  *  mantissa, so "1e-3" is read as one token, never re-split at the "-3" that happens to
  *  follow the "e".
  *
+ *  F03 (Codex regression #2, re-detected after the fix above): the exponent-group fix used
+ *  `[-+]?` for both the leading and exponent sign - ASCII-only. A real "1e−3 Pa" (typographic
+ *  minus, see SIGN_CHARS) fell through EXACTLY the same way the original bug did: the "e−3"
+ *  was not recognized as part of the number at all, so only the trailing bare "3 Pa" matched,
+ *  and "1e−3 Pa" vs "9e−3 Pa" again reduced to the identical token. SIGN_CHARS closes this
+ *  for both sign positions.
+ *
  *  The trailing lookahead also stops a bare number from matching as a prefix of an unrelated
  *  alphanumeric token (e.g. "5G" is never read as the number 5). */
-const NUMBER_TOKEN_RE = new RegExp(`([-+]?\\d+(?:[.,]\\d+)?(?:[eE][-+]?\\d+)?)(?:\\s*(${UNIT_ALTERNATION}))?(?![\\p{L}\\p{N}])`, 'gu');
+const NUMBER_TOKEN_RE = new RegExp(`([${SIGN_CHARS}]?\\d+(?:[.,]\\d+)?(?:[eE][${SIGN_CHARS}]?\\d+)?)(?:\\s*(${UNIT_ALTERNATION}))?(?![\\p{L}\\p{N}])`, 'gu');
 
 interface NumericToken { raw: string; key: string }
 
@@ -314,11 +329,14 @@ interface NumericToken { raw: string; key: string }
  *  numbers ever collapse to the same key, via JS's own number parser, never a heuristic string
  *  rewrite), while "1e-3 Pa" and "9e-3 Pa" - genuinely different values, not a formatting
  *  difference - still produce different keys ("0.001Pa" vs "0.009Pa"). Comma is treated as the
- *  same decimal separator as a period ("2,5" and "2.5" are the same value) before parsing. */
+ *  same decimal separator as a period ("2,5" and "2.5" are the same value) before parsing.
+ *  Any Unicode minus/dash sign matched via SIGN_CHARS is normalized to the ASCII hyphen-minus
+ *  first - `Number()` itself only ever recognizes "-", so without this step a real "−1e-3"
+ *  would parse to NaN (or silently lose its sign) instead of the actual negative value. */
 function extractNumericTokens(text: string): NumericToken[] {
   return Array.from(text.matchAll(NUMBER_TOKEN_RE)).map(match => {
     const [raw, number, unit] = match;
-    const normalizedNumber = number.replace(',', '.');
+    const normalizedNumber = number.replace(SIGN_VARIANT_RE, '-').replace(',', '.');
     const canonicalNumber = Number(normalizedNumber).toString();
     return { raw: raw.trim(), key: unit ? `${canonicalNumber}${unit}` : canonicalNumber };
   });

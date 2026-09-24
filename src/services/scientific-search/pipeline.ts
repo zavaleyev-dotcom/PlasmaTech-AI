@@ -56,11 +56,13 @@ const emptyContinuation = (): SearchContinuation => ({
  *  page 2 skipped both providers straight to offset 20, losing the other 20 forever).
  *
  *  Each call: (1) start from the caller's continuation (or a fresh, empty one for a new
- *  query); (2) fetch ONE more round from a provider ONLY if the buffer alone cannot already
- *  fill this page (this is what stops the old "always fetch `limit` from both, always
- *  truncate the merged set back down to `limit`" pattern that was discarding records) - never
- *  more than one round per provider per call, so a single request can never auto-walk deeper
- *  than one page's worth of extra fetching; (3) dedupe/filter/sort the WHOLE pool (buffer +
+ *  query); (2) fetch ONE more round from EVERY not-yet-exhausted provider, together, ONLY if
+ *  the buffer does not already hold more than one page's worth (this is both what stops the
+ *  old "always fetch `limit` from both, always truncate the merged set back down to `limit`"
+ *  pattern that was discarding records, AND what keeps the buffer/continuation itself from
+ *  growing without bound across many pages) - never more than one round per provider per
+ *  call, so a single request can never auto-walk deeper than one page's worth of extra
+ *  fetching; (3) dedupe/filter/sort the WHOLE pool (buffer +
  *  freshly fetched) exactly like a normal page; (4) emit the first `limit`, carry the rest
  *  into the new buffer, and record what was emitted in `emittedKeys` so it can never be
  *  re-emitted by a later fetch that happens to return it again. */
@@ -103,21 +105,34 @@ async function runCombinedSearch(query: ScientificSearchQuery, crossref: Scienti
     }
   }
 
-  // Fetch exactly ONE round from EVERY provider not yet known to be exhausted - never more
-  // than one round per provider per request (no auto-walking deeper within a single call),
-  // but also never fewer: skipping a provider just because the buffer alone already meets
-  // `limit` (an earlier version of this fix did that) would silently degrade "combined
-  // search" into "show Crossref until it runs out, then OpenAlex" - both sources keep
-  // advancing together, page after page, exactly like the pre-fix behavior did; the only
-  // change is that whatever this round fetches beyond what fits on THIS page is buffered for
-  // the next one instead of being discarded, which is what actually fixes the lost-results bug.
-  if (!crossrefExhausted) {
-    const round = await fetchRound(crossref, crossrefOffset);
-    crossrefOffset = round.nextOffset; crossrefExhausted = round.exhausted || crossrefExhausted; crossrefTotal = round.total ?? crossrefTotal;
-  }
-  if (!openalexExhausted) {
-    const round = await fetchRound(openalex, openalexOffset);
-    openalexOffset = round.nextOffset; openalexExhausted = round.exhausted || openalexExhausted; openalexTotal = round.total ?? openalexTotal;
+  // F20 (Codex regression #2): only fetch a fresh round when the carry-over buffer does NOT
+  // already comfortably cover this page - fetching unconditionally from both providers on
+  // EVERY page (the previous version of this fix) never lost a record, but it never stopped
+  // growing either: each round pulled in up to 2x`limit` fresh records while only `limit`
+  // were emitted, so the buffer - and the `continuation` object the client must cache and
+  // echo back on every request - grew by a net `limit` records forever, violating "bounded
+  // continuation state". The gate below (<=, not <) still fetches whenever the buffer holds
+  // AT MOST one page's worth, so with two evenly-supplied providers a fetch still happens
+  // every OTHER round at most, keeping the buffer providably bounded (oscillating, never
+  // exceeding roughly 2x`limit`) while a transient provider failure is still discovered
+  // within at most one extra page, never silently deferred indefinitely.
+  //
+  // The gate is evaluated ONCE, for both providers together - never per-provider. Skipping
+  // only ONE provider's fetch while still fetching the other would let its offset fall
+  // behind and bias the merged/sorted pool toward whichever provider kept advancing, exactly
+  // the "show Crossref until it runs out, then OpenAlex" failure this design deliberately
+  // avoids; both providers always advance in lockstep whenever a fetch round does happen.
+  // Nothing fetched is ever discarded either way - this only decides WHEN the next round's
+  // extra records get pulled in, never IF a fetched unique record eventually gets emitted.
+  if (incoming.buffer.length <= query.limit) {
+    if (!crossrefExhausted) {
+      const round = await fetchRound(crossref, crossrefOffset);
+      crossrefOffset = round.nextOffset; crossrefExhausted = round.exhausted || crossrefExhausted; crossrefTotal = round.total ?? crossrefTotal;
+    }
+    if (!openalexExhausted) {
+      const round = await fetchRound(openalex, openalexOffset);
+      openalexOffset = round.nextOffset; openalexExhausted = round.exhausted || openalexExhausted; openalexTotal = round.total ?? openalexTotal;
+    }
   }
 
   if (!anySuccess && pool.length === 0) {

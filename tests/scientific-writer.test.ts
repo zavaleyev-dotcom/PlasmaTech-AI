@@ -334,3 +334,36 @@ test('F03: 5 µm != 15 nm and 10 °C != 10 K still hold exactly as before (no re
   assert.equal(checkPreservation('Толщина 5 µm.', 'Толщина 15 nm.').ok, false);
   assert.equal(checkPreservation('Отжиг при 10 °C.', 'Отжиг при 10 K.').ok, false);
 });
+
+// ---------- F03 (Codex re-detection): typographic/Unicode minus sign in the exponent ----------
+//
+// Root cause: the exponent-group fix above used [-+]? for the sign - ASCII hyphen-minus only.
+// Real text pasted from Word/LaTeX/PDF exports (and LLM output, which tends to use proper math
+// typography) very commonly writes a negative exponent with U+2212 MINUS SIGN ("−"), not
+// U+002D HYPHEN-MINUS ("-"). "1e−3 Pa" fell through EXACTLY the same way the original bug did:
+// the "e−3" was not recognized as part of the number at all, so only a bare trailing "3 Pa"
+// matched, and "1e−3 Pa" -> "9e−3 Pa" again reduced to the identical token - the exact
+// reproduction Codex re-reported after the ASCII-only fix.
+
+test('F03 (re-detection): 1e−3 Pa -> 9e−3 Pa (typographic Unicode minus, U+2212) MUST warn, exactly like the ASCII "-" case', () => {
+  const result = checkPreservation('Давление составило 1e−3 Pa.', 'Давление составило 9e−3 Pa.');
+  assert.equal(result.ok, false);
+  assert.ok(result.missingNumbers.includes('1e−3 Pa'), `expected "1e−3 Pa" missing, got: ${result.missingNumbers.join(', ')}`);
+});
+
+test('F03 (re-detection): a Unicode-minus exponent value is still recognized as fully preserved when unchanged (no false positive from the wider sign class)', () => {
+  const result = checkPreservation('Давление 2.5e−3 Pa.', 'Итоговое давление составило 2.5e−3 Pa.');
+  assert.equal(result.ok, true, result.missingNumbers.join(', '));
+  assert.ok(result.preservedNumbers.includes('2.5e−3 Pa'));
+});
+
+test('F03 (re-detection): a Unicode minus sign on the LEADING sign (mantissa, not exponent) is not silently dropped - a negative value must never compare equal to its positive counterpart', () => {
+  const result = checkPreservation('p = −1e-3 Pa (below zero)', 'p = 1e-3 Pa (recomputed as positive, an error)');
+  assert.equal(result.ok, false, 'a negative and a positive value are genuinely different quantities');
+  assert.ok(result.missingNumbers.includes('−1e-3 Pa'), `expected "−1e-3 Pa" missing, got: ${result.missingNumbers.join(', ')}`);
+});
+
+test('F03 (re-detection): mixed Unicode dash variants (en dash, hyphen) in the exponent sign are all normalized the same way', () => {
+  assert.equal(checkPreservation('p = 1e–3 Pa.', 'p = 9e–3 Pa.').ok, false, 'en dash (U+2013) exponent sign');
+  assert.equal(checkPreservation('p = 1e‐3 Pa.', 'p = 9e‐3 Pa.').ok, false, 'Unicode hyphen (U+2010) exponent sign');
+});

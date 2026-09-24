@@ -465,6 +465,51 @@ test('F20 combined pagination: hasMore reflects the ACTUAL combined continuation
   assert.equal(stillMore.hasMore, true, 'Crossref alone still has far more to give');
 });
 
+// ---------- F20 (Codex re-detection): bounded continuation state ----------
+//
+// Root cause: a fresh round of `limit` records was fetched from BOTH providers on EVERY page,
+// unconditionally - even when the carry-over buffer already had more than enough to fill the
+// page. That never lost a record, but the buffer (and the `continuation` object the client
+// must cache and echo back on every request) grew by a net `limit` records forever: with two
+// providers that never run out, paging N pages deep left roughly N*limit/2 records sitting in
+// the buffer, an unbounded and ever-growing payload - exactly what Codex's checklist called out
+// as "bounded continuation state", independent of whether any record was actually lost.
+
+test('F20 (re-detection): with two providers that never exhaust, the continuation buffer stays bounded (never exceeds 2x limit) across many pages, instead of growing by `limit` every page forever', async () => {
+  const limit = 10;
+  const crossref = makeListProvider('crossref', makeUniqueRecords('cr', 500));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('oa', 500));
+
+  let continuation: ScientificSearchResult['continuation'];
+  const allDois = new Set<string>();
+  for (let page = 0; page < 20; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit, continuation }, [crossref, openalex]);
+    assert.ok(
+      (result.continuation?.buffer.length ?? 0) <= 2 * limit,
+      `page ${page + 1}: buffer grew to ${result.continuation?.buffer.length} records - continuation state must stay bounded, never grow linearly with the number of pages visited`,
+    );
+    for (const pub of result.publications) if (pub.doi) allDois.add(pub.doi);
+    continuation = result.continuation;
+  }
+  assert.equal(allDois.size, 200, 'still exactly 20 pages x 10 unique records emitted, no duplicates and nothing skipped, even though far fewer records were pre-fetched per page than before');
+});
+
+test('F20 (re-detection): bounding the buffer never drops or duplicates a record - 20 unique Crossref + 20 unique OpenAlex, limit 10, draining fully across pages still exposes all 40 exactly once', async () => {
+  const crossref = makeListProvider('crossref', makeUniqueRecords('cr', 20));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('oa', 20));
+
+  let continuation: ScientificSearchResult['continuation'];
+  const seen: string[] = [];
+  for (let page = 0; page < 8; page++) {
+    const result: ScientificSearchResult = await runSearch({ ...query, source: 'combined', limit: 10, continuation }, [crossref, openalex]);
+    for (const pub of result.publications) if (pub.doi) seen.push(pub.doi);
+    continuation = result.continuation;
+    if (!result.hasMore) break;
+  }
+  assert.equal(seen.length, 40, `expected exactly 40 emitted records total (no duplicates, nothing lost), got ${seen.length}`);
+  assert.equal(new Set(seen).size, 40, 'every emitted DOI must be unique - no record re-emitted on a later page');
+});
+
 test('sorting places unavailable values last and OA filter excludes unknown status', () => {
   const records = [publication({ id: 'unknown', year: null, citationCount: null }), publication({ id: 'older', year: 2020, citationCount: 42, openAccess: true }), publication({ id: 'newer', year: 2024, citationCount: 0, openAccess: false })];
   assert.deepEqual(sortPublications(records, 'year').map(p => p.id), ['newer', 'older', 'unknown']);

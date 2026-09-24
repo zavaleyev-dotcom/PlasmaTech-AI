@@ -51,8 +51,10 @@ export interface PublicationFilters {
  *  identity, matching deduplicatePublications's own notion of "the same work") prevents a
  *  record already shown on an earlier page from ever being re-emitted, even if a later fetch
  *  from either provider happens to return it again. Bounded by construction: `buffer` never
- *  exceeds one page's worth of records, and `emittedKeys` never exceeds MAX_SEARCH_OFFSET
- *  entries (this app never pages deeper than that). */
+ *  grows past roughly two pages' worth of records (the pipeline only fetches a fresh round
+ *  once the buffer has AT MOST one page's worth left, so it oscillates rather than growing
+ *  forever), and `emittedKeys` never exceeds MAX_SEARCH_OFFSET entries (this app never pages
+ *  deeper than that). */
 export interface SearchContinuation {
   crossrefOffset: number;
   openalexOffset: number;
