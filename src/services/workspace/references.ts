@@ -255,7 +255,8 @@ export function formatReferenceApa(ref: Reference): string {
     // and the DOI - never one silently replacing the other.
     const doiLink = ref.doi ? `https://doi.org/${ref.doi}` : undefined;
     const target = ref.url ?? doiLink;
-    const located = target ? (ref.accessDate ? `Retrieved ${ref.accessDate}, from ${target}` : target) : undefined;
+    // With no URL and no DOI the access date is still kept - never dropped, nothing invented.
+    const located = target ? (ref.accessDate ? `Retrieved ${ref.accessDate}, from ${target}` : target) : ref.accessDate ? `Retrieved ${ref.accessDate}.` : undefined;
     return joinClauses([authors, year, title, container, located, ref.url ? doiLink : undefined]);
   }
   const link = ref.doi ? `https://doi.org/${ref.doi}` : ref.url;

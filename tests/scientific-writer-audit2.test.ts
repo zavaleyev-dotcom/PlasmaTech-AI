@@ -113,7 +113,6 @@ test('titlesEquivalent: signs, decimals and units are significant; only presenta
   assert.equal(titlesEquivalent('Effect at 0.5 V', 'Effect at 5 V'), false);
   assert.equal(titlesEquivalent('Effect at 50 mV', 'Effect at 50 V'), false);
   assert.equal(titlesEquivalent('Hardness 5 mPa', 'Hardness 5 MPa'), false, 'mPa vs MPa differ by case only - must stay different');
-  assert.equal(titlesEquivalent('Effect at 50 mV', 'EFFECT AT 50 mV'), true);
   assert.equal(titlesEquivalent('Effect at 50 mV', 'EFFECT AT 50 MV'), false);
   assert.equal(titlesEquivalent('Cr-N coatings', 'Cr-N coatings at 5 K'), false);
 });
@@ -123,7 +122,7 @@ test('titlesEquivalent: genuinely identical titles with different Markdown/white
   assert.equal(titlesEquivalent('Effect at −50 V', 'Effect at −50 V'.replace('−50 V', '-50   V')), true);
   assert.equal(titlesEquivalent('# Effect at 5 V.', 'Effect at 5 V'), true);
   assert.equal(titlesEquivalent('Effect of "AlTiN" at 5 V', 'Effect of “AlTiN” at 5 V'), true);
-  assert.equal(titlesEquivalent('Effect at 5 V', 'effect at 5 V'), true);
+  assert.equal(titlesEquivalent('Effect at 5 V', 'effect at 5 V'), false, 'letter case is never normalized (see the audit-3 tests)');
   assert.equal(titlesEquivalent('Effect at *5 V*', 'Effect at 5 V'), true);
   assert.equal(titlesEquivalent('', ''), true);
 });

@@ -566,23 +566,41 @@ const SIGNIFICANCE_MARKERS: readonly RegExp[] = [
   new RegExp(`${WB_START}statistically${WB_END}`, 'giu'),
   new RegExp(`${WB_START}p\\s*[<=≤]\\s*0?[.,]\\d+`, 'giu'),
   new RegExp(`${WB_START}статистическ\\p{L}*\\s+значим\\p{L}*`, 'giu'),
-  new RegExp(`${WB_START}достоверн\\p{L}*`, 'giu'),
+  new RegExp(`${WB_START}достовер\\p{L}*`, 'giu'),
 ];
 
 export interface AddedSignificanceCheck { added: string[]; ok: boolean }
 
-/** Wording about (statistical) significance that the OUTPUT contains but the user's source text
- *  never used. Lexical only - it catches the specific, recurring failure of an editor adding
- *  "significantly" where no significance was established, not every possible strengthening of a
- *  claim (that needs a semantic verifier, which this project does not have). Meaningful for
- *  same-language rewriting/editing; not applied to translation, where "significantly" is a
- *  legitimate rendering of the source's own "значительно". */
+// A clause that negates the claim ("Достоверность не оценивалась", "was not significant") does
+// not ASSERT significance, so a marker inside it is not an added claim. Clause = text between
+// sentence/clause punctuation; the negator must be a whole word.
+const NEGATORS = new RegExp(
+  `${WB_START}(?:не|нет|ни|без|недостаточно|отсутствует|отсутствуют|отсутствие|невозможно|not|no|never|without|cannot|insufficient|unable)${WB_END}|n't${WB_END}`, 'iu');
+const CLAUSE_SPLIT = /[.!?;:,\n]|\s[—–]\s/u;
+
+function isNegated(text: string, matchIndex: number): boolean {
+  let start = 0;
+  let end = text.length;
+  for (let i = matchIndex - 1; i >= 0; i--) if (CLAUSE_SPLIT.test(text[i])) { start = i + 1; break; }
+  for (let i = matchIndex; i < text.length; i++) if (CLAUSE_SPLIT.test(text[i])) { end = i; break; }
+  return NEGATORS.test(text.slice(start, end));
+}
+
+/** Wording about (statistical) significance or reliability that the OUTPUT asserts but the user's
+ *  source text never used. Lexical only - it catches the specific, recurring failure of an editor
+ *  adding "significantly"/"достоверно" where nothing was established, not every possible
+ *  strengthening of a claim (that needs a semantic verifier, which this project does not have):
+ *  it cannot tell a sentence's real meaning, only that a marker word appears outside a clause
+ *  with an explicit negator. Meaningful for same-language rewriting/editing; not applied to
+ *  translation, where "significantly" is a legitimate rendering of the source's own
+ *  "значительно". */
 export function checkNoAddedSignificanceClaims(source: string, output: string): AddedSignificanceCheck {
   const added = new Set<string>();
   for (const marker of SIGNIFICANCE_MARKERS) {
-    const inSource = Array.from(source.matchAll(marker)).length > 0;
-    if (inSource) continue;
-    for (const match of output.matchAll(marker)) added.add(match[0].toLowerCase());
+    if (Array.from(source.matchAll(marker)).length > 0) continue;
+    for (const match of output.matchAll(marker)) {
+      if (!isNegated(output, match.index ?? 0)) added.add(match[0].toLowerCase());
+    }
   }
   return { added: [...added], ok: added.size === 0 };
 }

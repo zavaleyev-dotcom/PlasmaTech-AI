@@ -194,14 +194,11 @@ export function blocksToPlainParagraphs(blocks: MdBlock[]): string[] {
   return out;
 }
 
-// A number with its unit ("−50 V", "5 mPa"): the part of a title whose letter case can carry
-// meaning (mPa vs MPa, mV vs MV, K vs k).
-const QUANTITY_RE = /[+\-\u2212]?\d[\d.,]*\s*[\p{L}°%µμ]+/gu;
-
 /** Only presentation is normalized: Markdown emphasis markers, Unicode dashes/minus to "-",
- *  curly quotes, runs of whitespace (incl. no-break/thin spaces) and trailing ".:;". Digits,
- *  signs ("+"/"-"), decimal separators, units and every other character are kept exactly, so
- *  "−50 V" and "+50 V", "0.5" and "05", "0,5" and "0.5", "5 mV" and "5 V" stay different. */
+ *  curly quotes, runs of whitespace (incl. no-break/thin spaces) and trailing ".:;". Letter
+ *  case, digits, signs ("+"/"-"), decimal separators, units and every other character are kept
+ *  exactly, so "−50 V" and "+50 V", "0.5" and "05", "0,5" and "0.5", "5 mV" and "5 V",
+ *  "mPa" and "MPa" stay different. */
 function canonicalTitle(text: string): string {
   return runsToPlainText(parseInline(text)).replace(/^#+\s*/, '').normalize('NFC')
     .replace(/[\u2010-\u2015\u2212]/g, '-')
@@ -210,14 +207,11 @@ function canonicalTitle(text: string): string {
 }
 
 /** True only when two titles are the same title written with different presentation. Used to
- *  decide whether a title in the body may be dropped as a duplicate of the document title -
- *  so any doubt must answer false (the title is then kept, never lost). Letter-case
- *  differences count as presentation only when every number+unit in the two titles is
- *  case-identical. */
+ *  decide whether a title in the body may be dropped as a duplicate of the document title - so
+ *  any doubt must answer false (the title is then kept, never lost). Letter case is NEVER
+ *  normalized: case carries meaning in scientific notation even without a number next to it
+ *  (mPa/MPa, Co/CO, K/k, kV/KV), and no rule can tell a unit or element symbol from an
+ *  ordinary word. A duplicate that differs only in capitalization is therefore kept. */
 export function titlesEquivalent(a: string, b: string): boolean {
-  const left = canonicalTitle(a);
-  const right = canonicalTitle(b);
-  if (left === right) return true;
-  if (left.toLocaleLowerCase() !== right.toLocaleLowerCase()) return false;
-  return JSON.stringify(left.match(QUANTITY_RE) ?? []) === JSON.stringify(right.match(QUANTITY_RE) ?? []);
+  return canonicalTitle(a) === canonicalTitle(b);
 }

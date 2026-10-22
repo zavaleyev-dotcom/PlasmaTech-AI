@@ -107,7 +107,9 @@ function docxRuns(runs: InlineRun[], size: number): TextRun[] {
   const out: TextRun[] = [];
   for (const run of runs) {
     run.text.split('\n').forEach((line, index) => {
-      out.push(new TextRun({ text: line, font: run.code ? DOCX_MONO_FONT : DOCX_FONT, size, bold: run.bold, italics: run.italic, ...(index > 0 ? { break: 1 } : {}) }));
+      // A TAB is a real Word tab, never a raw character inside the text node.
+      const children = line.split('\t').flatMap((part, i) => (i === 0 ? [part] : [new Tab(), part]));
+      out.push(new TextRun({ children, font: run.code ? DOCX_MONO_FONT : DOCX_FONT, size, bold: run.bold, italics: run.italic, ...(index > 0 ? { break: 1 } : {}) }));
     });
   }
   return out;
@@ -140,10 +142,13 @@ function docxBlocks(blocks: NonNullable<ExportSection['blocks']>, bodySize: numb
         }));
       });
     } else {
+      // Marker column widened for long markers ("100."), in twips: ~ digit 115, "." 57.
+      const markerTwips = Math.max(...block.items.map(item => [...item.marker].reduce((sum, ch) => sum + (/\d/.test(ch) ? 115 : 57), 0)));
+      const textLeft = Math.max(567, 283 + markerTwips + 112);
       for (const item of block.items) {
         out.push(new Paragraph({
           children: [new TextRun({ text: `${item.marker}\t`, font: DOCX_FONT, size: bodySize }), ...docxRuns(item.runs, bodySize)],
-          indent: { left: 567, hanging: 283 }, tabStops: [{ type: TabStopType.LEFT, position: 567 }], spacing: { after: 60, ...spacingLine },
+          indent: { left: textLeft, hanging: textLeft - 283 }, tabStops: [{ type: TabStopType.LEFT, position: textLeft }], spacing: { after: 60, ...spacingLine },
         }));
       }
     }
@@ -366,16 +371,28 @@ function pdfFontFor(run: InlineRun, base: 'Body' | 'Bold' = 'Body'): string {
   return bold && run.italic ? 'BoldItalic' : bold ? 'Bold' : run.italic ? 'Italic' : 'Body';
 }
 
+/** A TAB cannot be positioned inside PDF text (PDFKit emits a NUL byte for it, which shows up
+ *  as "a\u0000b"): it is displayed as 4 spaces. Display only - every other character is untouched. */
+function pdfText(text: string): string { return text.replace(/\t/g, '    '); }
+
 /** Writes bold/italic runs as ONE wrapped paragraph (PDFKit's `continued` chaining). */
 function pdfRuns(doc: PDFKit.PDFDocument, runs: InlineRun[], opts: { width: number; lineGap?: number; base?: 'Body' | 'Bold' }): void {
   const visible = runs.filter(r => r.text !== '');
   visible.forEach((run, index) => {
-    doc.font(pdfFontFor(run, opts.base)).text(run.text, { continued: index < visible.length - 1, width: opts.width, align: 'left', lineGap: opts.lineGap ?? 0 });
+    doc.font(pdfFontFor(run, opts.base)).text(pdfText(run.text), { continued: index < visible.length - 1, width: opts.width, align: 'left', lineGap: opts.lineGap ?? 0 });
   });
   if (visible.length === 0) doc.text('', { width: opts.width });
 }
 
-const PDF_LIST_INDENT = 16;
+const PDF_LIST_MIN_INDENT = 16;
+const PDF_LIST_MARKER_GAP = 6;
+
+/** Marker column width for a list: wide enough for its WIDEST marker ("100." is far wider than
+ *  "1."), never narrower than the default - a fixed 16 pt column made "100."/"101." run into
+ *  the item text. */
+export function listMarkerIndent(markerWidthsPt: number[]): number {
+  return Math.max(PDF_LIST_MIN_INDENT, Math.ceil(Math.max(0, ...markerWidthsPt)) + PDF_LIST_MARKER_GAP);
+}
 
 function pdfBlocks(
   doc: PDFKit.PDFDocument, blocks: NonNullable<ExportSection['blocks']>,
@@ -397,19 +414,21 @@ function pdfBlocks(
       for (const line of block.text.split('\n')) {
         ensureSpace(doc, 12, ctx.margins);
         // A tab cannot be positioned in PDF text: shown as 4 spaces (display only).
-        doc.text(line === '' ? ' ' : line.replace(/\t/g, '    '), ctx.margins.left + 8, doc.y, { width: ctx.contentWidth - 8, lineGap: 0 });
+        doc.text(line === '' ? ' ' : pdfText(line), ctx.margins.left + 8, doc.y, { width: ctx.contentWidth - 8, lineGap: 0 });
       }
       doc.x = ctx.margins.left;
       doc.font('Body').fontSize(ctx.bodySize).moveDown(0.3);
     } else {
+      doc.font('Body').fontSize(ctx.bodySize);
+      const indent = listMarkerIndent(block.items.map(item => doc.widthOfString(item.marker)));
       for (const item of block.items) {
         ensureSpace(doc, 14, ctx.margins);
         const left = ctx.margins.left;
         const top = doc.y;
-        doc.font('Body').text(item.marker, left, top, { width: PDF_LIST_INDENT, lineBreak: false });
-        doc.x = left + PDF_LIST_INDENT;
+        doc.font('Body').text(item.marker, left, top, { width: indent, lineBreak: false });
+        doc.x = left + indent;
         doc.y = top;
-        pdfRuns(doc, item.runs, { width: ctx.contentWidth - PDF_LIST_INDENT, lineGap: ctx.lineGap });
+        pdfRuns(doc, item.runs, { width: ctx.contentWidth - indent, lineGap: ctx.lineGap });
         doc.x = left;
         doc.moveDown(0.1);
       }
