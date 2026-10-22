@@ -26,17 +26,29 @@ export type MdBlock =
    *  the document title instead of repeating it in the body. */
   | { kind: 'title-label'; text: string };
 
-// Bold/italic delimiters must not touch a letter, digit or another "*" on the outside: that
-// keeps "2**3**2" and "a*b*c" (arithmetic, not emphasis) literal - when in doubt, keep the text.
-const INLINE_RE = /(?<![\p{L}\p{N}*])\*\*([^*\n]+?)\*\*(?![\p{L}\p{N}*])|(?<![\p{L}\p{N}*])\*(?![\s*])([^*\n]+?)(?<![\s*])\*(?![\p{L}\p{N}*])/gu;
+// Emphasis is recognized only where it is unambiguous; anywhere else the asterisks are text:
+//  - the opening delimiter must not follow a letter, digit, "*" or closing bracket, and the
+//    closing one must not precede a letter, digit, "*" or opening bracket ("2**3**2", "a*b*c",
+//    "(a)*(b)*(c)" are arithmetic, not emphasis);
+//  - no whitespace directly inside the delimiters ("2 ** 3 ** 2": "** 3 **" is never bold);
+//  - a span that is only a number/operator expression ("**3**", "*5*") is an exponent or a
+//    product far more often than emphasis, so it stays literal.
+// When in doubt the text is kept exactly as written.
+const EM_OPEN = String.raw`(?<![\p{L}\p{N}*)\]}])`;
+const EM_CLOSE = String.raw`(?![\p{L}\p{N}*(\[{])`;
+const INLINE_RE = new RegExp(
+  `${EM_OPEN}\\*\\*(?!\\s)([^*\\n]+?)(?<!\\s)\\*\\*${EM_CLOSE}|${EM_OPEN}\\*(?![\\s*])([^*\\n]+?)(?<![\\s*])\\*${EM_CLOSE}`, 'gu');
+const NUMERIC_ONLY_RE = /^[\d.,+\-\u2212()\s]+$/u;
 
 function parseEmphasis(text: string): InlineRun[] {
   const runs: InlineRun[] = [];
   let last = 0;
   for (const match of text.matchAll(INLINE_RE)) {
+    const content = match[1] ?? match[2];
+    if (NUMERIC_ONLY_RE.test(content)) continue;
     const index = match.index ?? 0;
     if (index > last) runs.push({ text: text.slice(last, index) });
-    runs.push(match[1] !== undefined ? { text: match[1], bold: true } : { text: match[2], italic: true });
+    runs.push(match[1] !== undefined ? { text: content, bold: true } : { text: content, italic: true });
     last = index + match[0].length;
   }
   if (last < text.length) runs.push({ text: text.slice(last) });
@@ -77,15 +89,15 @@ export function runsToPlainText(runs: InlineRun[]): string { return runs.map(r =
 const FENCE_OPEN_RE = /^( {0,3})(`{3,}|~{3,})([^`]*)$/u;
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/u;
 const HEADING_RE = /^(#{1,6})\s+(.+?)\s*#*\s*$/u;
-const BOLD_LINE_RE = /^\*\*([^*]+?)\*\*\s*:?\s*$/u;
+const BOLD_LINE_RE = /^\*\*(?!\s)([^*]+?)(?<!\s)\*\*\s*:?\s*$/u;
 const TITLE_LABEL_RE = /^\*\*(?:Title|Название|Заголовок)\s*:?\s*\*\*\s*:?\s*(.+)$/iu;
-const LIST_RE = /^[ \t]*(?:([-*•])|(\d{1,3}[.)]))\s+(.+)$/u;
+const LIST_RE = /^[ \t]*(?:([-*•])|(\d{1,6}[.)]))\s+(.+)$/u;
 const RULE_RE = /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/;
 const NUMBERED_HEADING_RE = /^(\d+(?:\.\d+)*)[.)]?\s/u;
 
 function boldLineHeadingLevel(inner: string): 1 | 2 | 3 | null {
   const text = inner.trim().replace(/:$/, '').trim();
-  if (!text || text.length > 120 || /[.!?]$/.test(text)) return null;
+  if (!text || text.length > 120 || /[.!?]$/.test(text) || NUMERIC_ONLY_RE.test(text)) return null;
   const numbered = NUMBERED_HEADING_RE.exec(text);
   if (!numbered) return 1;
   return Math.min(3, numbered[1].split('.').length) as 1 | 2 | 3;

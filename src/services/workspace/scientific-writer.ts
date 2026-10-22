@@ -571,35 +571,71 @@ const SIGNIFICANCE_MARKERS: readonly RegExp[] = [
 
 export interface AddedSignificanceCheck { added: string[]; ok: boolean }
 
-// A clause that negates the claim ("Достоверность не оценивалась", "was not significant") does
-// not ASSERT significance, so a marker inside it is not an added claim. Clause = text between
-// sentence/clause punctuation; the negator must be a whole word.
-const NEGATORS = new RegExp(
-  `${WB_START}(?:не|нет|ни|без|недостаточно|отсутствует|отсутствуют|отсутствие|невозможно|not|no|never|without|cannot|insufficient|unable)${WB_END}|n't${WB_END}`, 'iu');
-const CLAUSE_SPLIT = /[.!?;:,\n]|\s[—–]\s/u;
+// A marker is NOT an asserted claim only when a negation demonstrably scopes THAT marker:
+//   (A) a negator right before it, with at most one word in between - "не достоверен",
+//       "не является статистически значимым", "was not significant", "недостаточно достоверно" -
+//       except "не только"/"not only" (emphasis: "не только достоверен" asserts it);
+//   (B) a negated assessment verb right after it - "Достоверность не оценивалась",
+//       "Significance was not assessed";
+//   (C) a fixed "no data on / without assessment of" phrase directly before it.
+// Any other negator in the clause ("Без нагрева ... достоверно", "... получено без нагрева",
+// "Нагрев не применяли, результат достоверен") negates something else and suppresses nothing.
+// "без"/"without" are deliberately NOT negators: they negate the noun that follows them. Whenever
+// the scope is unclear the marker counts as a claim - a warning is preferred to a silent pass.
+// This is a conservative lexical heuristic, not an understanding of the sentence.
+const NEGATOR_WORD = /^(?:не|нет|ни|недостаточно|not|no|never|cannot|insufficient|unable|\p{L}+n't)$/iu;
+const EMPHASIS_WORD = /^(?:только|лишь|просто|only|merely|just)$/iu;
+const ASSESSMENT_VERBS = '(?:оцен\\p{L}*|определ\\p{L}*|провер\\p{L}*|подтвержд\\p{L}*|подтверждён|установ\\p{L}*|показан\\p{L}*|доказан\\p{L}*|исследовал\\p{L}*|рассчитыва\\p{L}*|анализиров\\p{L}*|'
+  + 'assess\\p{L}*|evaluat\\p{L}*|test\\p{L}*|determin\\p{L}*|establish\\p{L}*|confirm\\p{L}*|demonstrat\\p{L}*|calculat\\p{L}*|examin\\p{L}*|check\\p{L}*|measur\\p{L}*|verif\\p{L}*|comput\\p{L}*)';
+const NEGATED_ASSESSMENT_AFTER = new RegExp(`^\\s*(?:[\\p{L}\\p{N}'-]+\\s+){0,2}(?:не|not|\\p{L}+n't)\\s+(?:[\\p{L}'-]+\\s+)?${ASSESSMENT_VERBS}`, 'iu');
+const NO_DATA_PHRASE_BEFORE = new RegExp(
+  `(?:${WB_START}нет\\s+(?:данных|информации|сведений|оценки|подтверждения)\\s+(?:о|об|по|для)?|${WB_START}без\\s+(?:оценки|проверки|подтверждения|анализа|определения)|`
+  + `${WB_START}no\\s+(?:data|evidence|information)\\s+(?:on|about|of|for)|${WB_START}without\\s+(?:assessment|assessing|testing|confirmation|evaluation)\\s+(?:of)?)\\s*$`, 'iu');
+// A clause ends at sentence/clause punctuation or a spaced dash.
+const CLAUSE_BOUNDARY = /[.!?;:,\n]|\s[—–-]\s/gu;
 
-function isNegated(text: string, matchIndex: number): boolean {
-  let start = 0;
-  let end = text.length;
-  for (let i = matchIndex - 1; i >= 0; i--) if (CLAUSE_SPLIT.test(text[i])) { start = i + 1; break; }
-  for (let i = matchIndex; i < text.length; i++) if (CLAUSE_SPLIT.test(text[i])) { end = i; break; }
-  return NEGATORS.test(text.slice(start, end));
+function clauseAround(text: string, start: number, end: number): { before: string; after: string } {
+  let clauseStart = 0;
+  let clauseEnd = text.length;
+  for (const boundary of text.matchAll(CLAUSE_BOUNDARY)) {
+    const at = boundary.index ?? 0;
+    if (at + boundary[0].length <= start) clauseStart = at + boundary[0].length;
+    else if (at >= end) { clauseEnd = at; break; }
+  }
+  return { before: text.slice(clauseStart, start), after: text.slice(end, clauseEnd) };
+}
+
+function wordsOf(text: string): string[] {
+  return text.split(/\s+/u).map(w => w.replace(/^[^\p{L}\p{N}']+|[^\p{L}\p{N}']+$/gu, '')).filter(Boolean);
+}
+
+function isNegated(text: string, start: number, end: number): boolean {
+  const { before, after } = clauseAround(text, start, end);
+  const words = wordsOf(before);
+  const last = words[words.length - 1];
+  const beforeLast = words[words.length - 2];
+  if (last && NEGATOR_WORD.test(last)) return true;
+  if (beforeLast && NEGATOR_WORD.test(beforeLast) && last && !EMPHASIS_WORD.test(last)) return true;
+  if (NO_DATA_PHRASE_BEFORE.test(before)) return true;
+  return NEGATED_ASSESSMENT_AFTER.test(after);
 }
 
 /** Wording about (statistical) significance or reliability that the OUTPUT asserts but the user's
- *  source text never used. Lexical only - it catches the specific, recurring failure of an editor
- *  adding "significantly"/"достоверно" where nothing was established, not every possible
- *  strengthening of a claim (that needs a semantic verifier, which this project does not have):
- *  it cannot tell a sentence's real meaning, only that a marker word appears outside a clause
- *  with an explicit negator. Meaningful for same-language rewriting/editing; not applied to
- *  translation, where "significantly" is a legitimate rendering of the source's own
+ *  source text never asserted. Lexical only - it catches the specific, recurring failure of an
+ *  editor adding "significantly"/"достоверно" where nothing was established, not every possible
+ *  strengthening of a claim (that needs a semantic verifier, which this project does not have).
+ *  A marker the source only used in a negated form ("Достоверность не оценивалась") does not
+ *  excuse the output asserting it. Meaningful for same-language rewriting/editing; not applied
+ *  to translation, where "significantly" is a legitimate rendering of the source's own
  *  "значительно". */
 export function checkNoAddedSignificanceClaims(source: string, output: string): AddedSignificanceCheck {
   const added = new Set<string>();
   for (const marker of SIGNIFICANCE_MARKERS) {
-    if (Array.from(source.matchAll(marker)).length > 0) continue;
+    const assertedInSource = Array.from(source.matchAll(marker)).some(m => !isNegated(source, m.index ?? 0, (m.index ?? 0) + m[0].length));
+    if (assertedInSource) continue;
     for (const match of output.matchAll(marker)) {
-      if (!isNegated(output, match.index ?? 0)) added.add(match[0].toLowerCase());
+      const at = match.index ?? 0;
+      if (!isNegated(output, at, at + match[0].length)) added.add(match[0].toLowerCase());
     }
   }
   return { added: [...added], ok: added.size === 0 };
