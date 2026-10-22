@@ -1,27 +1,33 @@
 import { ScientificSearchError } from './errors';
 import { normalizeDoi } from './normalization';
 import { publicationTypes, MAX_SEARCH_OFFSET, type ScientificSearchQuery, type SearchContinuation } from './types';
-import { processContinuationStore, isValidContinuationToken, type ContinuationStore } from './continuation-store';
+import { processContinuationStore, isValidContinuationToken, queryFingerprint, type ContinuationBinding, type ContinuationStore } from './continuation-store';
 
 function invalid(message: string): never {
   throw new ScientificSearchError('INVALID_QUERY', message, 400);
 }
 
-/** F20 production remediation (Codex re-detection #4): the client's `continuation` is now a
- *  compact opaque TOKEN (a ContinuationStore key), never the continuation object itself - see
- *  continuation-store.ts for why. Resolved leniently, same as the previous design: an unknown
- *  token shape, or one the store has no (or an expired) session for, is never a 400 - it just
- *  means "start this combined search fresh" (offset 0, empty buffer), so a client bug or a
- *  stale/foreign/tampered token can never hard-fail a search, only reset its pagination state.
- *  Nothing about the ACTUAL continuation state (buffer, emittedKeys, provider offsets) is ever
- *  parsed from client JSON anymore - it is looked up verbatim from server memory, so it can
- *  never be lossily truncated or malformed by a client-side roundtrip. */
-function resolveContinuation(value: unknown, store: ContinuationStore): SearchContinuation | undefined {
-  if (!isValidContinuationToken(value)) return undefined;
-  return store.resolve(value);
+/** The client's `continuation` is an opaque ContinuationStore token. It is resolved only for
+ *  combined searches and must be bound to the SAME search parameters and the SAME client
+ *  context that created it. Anything else is an explicit error - never a silent restart:
+ *   - malformed shape        -> 400 INVALID_CONTINUATION
+ *   - unknown/expired/foreign -> 410 CONTINUATION_EXPIRED
+ *   - other search's token   -> 409 CONTINUATION_MISMATCH
+ *  An absent token (undefined/null) is the only way to start a combined search fresh. */
+function resolveContinuation(value: unknown, store: ContinuationStore, binding: ContinuationBinding): SearchContinuation | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isValidContinuationToken(value)) {
+    throw new ScientificSearchError('INVALID_CONTINUATION', 'Некорректный токен постраничного просмотра. Выполните поиск заново.', 400);
+  }
+  const resolution = store.resolve(value, binding);
+  if (resolution.status === 'ok') return resolution.state;
+  if (resolution.status === 'mismatch') {
+    throw new ScientificSearchError('CONTINUATION_MISMATCH', 'Токен постраничного просмотра относится к другому поисковому запросу. Выполните поиск заново.', 409);
+  }
+  throw new ScientificSearchError('CONTINUATION_EXPIRED', 'Сессия постраничного просмотра истекла или недействительна. Выполните поиск заново.', 410);
 }
 
-export function parseSearchQuery(input: unknown, store: ContinuationStore = processContinuationStore): ScientificSearchQuery {
+export function parseSearchQuery(input: unknown, store: ContinuationStore = processContinuationStore, clientId = ''): ScientificSearchQuery {
   if (!input || typeof input !== 'object' || Array.isArray(input)) invalid('Неверный формат поискового запроса.');
   const data = input as Record<string, unknown>;
   function text(name: string, max: number): string {
@@ -71,12 +77,16 @@ export function parseSearchQuery(input: unknown, store: ContinuationStore = proc
   if (type && !publicationTypes.some(item => item === type)) invalid('Неизвестный тип публикации.');
   const journalOnly = flag('journalOnly');
   if (journalOnly && type && type !== 'journal-article') invalid('Фильтр journal article несовместим с выбранным типом публикации.');
-  // F20: only meaningful for source: 'combined' - resolved regardless of `source` being valid
-  // (harmless if present but unused for a single-provider search), never required.
-  const continuation = source === 'combined' ? resolveContinuation(data.continuation, store) : undefined;
-  return {
-    query, keywords, doi: doi || '', yearFrom, yearTo, limit, source, sort, offset, continuation,
-    type: type as ScientificSearchQuery['type'], journalOnly,
-    hasDoi: flag('hasDoi'), hasAbstract: flag('hasAbstract'), openAccessOnly: flag('openAccessOnly'),
+  const hasDoi = flag('hasDoi');
+  const hasAbstract = flag('hasAbstract');
+  const openAccessOnly = flag('openAccessOnly');
+  const parsed: ScientificSearchQuery = {
+    query, keywords, doi: doi || '', yearFrom, yearTo, limit, source, sort, offset,
+    type: type as ScientificSearchQuery['type'], journalOnly, hasDoi, hasAbstract, openAccessOnly,
   };
+  // Only meaningful for source: 'combined' (ignored for single-provider searches).
+  if (source === 'combined') {
+    parsed.continuation = resolveContinuation(data.continuation, store, { fingerprint: queryFingerprint(parsed), clientId });
+  }
+  return parsed;
 }

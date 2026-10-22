@@ -3,7 +3,7 @@ import { CrossrefProvider } from '@/integrations/crossref';
 import { OpenAlexProvider } from '@/integrations/openalex';
 import { parseSearchQuery } from './validation';
 import { runSearch } from './pipeline';
-import { processContinuationStore, isValidContinuationToken, type ContinuationStore } from './continuation-store';
+import { processContinuationStore, isValidContinuationToken, queryFingerprint, type ContinuationStore } from './continuation-store';
 import type { ScientificSearchResult, ScientificSearchWireResult, ScientificSourceProvider } from './types';
 
 const providers = {
@@ -27,23 +27,24 @@ function rawIncomingToken(input: unknown): string | undefined {
  *  BOTH `result.continuation` (the token for the NEXT page) and `result.query.continuation`
  *  (echoing the token that was RECEIVED this request, never the resolved object) so the bulky
  *  server-side state can never leak into a response body either. */
-function toWireResult(result: ScientificSearchResult, store: ContinuationStore, incomingToken: string | undefined): ScientificSearchWireResult {
+function toWireResult(result: ScientificSearchResult, store: ContinuationStore, incomingToken: string | undefined, clientId: string): ScientificSearchWireResult {
   const { continuation, query, ...rest } = result;
   return {
     ...rest,
     query: { ...query, continuation: incomingToken },
-    continuation: continuation ? store.save(continuation) : undefined,
+    continuation: continuation ? store.save(continuation, { fingerprint: queryFingerprint(query), clientId }) : undefined,
   };
 }
 
 export async function searchPublications(
   input: unknown,
-  deps: { store?: ContinuationStore; crossref?: ScientificSourceProvider; openalex?: ScientificSourceProvider } = {},
+  deps: { store?: ContinuationStore; clientId?: string; crossref?: ScientificSourceProvider; openalex?: ScientificSourceProvider } = {},
 ): Promise<ScientificSearchWireResult> {
   const store = deps.store ?? processContinuationStore;
   const crossref = deps.crossref ?? providers.crossref;
   const openalex = deps.openalex ?? providers.openalex;
-  const query = parseSearchQuery(input, store);
+  const clientId = deps.clientId ?? '';
+  const query = parseSearchQuery(input, store, clientId);
   const result = await runSearch(query, query.source === 'combined' ? [crossref, openalex] : (query.source === 'crossref' ? crossref : openalex));
-  return toWireResult(result, store, rawIncomingToken(input));
+  return toWireResult(result, store, rawIncomingToken(input), clientId);
 }

@@ -9,6 +9,10 @@ import {
 import { PublicationCard } from './publication-card';
 import styles from './search.module.css';
 
+// The server rejected the pagination token (expired / malformed / belongs to another search).
+// Retrying the same request can never succeed - only an explicit fresh search can.
+const CONTINUATION_ERRORS = new Set(['CONTINUATION_EXPIRED', 'CONTINUATION_MISMATCH', 'INVALID_CONTINUATION']);
+
 const typeLabels: Record<string, string> = {
   'journal-article': 'Журнальная статья', 'proceedings-article': 'Статья конференции',
   'book-chapter': 'Глава книги', book: 'Книга', 'posted-content': 'Размещённый материал / препринт',
@@ -34,6 +38,7 @@ export function SciFinderSearch() {
   const [busy, setBusy] = useState(false);
   const [page, setPage] = useState(0);
   const lastRequest = useRef<ScientificSearchWireQuery | null>(null);
+  const lastTargetPage = useRef(0);
   const activeRequest = useRef<AbortController | null>(null);
   // F20: combined-mode-only continuation history, one entry per page - the client caches a
   // compact opaque token per page (never the underlying pagination state itself, which lives
@@ -53,6 +58,7 @@ export function SciFinderSearch() {
     const controller = new AbortController();
     activeRequest.current = controller;
     lastRequest.current = request;
+    lastTargetPage.current = targetPage;
     setBusy(true);
     setError(null);
     setResult(null);
@@ -115,6 +121,18 @@ export function SciFinderSearch() {
   function goToCombinedPage(targetPage: number) {
     if (!lastRequest.current) return;
     void search({ ...lastRequest.current, continuation: combinedHistory.current[targetPage] }, targetPage);
+  }
+
+  // Explicit, user-initiated restart after a rejected continuation: page 1 of the same search,
+  // with a clean history - never done silently.
+  function restartSearch() {
+    if (!lastRequest.current) return;
+    combinedHistory.current = [undefined];
+    void search({ ...lastRequest.current, offset: 0, continuation: undefined }, 0);
+  }
+
+  function retry() {
+    if (lastRequest.current) void search(lastRequest.current, lastTargetPage.current);
   }
 
   function example() {
@@ -190,8 +208,11 @@ export function SciFinderSearch() {
             <p>Сортировка действует на загруженную выборку. Совместная релевантность объединяет позиции в выдачах источников; неизвестные годы и цитирования идут в конце. Статус OA известен только из метаданных OpenAlex.</p>
           </div>}
         </div>
-        {result && result.warnings.length > 0 && <div className="notice" role="status"><div>{result.warnings.map(warning => <p key={warning}>{warning}</p>)}<button className="button secondary mt-4" disabled={busy} onClick={() => lastRequest.current && void search(lastRequest.current)}>Повторить запрос</button></div></div>}
-        {error && <div className={`${styles.status} ${styles.error}`} role="alert"><p>{error.message}</p>{error.retryable && <button className="button secondary mt-4" disabled={busy} onClick={() => lastRequest.current && void search(lastRequest.current)}>Повторить запрос</button>}</div>}
+        {result && result.warnings.length > 0 && <div className="notice" role="status"><div>{result.warnings.map(warning => <p key={warning}>{warning}</p>)}<button className="button secondary mt-4" disabled={busy} onClick={retry}>Повторить запрос</button></div></div>}
+        {error && <div className={`${styles.status} ${styles.error}`} role="alert"><p>{error.message}</p>
+          {CONTINUATION_ERRORS.has(error.code)
+            ? <button className="button secondary mt-4" disabled={busy} onClick={restartSearch}>Начать поиск заново</button>
+            : error.retryable && <button className="button secondary mt-4" disabled={busy} onClick={retry}>Повторить запрос</button>}</div>}
         {!busy && !error && !result && <p className={styles.status}>Введите тему, ключевые слова или DOI и нажмите «Найти публикации».</p>}
         {result && result.returned === 0 && page === 0 && <p className={`${styles.status} mt-4`}>Ничего не найдено. Уточните запрос, проверьте DOI или ослабьте фильтры.</p>}
         {result && result.returned === 0 && page > 0 && <p className={`${styles.status} mt-4`}>На этой странице результатов больше нет.</p>}

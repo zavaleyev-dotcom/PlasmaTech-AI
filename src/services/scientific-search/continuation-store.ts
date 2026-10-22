@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import type { SearchContinuation } from './types';
+import { createHash, randomUUID } from 'node:crypto';
+import type { ScientificSearchQuery, SearchContinuation } from './types';
 
 /** F20 production remediation (Codex re-detection #4): combined-mode continuation used to be
  *  the client's OWN cached, fully-serialized SearchContinuation object, echoed back verbatim
@@ -37,8 +37,8 @@ import type { SearchContinuation } from './types';
  *  each entry expires after SESSION_TTL_MS of inactivity (refreshed on every successful
  *  resolve(), so an actively-paged session does not expire mid-use). No SQLite, no persistent
  *  user data - purely an in-process cache that is fine to lose on restart: a lost/expired/
- *  unknown session degrades to "start this combined search over" (resolve() returns
- *  `undefined`, exactly like an omitted continuation), never a crash or a 500. Single-process
+ *  unknown session is reported explicitly (CONTINUATION_EXPIRED) so the UI can offer a
+ *  restart - never a crash or a 500, and never a silent reset to page one. Single-process
  *  only by design: safe here (this app runs `next start` as one Node process - route.ts pins
  *  `runtime = 'nodejs'`), and even in a hypothetical multi-instance deployment the worst case
  *  is a session landing on a different instance and gracefully resetting - never data
@@ -49,7 +49,33 @@ import type { SearchContinuation } from './types';
 export const MAX_CONTINUATION_SESSIONS = 500;
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes of inactivity
 
-interface Session { state: SearchContinuation; expiresAt: number }
+/** What a continuation token is bound to at save time and must match again at resolve time:
+ *  `fingerprint` ties it to the search that produced it (so query A's token can never page
+ *  query B), `clientId` to the anonymous per-browser context (so another client cannot replay
+ *  it). This app has no user accounts, so the client context is the anonymous cookie id the
+ *  search route issues - see route.ts. */
+export interface ContinuationBinding { fingerprint: string; clientId: string }
+
+export type ContinuationResolution =
+  | { status: 'ok'; state: SearchContinuation }
+  /** Unknown, expired, evicted, OR issued to a different client - deliberately indistinguishable,
+   *  so a foreign token cannot be probed for existence. */
+  | { status: 'unknown' }
+  /** A live token of THIS client, but issued for a different search. */
+  | { status: 'mismatch' };
+
+type FingerprintInput = Pick<ScientificSearchQuery, 'query' | 'keywords' | 'doi' | 'yearFrom' | 'yearTo' | 'limit' | 'source' | 'sort' | 'type' | 'journalOnly' | 'hasDoi' | 'hasAbstract' | 'openAccessOnly'>;
+
+/** Every parameter that shapes the result set - everything except `offset` and `continuation`,
+ *  which are pagination position, not search identity. */
+export function queryFingerprint(q: FingerprintInput): string {
+  return createHash('sha256').update(JSON.stringify([
+    q.query, q.keywords, q.doi, q.yearFrom ?? null, q.yearTo ?? null, q.limit, q.source, q.sort,
+    q.type, q.journalOnly, q.hasDoi, q.hasAbstract, q.openAccessOnly,
+  ])).digest('hex');
+}
+
+interface Session { state: SearchContinuation; binding: ContinuationBinding; expiresAt: number }
 
 export class ContinuationStore {
   private sessions = new Map<string, Session>();
@@ -58,7 +84,7 @@ export class ContinuationStore {
    *  expired first, then - if still at capacity - the single oldest entry (Map iteration is
    *  insertion order, so the first key is the oldest); this keeps memory bounded under
    *  sustained traffic without ever needing a background sweep. */
-  save(state: SearchContinuation): string {
+  save(state: SearchContinuation, binding: ContinuationBinding): string {
     this.evictExpired();
     while (this.sessions.size >= MAX_CONTINUATION_SESSIONS) {
       const oldest = this.sessions.keys().next().value;
@@ -66,19 +92,20 @@ export class ContinuationStore {
       this.sessions.delete(oldest);
     }
     const token = randomUUID();
-    this.sessions.set(token, { state, expiresAt: Date.now() + SESSION_TTL_MS });
+    this.sessions.set(token, { state, binding, expiresAt: Date.now() + SESSION_TTL_MS });
     return token;
   }
 
-  /** Never throws - an unknown, expired, or malformed token simply resolves to `undefined`,
-   *  exactly like an omitted continuation (a fresh start), matching this module's existing
-   *  "malformed pagination state degrades gracefully, never a hard error" philosophy. */
-  resolve(token: string): SearchContinuation | undefined {
+  /** Never throws. Callers must surface anything other than 'ok' to the user - a lost or
+   *  foreign token must never silently become a fresh first page. */
+  resolve(token: string, binding: ContinuationBinding): ContinuationResolution {
     const session = this.sessions.get(token);
-    if (!session) return undefined;
-    if (session.expiresAt < Date.now()) { this.sessions.delete(token); return undefined; }
+    if (!session) return { status: 'unknown' };
+    if (session.expiresAt < Date.now()) { this.sessions.delete(token); return { status: 'unknown' }; }
+    if (session.binding.clientId !== binding.clientId) return { status: 'unknown' };
+    if (session.binding.fingerprint !== binding.fingerprint) return { status: 'mismatch' };
     session.expiresAt = Date.now() + SESSION_TTL_MS; // sliding expiration - an active session never expires mid-use
-    return session.state;
+    return { status: 'ok', state: session.state };
   }
 
   private evictExpired(): void {
@@ -101,9 +128,8 @@ export class ContinuationStore {
 export const processContinuationStore = new ContinuationStore();
 
 export const CONTINUATION_TOKEN_MAX_LENGTH = 128;
-// Generous enough to comfortably fit randomUUID()'s own alphabet/length; a foreign or garbled
-// token just fails this check and is treated as absent (→ fresh start), never crashes anything
-// downstream.
+// Generous enough to comfortably fit randomUUID()'s own alphabet/length; a garbled token fails
+// this check and is rejected as INVALID_CONTINUATION (see validation.ts).
 const TOKEN_PATTERN = /^[A-Za-z0-9-]{1,128}$/;
 
 export function isValidContinuationToken(value: unknown): value is string {

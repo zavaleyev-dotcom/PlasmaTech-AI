@@ -19,7 +19,7 @@ import {
 } from '../src/services/scientific-search/types';
 import { POST } from '../src/app/api/scifinder/search/route';
 import { searchPublications } from '../src/services/scientific-search';
-import { ContinuationStore, MAX_CONTINUATION_SESSIONS } from '../src/services/scientific-search/continuation-store';
+import { ContinuationStore, MAX_CONTINUATION_SESSIONS, processContinuationStore, queryFingerprint } from '../src/services/scientific-search/continuation-store';
 
 const query = parseSearchQuery({ query: 'AlTiSiN coating cutting tools' });
 const fixture = {
@@ -718,7 +718,7 @@ test('F20 (bound fix #3) H. QUERY RESET: a brand-new query without continuation 
  *  store instance so unrelated tests' sessions can never collide. */
 async function wireSearch(
   request: Partial<ScientificSearchWireQuery>,
-  deps: { store: ContinuationStore; crossref: ScientificSourceProvider; openalex: ScientificSourceProvider },
+  deps: { store: ContinuationStore; clientId?: string; crossref: ScientificSourceProvider; openalex: ScientificSourceProvider },
 ): Promise<ScientificSearchWireResult> {
   const wireInput: unknown = JSON.parse(JSON.stringify(request));
   return searchPublications(wireInput, deps);
@@ -905,16 +905,172 @@ test('F20 (production remediation) BOUND REACHED: the depth bound is still hones
   assert.ok(sharedStore.size() <= MAX_CONTINUATION_SESSIONS, `store grew to ${sharedStore.size()} sessions, past its own MAX_CONTINUATION_SESSIONS bound of ${MAX_CONTINUATION_SESSIONS}`);
 });
 
-test('F20 (production remediation) MALFORMED CONTINUATION: a garbled or unknown (never-issued) token resolves gracefully to a fresh session - never a crash, never a 4xx/5xx', async () => {
-  const store = new ContinuationStore();
-  const crossref = makeListProvider('crossref', makeUniqueRecords('wire-malformed-cr', 5));
-  const openalex = makeListProvider('openalex', makeUniqueRecords('wire-malformed-oa', 5));
+async function rejection(promise: Promise<unknown>): Promise<ScientificSearchError> {
+  try { await promise; } catch (error) { assert.ok(error instanceof ScientificSearchError, 'must be a controlled ScientificSearchError'); return error; }
+  assert.fail('expected the request to be rejected, but it succeeded (a silent restart/first page)');
+}
 
-  for (const badToken of ['not a real token!! 🙂', 'A'.repeat(200), '', 'ffffffff-ffff-ffff-ffff-ffffffffffff']) {
-    const result = await wireSearch({ query: 'x', limit: 10, source: 'combined', continuation: badToken }, { store, crossref, openalex });
-    assert.equal(result.offset, 0, `a malformed/unknown token ("${badToken}") must degrade to a fresh start, not an error`);
-    assert.ok(result.publications.length > 0);
+test('F20 defect 1: malformed, unknown and expired continuation tokens are EXPLICIT errors - never HTTP 200 with a silent first page', async () => {
+  const store = new ContinuationStore();
+  const crossref = makeListProvider('crossref', makeUniqueRecords('exp-cr', 30));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('exp-oa', 30));
+  const deps = { store, crossref, openalex };
+
+  for (const bad of ['not a real token!! 🙂', 'A'.repeat(200), '']) {
+    const error = await rejection(wireSearch({ query: 'x', limit: 10, source: 'combined', continuation: bad }, deps));
+    assert.equal(error.code, 'INVALID_CONTINUATION');
+    assert.equal(error.status, 400);
   }
+  for (const bad of [123, {}, ['x'], true]) {
+    const error = await rejection(wireSearch({ query: 'x', limit: 10, source: 'combined', continuation: bad as never }, deps));
+    assert.equal(error.code, 'INVALID_CONTINUATION', `non-string token ${JSON.stringify(bad)}`);
+  }
+  const unknown = await rejection(wireSearch({ query: 'x', limit: 10, source: 'combined', continuation: 'ffffffff-ffff-ffff-ffff-ffffffffffff' }, deps));
+  assert.equal(unknown.code, 'CONTINUATION_EXPIRED');
+  assert.equal(unknown.status, 410);
+
+  // A real token that has genuinely expired (TTL elapsed) must report expiry, not restart.
+  const page1 = await wireSearch({ query: 'x', limit: 10, source: 'combined' }, deps);
+  const realNow = Date.now;
+  Date.now = () => realNow() + 31 * 60 * 1000;
+  try {
+    const expired = await rejection(wireSearch({ query: 'x', limit: 10, source: 'combined', continuation: page1.continuation }, deps));
+    assert.equal(expired.code, 'CONTINUATION_EXPIRED');
+  } finally { Date.now = realNow; }
+
+  // An absent token is still the one legitimate way to start fresh (query reset).
+  const fresh = await wireSearch({ query: 'x', limit: 10, source: 'combined' }, deps);
+  assert.equal(fresh.offset, 0);
+  assert.ok(fresh.publications.length > 0);
+});
+
+test('F20 defect 1: an evicted session (store at capacity) is reported as expired, and a valid token keeps working with sliding expiry', async () => {
+  const store = new ContinuationStore();
+  const crossref = makeListProvider('crossref', makeUniqueRecords('evict-cr', 30));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('evict-oa', 30));
+  const deps = { store, crossref, openalex };
+  const first = await wireSearch({ query: 'first', limit: 10, source: 'combined' }, deps);
+  for (let i = 0; i < MAX_CONTINUATION_SESSIONS; i++) await wireSearch({ query: `other ${i}`, limit: 10, source: 'combined' }, deps);
+  const error = await rejection(wireSearch({ query: 'first', limit: 10, source: 'combined', continuation: first.continuation }, deps));
+  assert.equal(error.code, 'CONTINUATION_EXPIRED', 'the oldest session was evicted - must say so, not silently restart');
+  const fresh = await wireSearch({ query: 'first', limit: 10, source: 'combined' }, deps);
+  const page2 = await wireSearch({ query: 'first', limit: 10, source: 'combined', continuation: fresh.continuation }, deps);
+  assert.ok(page2.publications.length > 0);
+});
+
+test('F20 defect 2: a live token of query A is rejected for query B, for any changed search parameter', async () => {
+  const store = new ContinuationStore();
+  const crossref = makeListProvider('crossref', makeUniqueRecords('iso-cr', 30));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('iso-oa', 30));
+  const deps = { store, clientId: 'client-1', crossref, openalex };
+  const base = { query: 'plasma A', limit: 10 as const, source: 'combined' as const };
+  const pageA1 = await wireSearch(base, deps);
+  assert.ok(pageA1.continuation);
+
+  const variants: Array<Partial<ScientificSearchWireQuery>> = [
+    { query: 'plasma B' }, { keywords: 'PVD' }, { doi: '10.1234/abc' }, { limit: 25 }, { sort: 'year' },
+    { yearFrom: 2020 }, { yearTo: 2024 }, { type: 'book' }, { journalOnly: true }, { hasDoi: true },
+    { hasAbstract: true }, { openAccessOnly: true },
+  ];
+  for (const change of variants) {
+    const error = await rejection(wireSearch({ ...base, ...change, continuation: pageA1.continuation }, deps));
+    assert.equal(error.code, 'CONTINUATION_MISMATCH', `changing ${JSON.stringify(change)} must invalidate the token`);
+    assert.equal(error.status, 409);
+  }
+  // The mismatch attempts must not have burned or altered the original session.
+  const pageA2 = await wireSearch({ ...base, continuation: pageA1.continuation }, deps);
+  assert.equal(pageA2.returned, 10);
+});
+
+test('F20 defect 2: a token cannot be used by a different client context, and a foreign token is indistinguishable from an unknown one', async () => {
+  const store = new ContinuationStore();
+  const crossref = makeListProvider('crossref', makeUniqueRecords('cli-cr', 30));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('cli-oa', 30));
+  const request = { query: 'same query', limit: 10 as const, source: 'combined' as const };
+  const owner = { store, clientId: 'client-owner', crossref, openalex };
+  const attacker = { store, clientId: 'client-attacker', crossref, openalex };
+  const page1 = await wireSearch(request, owner);
+
+  const foreign = await rejection(wireSearch({ ...request, continuation: page1.continuation }, attacker));
+  assert.equal(foreign.code, 'CONTINUATION_EXPIRED', 'identical query but another client: rejected');
+  const unknown = await rejection(wireSearch({ ...request, continuation: 'ffffffff-ffff-ffff-ffff-ffffffffffff' }, attacker));
+  assert.equal(foreign.code, unknown.code, 'no oracle: a foreign token looks exactly like an unknown one');
+  assert.equal(foreign.status, unknown.status);
+  assert.equal(foreign.message, unknown.message);
+
+  const page2 = await wireSearch({ ...request, continuation: page1.continuation }, owner);
+  assert.equal(page2.returned, 10, 'the legitimate owner is unaffected by the rejected attempt');
+});
+
+test('F20 defects 1+2 do not regress lossless pagination, back navigation or query reset (same client, same query)', async () => {
+  const store = new ContinuationStore();
+  const crossref = makeListProvider('crossref', makeUniqueRecords('reg-cr', 25));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('reg-oa', 25));
+  const deps = { store, clientId: 'client-1', crossref, openalex };
+  const request = { query: 'regression', limit: 25 as const, source: 'combined' as const };
+
+  const page1 = await wireSearch(request, deps);
+  const page2 = await wireSearch({ ...request, continuation: page1.continuation }, deps);
+  const dois = [...page1.publications, ...page2.publications].map(p => p.doi);
+  assert.equal(dois.length, 50);
+  assert.equal(new Set(dois).size, 50, '0 lost, 0 duplicated');
+
+  // back navigation replays a cached token (same token twice) deterministically
+  const again = await wireSearch({ ...request, continuation: page1.continuation }, deps);
+  assert.deepEqual(again.publications.map(p => p.doi), page2.publications.map(p => p.doi));
+
+  // an offset change alone is pagination position, not search identity
+  const withOffset = await wireSearch({ ...request, offset: 0, continuation: page1.continuation }, deps);
+  assert.equal(withOffset.returned, page2.returned);
+
+  // query reset: a different query with NO token starts independently
+  const reset = await wireSearch({ ...request, query: 'another topic' }, deps);
+  assert.notEqual(reset.continuation, page1.continuation);
+});
+
+test('F20 defect 2: a continuation sent with a single-provider source is ignored (no error, no state leak)', async () => {
+  const store = new ContinuationStore();
+  const crossref = makeListProvider('crossref', makeUniqueRecords('sp-cr', 30));
+  const openalex = makeListProvider('openalex', makeUniqueRecords('sp-oa', 30));
+  const result = await wireSearch({ query: 'x', limit: 10, source: 'crossref', continuation: 'ffffffff-ffff-ffff-ffff-ffffffffffff' }, { store, crossref, openalex });
+  assert.equal(result.continuation, undefined);
+  assert.ok(result.publications.length > 0);
+});
+
+test('F20 route: the API issues an httpOnly anonymous client cookie, reports an unknown token as HTTP 410, and a malformed one as HTTP 400', async () => {
+  const send = (body: unknown, cookie?: string) => POST(new Request('http://localhost/api/scifinder/search', {
+    method: 'POST', body: JSON.stringify(body), headers: cookie ? { cookie } : {},
+  }));
+  const expired = await send({ query: 'x', source: 'combined', limit: 10, continuation: 'ffffffff-ffff-ffff-ffff-ffffffffffff' });
+  assert.equal(expired.status, 410);
+  assert.equal((await expired.json()).error.code, 'CONTINUATION_EXPIRED');
+  const setCookie = expired.headers.get('set-cookie') ?? '';
+  assert.match(setCookie, /sf_ctx=[0-9a-f-]{36}/);
+  assert.match(setCookie, /HttpOnly/i);
+  assert.match(setCookie, /SameSite=strict/i);
+
+  const existing = 'sf_ctx=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  const malformed = await send({ query: 'x', source: 'combined', limit: 10, continuation: 'bad token!' }, existing);
+  assert.equal(malformed.status, 400);
+  assert.equal((await malformed.json()).error.code, 'INVALID_CONTINUATION');
+  assert.equal(malformed.headers.get('set-cookie'), null, 'an existing client id is not re-issued');
+});
+
+test('F20 route: a token saved for one cookie id cannot be used with another cookie id', async () => {
+  const state = { crossrefOffset: 0, openalexOffset: 0, crossrefTotal: null, openalexTotal: null, crossrefExhausted: false, openalexExhausted: false, buffer: [], emittedKeys: [] };
+  const parsed = parseSearchQuery({ query: 'routeq', source: 'combined', limit: 10 });
+  const token = processContinuationStore.save(state, { fingerprint: queryFingerprint(parsed), clientId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' });
+  const response = await POST(new Request('http://localhost/api/scifinder/search', {
+    method: 'POST', body: JSON.stringify({ query: 'routeq', source: 'combined', limit: 10, continuation: token }),
+    headers: { cookie: 'sf_ctx=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' },
+  }));
+  assert.equal(response.status, 410);
+  const mismatch = await POST(new Request('http://localhost/api/scifinder/search', {
+    method: 'POST', body: JSON.stringify({ query: 'different', source: 'combined', limit: 10, continuation: token }),
+    headers: { cookie: 'sf_ctx=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+  }));
+  assert.equal(mismatch.status, 409);
+  assert.equal((await mismatch.json()).error.code, 'CONTINUATION_MISMATCH');
 });
 
 test('F20 (production remediation) OVERSIZED CONTINUATION: a huge continuation value is rejected as a controlled 413, never a 500, via the REAL POST route handler', async () => {
