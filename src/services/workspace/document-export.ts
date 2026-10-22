@@ -8,7 +8,7 @@
 
 import 'server-only';
 import path from 'node:path';
-import { Document, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, Packer, PageBreak, AlignmentType, VerticalAlign, TabStopType } from 'docx';
+import { Document, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, Packer, PageBreak, AlignmentType, VerticalAlign, TabStopType, Tab, ShadingType } from 'docx';
 import PDFDocument from 'pdfkit';
 import type { MdBlock, InlineRun } from './scientific-markdown';
 
@@ -78,6 +78,7 @@ export interface RenderOptions {
 
 // ---------- DOCX renderer ----------
 
+const DOCX_MONO_FONT = 'Courier New'; // code and inline code: fixed-width, spaces significant
 const DOCX_FONT = 'Times New Roman'; // ships with every Word install and renders Cyrillic natively
 const BODY_SIZE = 22; // half-points -> 11pt (default when no formatting profile is given)
 const HEADING_SIZE = 26; // half-points -> 13pt (default)
@@ -106,7 +107,7 @@ function docxRuns(runs: InlineRun[], size: number): TextRun[] {
   const out: TextRun[] = [];
   for (const run of runs) {
     run.text.split('\n').forEach((line, index) => {
-      out.push(new TextRun({ text: line, font: DOCX_FONT, size, bold: run.bold, italics: run.italic, ...(index > 0 ? { break: 1 } : {}) }));
+      out.push(new TextRun({ text: line, font: run.code ? DOCX_MONO_FONT : DOCX_FONT, size, bold: run.bold, italics: run.italic, ...(index > 0 ? { break: 1 } : {}) }));
     });
   }
   return out;
@@ -126,6 +127,18 @@ function docxBlocks(blocks: NonNullable<ExportSection['blocks']>, bodySize: numb
       }));
     } else if (block.kind === 'paragraph') {
       out.push(new Paragraph({ children: docxRuns(block.runs, bodySize), spacing: { after: 100, ...spacingLine } }));
+    } else if (block.kind === 'code') {
+      const codeLines = block.text.split('\n');
+      codeLines.forEach((line, index) => {
+        // One paragraph per line: every space is kept (the docx writer marks the text as
+        // space-preserving) and each tab becomes a real Word tab, never collapsed.
+        const children = line.split('\t').flatMap((part, i) => (i === 0 ? [part] : [new Tab(), part]));
+        out.push(new Paragraph({
+          children: [new TextRun({ children, font: DOCX_MONO_FONT, size: Math.max(bodySize - 2, 16) })],
+          shading: { type: ShadingType.CLEAR, fill: 'F2F2F2' }, keepLines: true,
+          spacing: { after: index === codeLines.length - 1 ? 120 : 0 },
+        }));
+      });
     } else {
       for (const item of block.items) {
         out.push(new Paragraph({
@@ -223,6 +236,7 @@ export async function renderGenericDocx(viewModel: GenericDocumentViewModel, opt
 // stays correct without asking either bundler to trace or load the .ttf as a module.
 const PDF_FONT_REGULAR = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans.ttf');
 const PDF_FONT_BOLD = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans-Bold.ttf');
+const PDF_FONT_MONO = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSansMono.ttf');
 const PDF_FONT_ITALIC = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans-Oblique.ttf');
 const PDF_FONT_BOLD_ITALIC = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans-BoldOblique.ttf');
 const PDF_MARGIN = 56;
@@ -255,6 +269,7 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
       const doc = new PDFDocument({ size: 'A4', layout: landscape ? 'landscape' : 'portrait', margins, bufferPages: true });
       doc.registerFont('Body', PDF_FONT_REGULAR);
       doc.registerFont('Bold', PDF_FONT_BOLD);
+      doc.registerFont('Mono', PDF_FONT_MONO);
       doc.registerFont('Italic', PDF_FONT_ITALIC);
       doc.registerFont('BoldItalic', PDF_FONT_BOLD_ITALIC);
       doc.font('Body');
@@ -346,6 +361,7 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
 }
 
 function pdfFontFor(run: InlineRun, base: 'Body' | 'Bold' = 'Body'): string {
+  if (run.code) return 'Mono';
   const bold = run.bold || base === 'Bold';
   return bold && run.italic ? 'BoldItalic' : bold ? 'Bold' : run.italic ? 'Italic' : 'Body';
 }
@@ -376,6 +392,15 @@ function pdfBlocks(
       ensureSpace(doc, 14, ctx.margins);
       pdfRuns(doc, block.runs, { width: ctx.contentWidth, lineGap: ctx.lineGap });
       doc.moveDown(0.2);
+    } else if (block.kind === 'code') {
+      doc.font('Mono').fontSize(Math.max(ctx.bodySize - 1, 7));
+      for (const line of block.text.split('\n')) {
+        ensureSpace(doc, 12, ctx.margins);
+        // A tab cannot be positioned in PDF text: shown as 4 spaces (display only).
+        doc.text(line === '' ? ' ' : line.replace(/\t/g, '    '), ctx.margins.left + 8, doc.y, { width: ctx.contentWidth - 8, lineGap: 0 });
+      }
+      doc.x = ctx.margins.left;
+      doc.font('Body').fontSize(ctx.bodySize).moveDown(0.3);
     } else {
       for (const item of block.items) {
         ensureSpace(doc, 14, ctx.margins);

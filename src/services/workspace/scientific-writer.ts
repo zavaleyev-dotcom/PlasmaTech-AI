@@ -556,9 +556,17 @@ export function checkNoInventedNumbers(input: ScientificWriterInput, generatedTe
   return { invented: invented.map(t => t.raw), ok: invented.length === 0 };
 }
 
+// Word boundaries are Unicode-aware lookarounds: JS's \b is ASCII-only even with the `u` flag,
+// so "\bдостоверн" can never match - there is no \b between a space and "д". "недостоверно"
+// (the opposite claim) is deliberately NOT matched: a letter precedes the stem.
+const WB_START = String.raw`(?<![\p{L}\p{N}])`;
+const WB_END = String.raw`(?![\p{L}\p{N}])`;
 const SIGNIFICANCE_MARKERS: readonly RegExp[] = [
-  /\bsignificant(?:ly)?\b/giu, /\bstatistically\b/giu, /\bp\s*[<=≤]\s*0?[.,]\d+/giu,
-  /статистическ\p{L}*\s+значим\p{L}*/giu, /\bдостоверн\p{L}*/giu,
+  new RegExp(`${WB_START}significant(?:ly)?${WB_END}`, 'giu'),
+  new RegExp(`${WB_START}statistically${WB_END}`, 'giu'),
+  new RegExp(`${WB_START}p\\s*[<=≤]\\s*0?[.,]\\d+`, 'giu'),
+  new RegExp(`${WB_START}статистическ\\p{L}*\\s+значим\\p{L}*`, 'giu'),
+  new RegExp(`${WB_START}достоверн\\p{L}*`, 'giu'),
 ];
 
 export interface AddedSignificanceCheck { added: string[]; ok: boolean }

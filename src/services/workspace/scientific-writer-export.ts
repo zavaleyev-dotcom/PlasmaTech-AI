@@ -9,7 +9,7 @@
 import 'server-only';
 import { DOCUMENT_TYPES, DOCUMENT_TYPE_LABELS, type DocumentType } from './scientific-writer';
 import { EXPORT_FORMATS, type ExportFormat } from './techdoc-export-types';
-import { parseMarkdown, blocksToPlainParagraphs, normalizeForCompare, runsToPlainText, type MdBlock } from './scientific-markdown';
+import { parseMarkdown, blocksToPlainParagraphs, titlesEquivalent, runsToPlainText, type MdBlock } from './scientific-markdown';
 import { renderGenericDocx, renderGenericPdf, sanitizeFilenameSegment, type GenericDocumentViewModel, type ExportSection, type ExportMetadataItem } from './document-export';
 import {
   REFERENCE_TYPES, CITATION_STYLES, CITATION_STYLE_LABELS, DOCUMENT_PROFILES, FORMATTING_PROFILES,
@@ -91,7 +91,7 @@ function separateTitle(blocks: MdBlock[], userTitle: string | undefined): { titl
   else if (first?.kind === 'heading' && first.mdLevel === 1 && blocks.some(b => b.kind === 'heading' && b.mdLevel === 2)) candidate = runsToPlainText(first.runs).trim();
   if (!candidate) return { body: keepInBody(blocks) };
   if (!userTitle) return { title: candidate, body: keepInBody(blocks.slice(1)) };
-  if (normalizeForCompare(candidate) === normalizeForCompare(userTitle)) return { body: keepInBody(blocks.slice(1)) };
+  if (titlesEquivalent(candidate, userTitle)) return { body: keepInBody(blocks.slice(1)) };
   return { body: keepInBody(blocks) };
 }
 

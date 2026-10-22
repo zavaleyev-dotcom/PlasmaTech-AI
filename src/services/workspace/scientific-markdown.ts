@@ -2,7 +2,8 @@
  *  scientific drafts actually use, so DOCX/PDF export can turn it into real document structure
  *  instead of leaving "**Abstract:**" and "## Methods" as literal text.
  *
- *  Supported: "#"-"######" headings; a line that is ONLY a bold span ("**1. Introduction**",
+ *  Supported: fenced code blocks (``` or ~~~) and `inline code`, kept character-for-character
+ *  (nothing inside code is ever interpreted as Markdown); "#"-"######" headings; a line that is ONLY a bold span ("**1. Introduction**",
  *  "**Abstract:**") as a heading; **bold** and *italic* inline; "-", "*", "•" bullets and
  *  "1." / "1)" numbered items (their numbers are kept exactly as written); "---" rules are
  *  dropped (a separator, not content).
@@ -11,20 +12,25 @@
  *  unbalanced asterisks, "5*3". The parser never rewrites, reorders or removes anything that
  *  carries content; it only strips the marker characters of the constructs it understands. */
 
-export interface InlineRun { text: string; bold?: boolean; italic?: boolean }
+export interface InlineRun { text: string; bold?: boolean; italic?: boolean; code?: boolean }
 export interface ListItem { marker: string; runs: InlineRun[] }
 
 export type MdBlock =
   | { kind: 'heading'; level: 1 | 2 | 3; mdLevel: number; runs: InlineRun[] }
   | { kind: 'paragraph'; runs: InlineRun[] }
   | { kind: 'list'; items: ListItem[] }
+  /** A fenced code block: `text` is the exact content between the fences (newlines, spaces and
+   *  tabs untouched). */
+  | { kind: 'code'; text: string; lang?: string }
   /** A leading "**Title:** …" / "**Название:** …" line - reported so the exporter can use it as
    *  the document title instead of repeating it in the body. */
   | { kind: 'title-label'; text: string };
 
-const INLINE_RE = /\*\*([^*\n]+?)\*\*|(?<![\p{L}\p{N}*])\*(?![\s*])([^*\n]+?)(?<![\s*])\*(?![\p{L}\p{N}*])/gu;
+// Bold/italic delimiters must not touch a letter, digit or another "*" on the outside: that
+// keeps "2**3**2" and "a*b*c" (arithmetic, not emphasis) literal - when in doubt, keep the text.
+const INLINE_RE = /(?<![\p{L}\p{N}*])\*\*([^*\n]+?)\*\*(?![\p{L}\p{N}*])|(?<![\p{L}\p{N}*])\*(?![\s*])([^*\n]+?)(?<![\s*])\*(?![\p{L}\p{N}*])/gu;
 
-export function parseInline(text: string): InlineRun[] {
+function parseEmphasis(text: string): InlineRun[] {
   const runs: InlineRun[] = [];
   let last = 0;
   for (const match of text.matchAll(INLINE_RE)) {
@@ -34,11 +40,42 @@ export function parseInline(text: string): InlineRun[] {
     last = index + match[0].length;
   }
   if (last < text.length) runs.push({ text: text.slice(last) });
+  return runs;
+}
+
+/** Splits `text` into code spans (a run of N backticks, content, the SAME run of N backticks -
+ *  CommonMark's rule, so ``a`b`` works) and the text between them. An unmatched backtick run
+ *  is ordinary text. Code content is never touched. */
+export function parseInline(text: string): InlineRun[] {
+  const runs: InlineRun[] = [];
+  let plainStart = 0;
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] !== '`') { i++; continue; }
+    let n = 0;
+    while (text[i + n] === '`') n++;
+    let close = -1;
+    for (let j = i + n; j < text.length; j++) {
+      if (text[j] !== '`') continue;
+      let m = 0;
+      while (text[j + m] === '`') m++;
+      if (m === n) { close = j; break; }
+      j += m - 1;
+    }
+    if (close === -1) { i += n; continue; }
+    if (i > plainStart) runs.push(...parseEmphasis(text.slice(plainStart, i)));
+    runs.push({ text: text.slice(i + n, close), code: true });
+    i = close + n;
+    plainStart = i;
+  }
+  if (plainStart < text.length) runs.push(...parseEmphasis(text.slice(plainStart)));
   return runs.length > 0 ? runs : [{ text }];
 }
 
 export function runsToPlainText(runs: InlineRun[]): string { return runs.map(r => r.text).join(''); }
 
+const FENCE_OPEN_RE = /^( {0,3})(`{3,}|~{3,})([^`]*)$/u;
+const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/u;
 const HEADING_RE = /^(#{1,6})\s+(.+?)\s*#*\s*$/u;
 const BOLD_LINE_RE = /^\*\*([^*]+?)\*\*\s*:?\s*$/u;
 const TITLE_LABEL_RE = /^\*\*(?:Title|Название|Заголовок)\s*:?\s*\*\*\s*:?\s*(.+)$/iu;
@@ -74,11 +111,31 @@ export function parseMarkdown(text: string): MdBlock[] {
   };
   const flushAll = () => { flushParagraph(); flushList(); };
 
-  for (const rawLine of text.replace(/\r\n?/g, '\n').split('\n')) {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  for (let index = 0; index < lines.length; index++) {
+    const rawLine = lines[index];
     const line = rawLine.replace(/\s+$/, '');
     if (line.trim() === '') { flushAll(); continue; }
     const wasFirst = firstContentLine;
     firstContentLine = false;
+
+    // Fenced code: everything up to the matching closing fence (or the end of the text) is
+    // taken verbatim - no heading, list, emphasis or rule detection happens inside it.
+    const fence = FENCE_OPEN_RE.exec(rawLine);
+    if (fence) {
+      flushAll();
+      const marker = fence[2];
+      const body: string[] = [];
+      let next = index + 1;
+      for (; next < lines.length; next++) {
+        const closing = FENCE_CLOSE_RE.exec(lines[next]);
+        if (closing && closing[1][0] === marker[0] && closing[1].length >= marker.length) break;
+        body.push(lines[next]);
+      }
+      blocks.push({ kind: 'code', text: body.join('\n'), ...(fence[3].trim() ? { lang: fence[3].trim() } : {}) });
+      index = next;
+      continue;
+    }
 
     if (RULE_RE.test(line)) { flushAll(); continue; }
 
@@ -131,13 +188,36 @@ export function blocksToPlainParagraphs(blocks: MdBlock[]): string[] {
     if (block.kind === 'heading') out.push(runsToPlainText(block.runs));
     else if (block.kind === 'paragraph') out.push(runsToPlainText(block.runs));
     else if (block.kind === 'title-label') out.push(block.text);
+    else if (block.kind === 'code') out.push(block.text);
     else out.push(block.items.map(i => `${i.marker} ${runsToPlainText(i.runs)}`).join('\n'));
   }
   return out;
 }
 
-/** Comparison form for "is this the same title": case, punctuation, markup and spacing
- *  insensitive, Unicode-normalized. */
-export function normalizeForCompare(text: string): string {
-  return text.normalize('NFKC').toLowerCase().replace(/[*_#`]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+// A number with its unit ("−50 V", "5 mPa"): the part of a title whose letter case can carry
+// meaning (mPa vs MPa, mV vs MV, K vs k).
+const QUANTITY_RE = /[+\-\u2212]?\d[\d.,]*\s*[\p{L}°%µμ]+/gu;
+
+/** Only presentation is normalized: Markdown emphasis markers, Unicode dashes/minus to "-",
+ *  curly quotes, runs of whitespace (incl. no-break/thin spaces) and trailing ".:;". Digits,
+ *  signs ("+"/"-"), decimal separators, units and every other character are kept exactly, so
+ *  "−50 V" and "+50 V", "0.5" and "05", "0,5" and "0.5", "5 mV" and "5 V" stay different. */
+function canonicalTitle(text: string): string {
+  return runsToPlainText(parseInline(text)).replace(/^#+\s*/, '').normalize('NFC')
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"')
+    .replace(/\s+/g, ' ').trim().replace(/[.:;]+$/, '').trim();
+}
+
+/** True only when two titles are the same title written with different presentation. Used to
+ *  decide whether a title in the body may be dropped as a duplicate of the document title -
+ *  so any doubt must answer false (the title is then kept, never lost). Letter-case
+ *  differences count as presentation only when every number+unit in the two titles is
+ *  case-identical. */
+export function titlesEquivalent(a: string, b: string): boolean {
+  const left = canonicalTitle(a);
+  const right = canonicalTitle(b);
+  if (left === right) return true;
+  if (left.toLocaleLowerCase() !== right.toLocaleLowerCase()) return false;
+  return JSON.stringify(left.match(QUANTITY_RE) ?? []) === JSON.stringify(right.match(QUANTITY_RE) ?? []);
 }

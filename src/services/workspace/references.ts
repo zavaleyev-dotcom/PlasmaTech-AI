@@ -250,7 +250,15 @@ export function formatReferenceApa(ref: Reference): string {
   } else if (ref.type !== 'thesis' && ref.containerTitle) {
     container = endSentence(ref.containerTitle);
   }
-  const link = ref.doi ? `https://doi.org/${ref.doi}` : ref.url ? (ref.type === 'website' && ref.accessDate ? `Retrieved ${ref.accessDate}, from ${ref.url}` : ref.url) : undefined;
+  if (ref.type === 'website') {
+    // A web source keeps EVERY locator it was given: the page URL (with the access date, if any)
+    // and the DOI - never one silently replacing the other.
+    const doiLink = ref.doi ? `https://doi.org/${ref.doi}` : undefined;
+    const target = ref.url ?? doiLink;
+    const located = target ? (ref.accessDate ? `Retrieved ${ref.accessDate}, from ${target}` : target) : undefined;
+    return joinClauses([authors, year, title, container, located, ref.url ? doiLink : undefined]);
+  }
+  const link = ref.doi ? `https://doi.org/${ref.doi}` : ref.url;
   return joinClauses([authors, year, title, container, link]);
 }
 
@@ -287,9 +295,19 @@ export function formatReferenceIeee(ref: Reference, number: number): string {
     case 'report':
       clauses = [authorsClause, quoted, ref.containerTitle ? `${ref.containerTitle},` : undefined, 'Rep.,', yearWith(ref.year !== undefined ? String(ref.year) : undefined, !!link), link];
       break;
-    case 'website':
-      clauses = [authorsClause, ref.title ? `"${ref.title}."` : undefined, ref.containerTitle ? `${ref.containerTitle}.` : undefined, ref.url ? `${ref.url}${ref.accessDate ? ` (accessed ${ref.accessDate}).` : '.'}` : undefined];
+    case 'website': {
+      // URL, DOI, year and access date are all kept when present; none is ever invented.
+      const accessed = ref.accessDate ? `(accessed ${ref.accessDate}).` : undefined;
+      clauses = [
+        authorsClause, ref.title ? `"${ref.title}."` : undefined, ref.containerTitle ? `${ref.containerTitle}.` : undefined,
+        ref.year !== undefined ? `${ref.year}.` : undefined,
+        ref.url ? `${ref.url}` : undefined, ref.url ? accessed : undefined,
+        ref.doi ? `doi: ${ref.doi}.` : undefined, ref.url ? undefined : accessed,
+      ];
+      // Without an access date the URL still needs its closing period.
+      if (ref.url && !accessed) clauses[4] = `${ref.url}.`;
       break;
+    }
     default: {
       const container = ref.containerTitle ? `${ref.containerTitle},` : undefined;
       const vol = ref.volume ? `vol. ${ref.volume},` : undefined;
@@ -318,9 +336,16 @@ export function formatReferenceGost(ref: Reference, number: number): string {
     case 'thesis':
       clauses = [authors, ref.title ? `${ref.title} : дис.` : 'дис.', ref.containerTitle || ref.year !== undefined ? `– ${[ref.containerTitle, ref.year].filter(v => v !== undefined && v !== '').join(', ')}.` : undefined, pages, doiOrUrl];
       break;
-    case 'website':
-      clauses = [authors, ref.title ? `${ref.title} [Электронный ресурс].` : undefined, ref.containerTitle ? `– ${ref.containerTitle}.` : undefined, year, ref.url ? `– URL: ${ref.url}${ref.accessDate ? ` (дата обращения: ${ref.accessDate})` : ''}.` : undefined];
+    case 'website': {
+      const accessed = ref.accessDate ? ` (дата обращения: ${ref.accessDate})` : '';
+      clauses = [
+        authors, ref.title ? `${ref.title} [Электронный ресурс].` : undefined, ref.containerTitle ? `– ${ref.containerTitle}.` : undefined, year,
+        ref.url ? `– URL: ${ref.url}${accessed}.` : undefined,
+        ref.doi ? `– DOI: ${ref.doi}${ref.url ? '' : accessed}.` : undefined,
+        !ref.url && !ref.doi && accessed ? `–${accessed}.` : undefined,
+      ];
       break;
+    }
     default: {
       // Journal, conference paper, book chapter: a component of a larger work ("//").
       const container = ref.containerTitle ? `// ${ref.containerTitle}.` : undefined;
