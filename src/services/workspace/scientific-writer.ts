@@ -208,29 +208,87 @@ export const PROTECTED_TECHNICAL_TERMS = [
 
 export interface GenerationPrompt { system: string; user: string }
 
+/** Established Russian renderings of the domain's English terms (and the reverse direction).
+ *  Kept deliberately short and conventional - a hint for the model, not a dictionary, and not
+ *  a claim that every term has exactly one acceptable translation. */
+export const TRANSLATION_GLOSSARY: readonly (readonly [en: string, ru: string])[] = [
+  ['diamond-like carbon (DLC) coatings', 'алмазоподобные углеродные покрытия (DLC)'],
+  ['tetrahedral amorphous carbon (ta-C)', 'тетраэдрический аморфный углерод (ta-C)'],
+  ['physical vapor deposition (PVD)', 'физическое осаждение из паровой фазы (PVD)'],
+  ['chemical vapor deposition (CVD)', 'химическое осаждение из газовой фазы (CVD)'],
+  ['plasma-enhanced CVD (PECVD)', 'плазмохимическое осаждение из газовой фазы (PECVD)'],
+  ['filtered cathodic vacuum arc (FCVA)', 'фильтрованная катодная вакуумная дуга (FCVA)'],
+  ['magnetron sputtering', 'магнетронное распыление'],
+  ['substrate bias', 'напряжение смещения на подложке'],
+  ['deposition rate', 'скорость осаждения'],
+  ['coating thickness', 'толщина покрытия'],
+  ['adhesion strength', 'адгезионная прочность'],
+  ['wear rate', 'скорость износа'],
+  ['coefficient of friction', 'коэффициент трения'],
+  ['thin films', 'тонкие плёнки'],
+  ['etching', 'травление'],
+];
+
+/** Rules that apply whenever the user's OWN text is being rewritten, edited or translated.
+ *  The model is told to behave as an editor/translator of fixed content, never as an author.
+ *  These are instructions only: nothing here verifies the model complied (see the
+ *  deterministic checks below, which are lexical and cannot check meaning). */
+const SOURCE_FIDELITY_RULES = [
+  'Исходный текст пользователя - единственный источник содержания. Каждое утверждение исходного текста должно быть сохранено: не заменяй конкретное утверждение общей фразой, не пропускай и не сокращай предложения до потери информации.',
+  'Фразу "Недостаточно данных" в этом режиме НЕ используй: если сам исходный текст сообщает, что данных нет или они не предоставлены (например "No experimental data on adhesion strength or wear rate were provided"), точно передай именно это утверждение со всеми названными величинами.',
+  'Сохраняй отрицания и ограничения ("не", "нет", "no", "not", "without", "only", "не предоставлены", "не измерялось") и все названные материалы, образцы, параметры и условия эксперимента.',
+  'Сохраняй числовые значения со знаком, десятичной частью и единицами; не округляй и не пересчитывай.',
+  'Не усиливай и не ослабляй выводы: сохраняй степень уверенности исходника ("may", "suggests", "возможно" остаются осторожными), не превращай предположение в доказанный факт, а корреляцию - в причинно-следственную связь.',
+  'Не добавляй утверждений о статистической значимости ("significant", "significantly", "статистически значимо", p-значения) и усилителей ("substantially", "dramatically", "clearly demonstrates", "существенно"), если их нет в исходном тексте. Не вводи новые результаты, сравнения, причины или выводы.',
+  'Если сомневаешься, как переформулировать, оставь формулировку исходного текста.',
+] as const;
+
+function glossaryLines(): string {
+  return TRANSLATION_GLOSSARY.map(([en, ru]) => `${en} = ${ru}`).join('; ');
+}
+
+function translationInstructions(direction: 'ru_en' | 'en_ru'): string {
+  const dir = direction === 'ru_en' ? 'с русского на английский' : 'с английского на русский';
+  const target = direction === 'ru_en' ? 'английского' : 'русского';
+  return [
+    `Задача: выполнить научно-технический перевод предоставленного текста ${dir}. Переводи ВСЕ предложения полностью и точно - это перевод, а не пересказ и не резюме.`,
+    `Сохрани общепринятые международные технические сокращения (${PROTECTED_TECHNICAL_TERMS.join(', ')}) без произвольного перевода.`,
+    `Используй устоявшуюся терминологию физики плазмы и тонких плёнок на языке ${target}, а не дословную кальку (например: ${glossaryLines()}).`,
+    'Числовые значения, знаки и порядок величин сохраняй точно. Единицы измерения передавай стандартными обозначениями целевого языка (V ↔ В, µm ↔ мкм, GPa ↔ ГПа, nm ↔ нм); °C сохраняй как °C.',
+  ].join('\n');
+}
+
 function modeInstructions(mode: WriterMode, targetLanguage: Language): string {
   switch (mode) {
     case 'draft':
-      return 'Задача: подготовить черновик документа СТРОГО на основе перечисленных ниже данных пользователя. Не добавляй факты, цитаты, DOI, авторов, журналы или результаты экспериментов, которых нет в данных. Для разделов без данных напиши "Недостаточно данных".';
+      return [
+        'Задача: подготовить черновик документа СТРОГО на основе перечисленных ниже данных пользователя. Не добавляй факты, цитаты, DOI, авторов, журналы или результаты экспериментов, которых нет в данных. Для разделов без данных напиши "Недостаточно данных".',
+        'Оформление: название документа - строка "# Название", каждый раздел - строка "## Название раздела", затем обычные абзацы. Не используй жирный шрифт вместо заголовков.',
+      ].join('\n');
     case 'rewrite':
-      return 'Задача: переписать и улучшить стиль и структуру предоставленного текста, сохранив технический смысл. Не меняй числовые значения, химические формулы, обозначения оборудования и единицы измерения. Не добавляй новые факты.';
+      return `Задача: переписать и улучшить стиль и структуру предоставленного текста, сохранив технический смысл. Не меняй числовые значения, химические формулы, обозначения оборудования и единицы измерения. Не добавляй новые факты.\n${SOURCE_FIDELITY_RULES.join('\n')}`;
     case 'edit':
-      return 'Задача: выполнить научное редактирование предоставленного текста (грамматика, терминология, ясность изложения). Не меняй числовые значения, химические формулы, обозначения оборудования и единицы измерения. Не добавляй новые факты.';
+      return `Задача: выполнить научное редактирование предоставленного текста (грамматика, терминология, ясность изложения). Не меняй числовые значения, химические формулы, обозначения оборудования и единицы измерения. Не добавляй новые факты.\n${SOURCE_FIDELITY_RULES.join('\n')}`;
     case 'translate_ru_en':
-      return `Задача: выполнить научно-технический перевод предоставленного текста с русского на английский. Сохрани общепринятые международные технические сокращения (${PROTECTED_TECHNICAL_TERMS.join(', ')}) без произвольного перевода. Не меняй числовые значения и единицы измерения.`;
+      return `${translationInstructions('ru_en')}\n${SOURCE_FIDELITY_RULES.join('\n')}`;
     case 'translate_en_ru':
-      return `Задача: выполнить научно-технический перевод предоставленного текста с английского на русский. Сохрани общепринятые международные технические сокращения (${PROTECTED_TECHNICAL_TERMS.join(', ')}) без произвольного перевода. Не меняй числовые значения и единицы измерения.`;
+      return `${translationInstructions('en_ru')}\n${SOURCE_FIDELITY_RULES.join('\n')}`;
   }
   return `Целевой язык: ${targetLanguage === 'ru' ? 'русский' : 'английский'}.`;
 }
 
 export function buildSystemPrompt(mode: WriterMode, targetLanguage: Language): string {
-  return [
+  const lines = [
     'Ты - ассистент для подготовки научно-технических текстов в области физики плазмы, вакуумных и PVD/CVD/PECVD технологий нанесения покрытий.',
     'Категорически запрещено: придумывать цитаты, DOI, библиографические ссылки, авторов, названия журналов, экспериментальные результаты или числовые данные, которых нет в предоставленном пользователем тексте.',
-    'Если данных для раздела недостаточно - явно напиши "Недостаточно данных" вместо того, чтобы придумывать содержание.',
-    modeInstructions(mode, targetLanguage),
-  ].join('\n');
+    'Не утверждай статистическую значимость различий и не усиливай выводы без подтверждающих данных в тексте пользователя.',
+  ];
+  // The "insufficient data" placeholder is only for drafting sections the user gave no data
+  // for. In rewrite/edit/translate modes the user's text is the content: applying the
+  // placeholder there replaces real statements with a stock phrase.
+  if (!REWRITE_LIKE_MODES.includes(mode)) lines.push('Если данных для раздела недостаточно - явно напиши "Недостаточно данных" вместо того, чтобы придумывать содержание.');
+  lines.push(modeInstructions(mode, targetLanguage));
+  return lines.join('\n');
 }
 
 /** Lists ONLY what the user actually provided (via EvidenceReport) plus an explicit "missing"
@@ -276,16 +334,30 @@ function containsAsWord(haystack: string, needle: string): boolean {
  *  either missing real units or misreading ordinary text as one). Sorted longest-first so e.g.
  *  "kPa"/"MPa"/"GPa" match before a bare "Pa" would. */
 const KNOWN_UNITS = [
-  'nm', 'мкм', 'нм', 'mm', 'мм', 'cm', 'см', 'µm', 'm', 'м',
-  '°C', '°К', '°F', 'K', 'К',
+  'nm', 'мкм', 'нм', 'mm', 'мм', 'cm', 'см', 'µm', 'μm', 'm', 'м',
+  '°C', '°С', '°К', '°F', 'K', 'К',
   'ms', 'мс', 'min', 'мин', 'h', 'ч', 's', 'с',
-  'kPa', 'кПа', 'MPa', 'МПа', 'GPa', 'ГПа', 'Pa', 'Па', 'mbar', 'мбар', 'bar', 'бар', 'torr', 'Torr',
+  'kPa', 'кПа', 'MPa', 'МПа', 'GPa', 'ГПа', 'Pa', 'Па', 'mbar', 'мбар', 'bar', 'бар', 'torr', 'Torr', 'торр',
   'kW', 'кВт', 'mA', 'мА', 'kV', 'кВ', 'W', 'Вт', 'A', 'А', 'V', 'В',
   'kHz', 'кГц', 'Hz', 'Гц',
   'HRC', 'HV', 'sccm', '%',
 ].sort((a, b) => b.length - a.length);
 
 const UNIT_ALTERNATION = KNOWN_UNITS.map(escapeRegExp).join('|');
+
+/** The SAME physical unit written in another language/script (or with a look-alike glyph) must
+ *  compare equal: a faithful EN->RU translation turns "V" into "В", "µm" into "мкм", "GPa"
+ *  into "ГПа" - and Cyrillic "В"/"А"/"К"/"С" are visually identical to the Latin letters, so
+ *  texts routinely mix them. Everything maps to one canonical (Latin/SI) spelling; units that
+ *  are genuinely DIFFERENT ("°C" vs "K", "µm" vs "nm") stay different. */
+const UNIT_CANONICAL: Record<string, string> = {
+  'нм': 'nm', 'мкм': 'µm', 'μm': 'µm', 'мм': 'mm', 'см': 'cm', 'м': 'm',
+  '°С': '°C', '°К': 'K', 'К': 'K',
+  'мс': 'ms', 'мин': 'min', 'ч': 'h', 'с': 's',
+  'кПа': 'kPa', 'МПа': 'MPa', 'ГПа': 'GPa', 'Па': 'Pa', 'мбар': 'mbar', 'бар': 'bar', 'Torr': 'torr', 'торр': 'torr',
+  'кВт': 'kW', 'мА': 'mA', 'кВ': 'kV', 'А': 'A', 'В': 'V', 'Вт': 'W', 'кГц': 'kHz', 'Гц': 'Hz',
+};
+function canonicalUnit(unit: string): string { return UNIT_CANONICAL[unit] ?? unit; }
 /** Every character real scientific text uses as a numeric minus/plus sign - not just the
  *  ASCII hyphen-minus. Text pasted from Word/LaTeX/PDF exports (and LLM output, which tends
  *  to use proper math typography) very commonly renders a negative exponent with U+2212
@@ -316,9 +388,33 @@ const SIGN_VARIANT_RE = /[‐‑‒–—−]/g;
  *
  *  The trailing lookahead also stops a bare number from matching as a prefix of an unrelated
  *  alphanumeric token (e.g. "5G" is never read as the number 5). */
-const NUMBER_TOKEN_RE = new RegExp(`([${SIGN_CHARS}]?\\d+(?:[.,]\\d+)?(?:[eE][${SIGN_CHARS}]?\\d+)?)(?:\\s*(${UNIT_ALTERNATION}))?(?![\\p{L}\\p{N}])`, 'gu');
+const NUMBER_TOKEN_RE = new RegExp(`((?:(?<![\\p{L}\\p{N}])[${SIGN_CHARS}])?\\d+(?:[.,]\\d+)?(?:[eE][${SIGN_CHARS}]?\\d+)?)(?:\\s*(${UNIT_ALTERNATION}))?(?![\\p{L}\\p{N}])`, 'gu');
 
-interface NumericToken { raw: string; key: string }
+/** `key` is the comparison identity (canonical value + canonical unit). `inherited` marks a
+ *  number that had no unit of its own and received one from the unit-bearing number right
+ *  after it in a range/list ("-50 to -100 V", "1.2 and 1.1 µm") - see inheritRangeUnits. */
+interface NumericToken { raw: string; key: string; value: string; unit?: string; inherited: boolean; start: number; end: number }
+
+/** Text between two numbers that makes them one range/list sharing a unit. Deliberately narrow:
+ *  only a comma, a range word (EN/RU) or a dash/slash/ellipsis - never arbitrary prose. */
+const RANGE_GAP_RE = /^\s*(?:,\s*)?(?:(?:to|and|or|до|и|или)\s+|[-‐-―−/…]|\.{3})?\s*$/iu;
+
+/** "-50 to -100 V" and "-50 V to -100 V" are the same quantities written two ways; a rewrite
+ *  or translation may freely switch between them. Applied identically to BOTH texts being
+ *  compared, so the first number of such a range is compared as "-50 V" on either side. Walks
+ *  right-to-left so a whole list ("-50, -100, -150 V") resolves. */
+function inheritRangeUnits(text: string, tokens: NumericToken[]): void {
+  for (let i = tokens.length - 2; i >= 0; i--) {
+    const current = tokens[i];
+    const next = tokens[i + 1];
+    if (current.unit || !next.unit) continue;
+    const gap = text.slice(current.end, next.start);
+    if (gap.trim() === '' || !RANGE_GAP_RE.test(gap)) continue;
+    current.unit = next.unit;
+    current.key = `${current.value}${next.unit}`;
+    current.inherited = true;
+  }
+}
 
 /** Every number (optionally paired with its unit) in `text`, as both a human-readable form
  *  (`raw`, exactly as written - for display in warnings) and a comparison key (`key`).
@@ -332,32 +428,68 @@ interface NumericToken { raw: string; key: string }
  *  same decimal separator as a period ("2,5" and "2.5" are the same value) before parsing.
  *  Any Unicode minus/dash sign matched via SIGN_CHARS is normalized to the ASCII hyphen-minus
  *  first - `Number()` itself only ever recognizes "-", so without this step a real "−1e-3"
- *  would parse to NaN (or silently lose its sign) instead of the actual negative value. */
+ *  would parse to NaN (or silently lose its sign) instead of the actual negative value.
+ *  The unit is compared in its canonical spelling (UNIT_CANONICAL), so "−150 V" and "−150 В",
+ *  "0.9 µm" and "0.9 мкм", "3.1 GPa" and "3.1 ГПа" are the same quantity. */
 function extractNumericTokens(text: string): NumericToken[] {
-  return Array.from(text.matchAll(NUMBER_TOKEN_RE)).map(match => {
+  const tokens = Array.from(text.matchAll(NUMBER_TOKEN_RE)).map((match): NumericToken => {
     const [raw, number, unit] = match;
     const normalizedNumber = number.replace(SIGN_VARIANT_RE, '-').replace(',', '.');
-    const canonicalNumber = Number(normalizedNumber).toString();
-    return { raw: raw.trim(), key: unit ? `${canonicalNumber}${unit}` : canonicalNumber };
+    const value = Number(normalizedNumber).toString();
+    const canonical = unit ? canonicalUnit(unit) : undefined;
+    const start = match.index ?? 0;
+    return { raw: raw.trim(), value, unit: canonical, key: canonical ? `${value}${canonical}` : value, inherited: false, start, end: start + raw.length };
   });
+  inheritRangeUnits(text, tokens);
+  return tokens;
 }
 
 function uniqueByKey(tokens: NumericToken[]): NumericToken[] {
   return Array.from(new Map(tokens.map(t => [t.key, t])).values());
 }
 
+/** What a text offers for matching: every effective key, plus the values of numbers that had
+ *  no unit of their own in that text (needed to let a range-inherited unit survive a
+ *  punctuation change - see isCovered). */
+interface TokenPool { keys: Set<string>; unitlessValues: Set<string> }
+
+function buildPool(tokens: NumericToken[]): TokenPool {
+  return {
+    keys: new Set(tokens.map(t => t.key)),
+    unitlessValues: new Set(tokens.filter(t => !t.unit || t.inherited).map(t => t.value)),
+  };
+}
+
+/** A token is covered when the pool holds the same value+unit. A token whose unit was only
+ *  INHERITED from its range neighbour is also covered by the same value written without a unit
+ *  (e.g. "Table 2, 5 µm" rewritten as "Table 2. 5 µm" must not flag "2") - never by the same
+ *  value with a DIFFERENT explicit unit, and never for a number that carried its own unit. */
+function isCovered(token: NumericToken, pool: TokenPool): boolean {
+  if (pool.keys.has(token.key)) return true;
+  return token.inherited && pool.unitlessValues.has(token.value);
+}
+
 export interface PreservationCheck { preservedNumbers: string[]; missingNumbers: string[]; preservedTerms: string[]; missingTerms: string[]; ok: boolean }
+
+/** Terms that stay in their original Latin spelling in any translation. The remaining
+ *  PROTECTED_TECHNICAL_TERMS are ordinary English words ("pressure", "plasma", ...) that a
+ *  correct translation MUST translate - requiring them verbatim in a translation would flag
+ *  every faithful EN->RU result. */
+const TRANSLATION_INVARIANT_TERMS: readonly string[] = ['PVD', 'CVD', 'PECVD', 'FCVA', 'ICP/RF', 'ICP', 'RF', 'ta-C'];
 
 /** Confirms every number (with its unit, when it has one) and every protected technical term
  *  present in the ORIGINAL text still appears - as the SAME number+unit pair, never merely a
  *  matching substring - somewhere in the EDITED/translated text. A real, checkable guarantee
- *  rather than an assumption about how the model behaved. */
-export function checkPreservation(original: string, edited: string): PreservationCheck {
+ *  rather than an assumption about how the model behaved. Deterministic and lexical only: it
+ *  does NOT verify that the meaning is preserved. */
+export function checkPreservation(original: string, edited: string, mode?: WriterMode): PreservationCheck {
   const originalTokens = uniqueByKey(extractNumericTokens(original));
-  const editedKeys = new Set(extractNumericTokens(edited).map(t => t.key));
-  const missing = originalTokens.filter(t => !editedKeys.has(t.key));
+  const editedPool = buildPool(extractNumericTokens(edited));
+  const missing = originalTokens.filter(t => !isCovered(t, editedPool));
   const missingKeys = new Set(missing.map(t => t.key));
-  const presentTerms = PROTECTED_TECHNICAL_TERMS.filter(t => containsAsWord(original, t));
+  const isTranslation = mode === 'translate_ru_en' || mode === 'translate_en_ru';
+  const candidateTerms = isTranslation ? PROTECTED_TECHNICAL_TERMS.filter(t => TRANSLATION_INVARIANT_TERMS.includes(t)) : PROTECTED_TECHNICAL_TERMS;
+  const presentTerms = candidateTerms.filter(t => containsAsWord(original, t));
   const missingTerms = presentTerms.filter(t => !containsAsWord(edited, t));
   return {
     preservedNumbers: originalTokens.filter(t => !missingKeys.has(t.key)).map(t => t.raw),
@@ -417,11 +549,34 @@ export function checkNoInventedNumbers(input: ScientificWriterInput, generatedTe
     input.title, input.researchField, input.goal, input.researchObject, input.methods,
     input.results, input.conclusions, input.keywords, input.sourceText, input.additionalRequirements,
   ].filter((v): v is string => !!v).join('\n');
-  const suppliedKeys = new Set(extractNumericTokens(suppliedText).map(t => t.key));
+  const suppliedPool = buildPool(extractNumericTokens(suppliedText));
   const generatedTokens = uniqueByKey(extractNumericTokens(generatedText));
   const structuralKeys = structuralListMarkerKeys(generatedText);
-  const invented = generatedTokens.filter(t => !suppliedKeys.has(t.key) && !structuralKeys.has(t.key));
+  const invented = generatedTokens.filter(t => !isCovered(t, suppliedPool) && !structuralKeys.has(t.key));
   return { invented: invented.map(t => t.raw), ok: invented.length === 0 };
+}
+
+const SIGNIFICANCE_MARKERS: readonly RegExp[] = [
+  /\bsignificant(?:ly)?\b/giu, /\bstatistically\b/giu, /\bp\s*[<=≤]\s*0?[.,]\d+/giu,
+  /статистическ\p{L}*\s+значим\p{L}*/giu, /\bдостоверн\p{L}*/giu,
+];
+
+export interface AddedSignificanceCheck { added: string[]; ok: boolean }
+
+/** Wording about (statistical) significance that the OUTPUT contains but the user's source text
+ *  never used. Lexical only - it catches the specific, recurring failure of an editor adding
+ *  "significantly" where no significance was established, not every possible strengthening of a
+ *  claim (that needs a semantic verifier, which this project does not have). Meaningful for
+ *  same-language rewriting/editing; not applied to translation, where "significantly" is a
+ *  legitimate rendering of the source's own "значительно". */
+export function checkNoAddedSignificanceClaims(source: string, output: string): AddedSignificanceCheck {
+  const added = new Set<string>();
+  for (const marker of SIGNIFICANCE_MARKERS) {
+    const inSource = Array.from(source.matchAll(marker)).length > 0;
+    if (inSource) continue;
+    for (const match of output.matchAll(marker)) added.add(match[0].toLowerCase());
+  }
+  return { added: [...added], ok: added.size === 0 };
 }
 
 const DOI_RE = /\b10\.\d{4,9}\/\S+/;
@@ -448,6 +603,10 @@ export function buildSafetyWarnings(input: ScientificWriterInput, generatedText:
   if (preservation && !preservation.ok) {
     if (preservation.missingNumbers.length) warnings.push(`Возможна потеря числовых значений: ${preservation.missingNumbers.join(', ')}.`);
     if (preservation.missingTerms.length) warnings.push(`Возможна потеря защищённых терминов: ${preservation.missingTerms.join(', ')}.`);
+  }
+  if ((input.mode === 'rewrite' || input.mode === 'edit') && input.sourceText) {
+    const significance = checkNoAddedSignificanceClaims(input.sourceText, generatedText);
+    if (!significance.ok) warnings.push(`В результат добавлены формулировки о значимости, которых нет в исходном тексте: ${significance.added.join(', ')}. Проверьте, подтверждены ли они вашими данными.`);
   }
   const inventedNumbers = checkNoInventedNumbers(input, generatedText);
   if (!inventedNumbers.ok) warnings.push(`Обнаружены числа, не подтверждённые пользователем: ${inventedNumbers.invented.join(', ')}. Проверьте перед использованием.`);

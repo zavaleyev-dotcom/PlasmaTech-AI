@@ -9,6 +9,7 @@
 import 'server-only';
 import { DOCUMENT_TYPES, DOCUMENT_TYPE_LABELS, type DocumentType } from './scientific-writer';
 import { EXPORT_FORMATS, type ExportFormat } from './techdoc-export-types';
+import { parseMarkdown, blocksToPlainParagraphs, normalizeForCompare, runsToPlainText, type MdBlock } from './scientific-markdown';
 import { renderGenericDocx, renderGenericPdf, sanitizeFilenameSegment, type GenericDocumentViewModel, type ExportSection, type ExportMetadataItem } from './document-export';
 import {
   REFERENCE_TYPES, CITATION_STYLES, CITATION_STYLE_LABELS, DOCUMENT_PROFILES, FORMATTING_PROFILES,
@@ -19,8 +20,6 @@ import {
 export { DOCUMENT_TYPES, DOCUMENT_TYPE_LABELS, EXPORT_FORMATS, type DocumentType, type ExportFormat };
 
 const NOT_SET = 'не задано';
-
-function show(value: string | undefined): string { return value !== undefined && value.trim() !== '' ? value : NOT_SET; }
 
 const FILENAME_SEGMENT: Record<DocumentType, string> = {
   article: 'article',
@@ -76,19 +75,64 @@ export function validateExportRequest(request: ScientificExportRequest): void {
 
 // ---------- ScientificWriterResult -> ScientificDocumentViewModel -> generic renderer ----------
 
+type BodyBlock = Exclude<MdBlock, { kind: 'title-label' }>;
+
+function keepInBody(list: MdBlock[]): BodyBlock[] {
+  return list.map((b): BodyBlock => (b.kind === 'title-label' ? { kind: 'paragraph', runs: [{ text: 'Title: ', bold: true }, { text: b.text }] } : b));
+}
+
+/** Splits a generated draft's leading title (a "**Title:** …" line, or a "# …" heading in a
+ *  document that also has "##" sections) off its body. Returns the remaining blocks; a title
+ *  line that is NOT used as the document title stays in the body, so nothing is ever dropped. */
+function separateTitle(blocks: MdBlock[], userTitle: string | undefined): { title?: string; body: BodyBlock[] } {
+  const first = blocks[0];
+  let candidate: string | undefined;
+  if (first?.kind === 'title-label') candidate = first.text;
+  else if (first?.kind === 'heading' && first.mdLevel === 1 && blocks.some(b => b.kind === 'heading' && b.mdLevel === 2)) candidate = runsToPlainText(first.runs).trim();
+  if (!candidate) return { body: keepInBody(blocks) };
+  if (!userTitle) return { title: candidate, body: keepInBody(blocks.slice(1)) };
+  if (normalizeForCompare(candidate) === normalizeForCompare(userTitle)) return { body: keepInBody(blocks.slice(1)) };
+  return { body: keepInBody(blocks) };
+}
+
+function isTypeLabelHeading(heading: string, documentType: DocumentType): boolean {
+  const trimmed = heading.trim();
+  return trimmed === '' || trimmed.toLocaleLowerCase() === DOCUMENT_TYPE_LABELS[documentType].toLocaleLowerCase();
+}
+
 export function buildScientificDocumentViewModel(request: ScientificExportRequest): GenericDocumentViewModel {
   const typeLabel = DOCUMENT_TYPE_LABELS[request.documentType];
-  const title = request.title ? `${typeLabel}: ${request.title}` : typeLabel;
+  const userTitle = request.title?.trim() || undefined;
+  let extractedTitle: string | undefined;
+
+  const sections: ExportSection[] = request.sections.map((s, index) => {
+    // The local scaffold is the user's own words in "Label: value" form - never Markdown, so
+    // it is never interpreted as such (a literal "5*3" or "**" in user data must survive).
+    if (!request.generatedByAI) return { heading: s.heading, paragraphs: splitParagraphs(s.text) };
+    const parsed = parseMarkdown(s.text);
+    if (parsed.length === 0) return { heading: s.heading, paragraphs: splitParagraphs(s.text) };
+    const selfStructured = isTypeLabelHeading(s.heading, request.documentType);
+    let body: BodyBlock[];
+    if (index === 0 && selfStructured) {
+      const separated = separateTitle(parsed, userTitle);
+      extractedTitle = separated.title;
+      body = separated.body;
+    } else {
+      body = keepInBody(parsed);
+    }
+    return { heading: selfStructured ? '' : s.heading, paragraphs: blocksToPlainParagraphs(body), blocks: body };
+  });
+
+  // The title is only the document's own title - never prefixed with the document type, which
+  // is service information and is listed in the appendix instead.
+  const title = userTitle ?? extractedTitle ?? typeLabel;
 
   const metadata: ExportMetadataItem[] = [
     { label: 'Тип документа', value: typeLabel },
-    { label: 'Тема', value: show(request.title) },
     { label: 'Источник текста', value: request.generatedByAI ? 'сгенерировано ИИ - требует проверки автором' : 'локальная структура, без ИИ-генерации' },
   ];
   if (request.profileId) metadata.push({ label: 'Профиль оформления', value: FORMATTING_PROFILES[request.profileId].label });
   if (request.citationStyle) metadata.push({ label: 'Стиль оформления ссылок', value: CITATION_STYLE_LABELS[request.citationStyle] });
-
-  const sections: ExportSection[] = request.sections.map(s => ({ heading: s.heading, paragraphs: splitParagraphs(s.text) }));
 
   const references = request.references ?? [];
   // Никогда не создаём раздел "Список источников", если реальных источников нет (item 11/12).
@@ -114,7 +158,8 @@ export function buildScientificDocumentViewModel(request: ScientificExportReques
     sections,
     tables: [],
     traceability,
-    traceabilityHeading: 'Происхождение данных',
+    traceabilityHeading: 'Служебная информация (не входит в текст документа)',
+    metadataPlacement: 'appendix',
     footer: 'Scientific Writer не заменяет проверку научных фактов: любые утверждения, цифры, цитаты и ссылки должны быть проверены автором перед публикацией. Система не создаёт вымышленные ссылки, DOI, авторов или журналы.',
   };
 }

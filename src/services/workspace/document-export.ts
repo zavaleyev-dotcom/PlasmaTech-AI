@@ -8,8 +8,9 @@
 
 import 'server-only';
 import path from 'node:path';
-import { Document, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, Packer, PageBreak, AlignmentType, VerticalAlign } from 'docx';
+import { Document, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, Packer, PageBreak, AlignmentType, VerticalAlign, TabStopType } from 'docx';
 import PDFDocument from 'pdfkit';
+import type { MdBlock, InlineRun } from './scientific-markdown';
 
 export const NOT_SET = 'не задано';
 export const DASH = '—';
@@ -29,7 +30,11 @@ export function sanitizeFilenameSegment(value: string, fallback: string): string
 
 // ---------- generic DocumentViewModel: the ONE normalized layer every DOCX/PDF export renders from ----------
 
-export interface ExportSection { heading: string; paragraphs: string[] }
+/** `blocks` (optional) is the rich form of the same content - real headings, bold/italic runs
+ *  and lists. Renderers use it when present; `paragraphs` stays the plain-text equivalent that
+ *  every existing caller (TechDoc) provides and that tests read. An empty `heading` renders no
+ *  heading at all (the content is already self-structured by `blocks`). */
+export interface ExportSection { heading: string; paragraphs: string[]; blocks?: Exclude<MdBlock, { kind: 'title-label' }>[] }
 export interface ExportTable { heading: string; columns: string[]; rows: string[][] }
 export interface ExportMetadataItem { label: string; value: string }
 
@@ -44,6 +49,11 @@ export interface GenericDocumentViewModel {
   traceability: ExportMetadataItem[];
   traceabilityHeading: string;
   footer: string;
+  /** 'top' (default, TechDoc): `metadata` is printed right under the title. 'appendix': the
+   *  document starts with the title and the content only; `metadata` is printed together with
+   *  `traceability`, under `traceabilityHeading`, on a new page after the content - so service
+   *  information is never mixed into the body of the document. */
+  metadataPlacement?: 'top' | 'appendix';
 }
 
 /** F11: real, applied formatting-profile parameters - when omitted, every existing caller
@@ -92,6 +102,42 @@ function textParagraph(text: string, opts: { bold?: boolean; size?: number; line
   });
 }
 
+function docxRuns(runs: InlineRun[], size: number): TextRun[] {
+  const out: TextRun[] = [];
+  for (const run of runs) {
+    run.text.split('\n').forEach((line, index) => {
+      out.push(new TextRun({ text: line, font: DOCX_FONT, size, bold: run.bold, italics: run.italic, ...(index > 0 ? { break: 1 } : {}) }));
+    });
+  }
+  return out;
+}
+
+const DOCX_HEADINGS = [HeadingLevel.HEADING_1, HeadingLevel.HEADING_2, HeadingLevel.HEADING_3] as const;
+
+function docxBlocks(blocks: NonNullable<ExportSection['blocks']>, bodySize: number, headingSize: number, lineSpacing: number | undefined): Paragraph[] {
+  const spacingLine = lineSpacing ? { line: Math.round(240 * lineSpacing), lineRule: 'auto' as const } : {};
+  const out: Paragraph[] = [];
+  for (const block of blocks) {
+    if (block.kind === 'heading') {
+      const size = block.level === 1 ? headingSize : block.level === 2 ? Math.max(bodySize + 2, headingSize - 2) : bodySize;
+      out.push(new Paragraph({
+        children: block.runs.map(r => new TextRun({ text: r.text, font: DOCX_FONT, size, bold: true, italics: r.italic })),
+        heading: DOCX_HEADINGS[block.level - 1], spacing: { before: 200, after: 100 }, keepNext: true,
+      }));
+    } else if (block.kind === 'paragraph') {
+      out.push(new Paragraph({ children: docxRuns(block.runs, bodySize), spacing: { after: 100, ...spacingLine } }));
+    } else {
+      for (const item of block.items) {
+        out.push(new Paragraph({
+          children: [new TextRun({ text: `${item.marker}\t`, font: DOCX_FONT, size: bodySize }), ...docxRuns(item.runs, bodySize)],
+          indent: { left: 567, hanging: 283 }, tabStops: [{ type: TabStopType.LEFT, position: 567 }], spacing: { after: 60, ...spacingLine },
+        }));
+      }
+    }
+  }
+  return out;
+}
+
 function metadataParagraph(item: ExportMetadataItem, size = BODY_SIZE): Paragraph {
   return new Paragraph({
     children: [
@@ -135,12 +181,14 @@ export async function renderGenericDocx(viewModel: GenericDocumentViewModel, opt
 
   const children: (Paragraph | Table)[] = [];
   children.push(new Paragraph({ children: [new TextRun({ text: viewModel.title, font: DOCX_FONT, size: 32, bold: true })], heading: HeadingLevel.TITLE, alignment: AlignmentType.LEFT, spacing: { after: 200 } }));
-  children.push(...viewModel.metadata.map(item => metadataParagraph(item, bodySize)));
+  const appendix = viewModel.metadataPlacement === 'appendix';
+  if (!appendix) children.push(...viewModel.metadata.map(item => metadataParagraph(item, bodySize)));
   if (options.pageBreakAfterMetadata) children.push(new Paragraph({ children: [new PageBreak()] }));
 
   for (const section of viewModel.sections) {
-    children.push(new Paragraph({ children: [new TextRun({ text: section.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
-    children.push(...section.paragraphs.map(p => textParagraph(p, { size: bodySize, lineSpacing })));
+    if (section.heading) children.push(new Paragraph({ children: [new TextRun({ text: section.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
+    if (section.blocks) children.push(...docxBlocks(section.blocks, bodySize, headingSize, lineSpacing));
+    else children.push(...section.paragraphs.map(p => textParagraph(p, { size: bodySize, lineSpacing })));
   }
 
   for (const table of viewModel.tables) {
@@ -148,7 +196,8 @@ export async function renderGenericDocx(viewModel: GenericDocumentViewModel, opt
     children.push(docxTable(table));
   }
 
-  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.traceabilityHeading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 300, after: 100 } }));
+  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.traceabilityHeading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, pageBreakBefore: appendix, spacing: { before: 300, after: 100 } }));
+  if (appendix) children.push(...viewModel.metadata.map(item => metadataParagraph(item, bodySize)));
   children.push(...viewModel.traceability.map(item => metadataParagraph(item, bodySize)));
   children.push(new Paragraph({ children: [new TextRun({ text: viewModel.footer, font: DOCX_FONT, size: 18, italics: true })], spacing: { before: 300 } }));
 
@@ -174,6 +223,8 @@ export async function renderGenericDocx(viewModel: GenericDocumentViewModel, opt
 // stays correct without asking either bundler to trace or load the .ttf as a module.
 const PDF_FONT_REGULAR = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans.ttf');
 const PDF_FONT_BOLD = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans-Bold.ttf');
+const PDF_FONT_ITALIC = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans-Oblique.ttf');
+const PDF_FONT_BOLD_ITALIC = path.join(process.cwd(), 'node_modules', 'dejavu-fonts-ttf', 'ttf', 'DejaVuSans-BoldOblique.ttf');
 const PDF_MARGIN = 56;
 const PDF_BODY_SIZE = 10;
 const PDF_HEADING_SIZE = 13;
@@ -204,6 +255,8 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
       const doc = new PDFDocument({ size: 'A4', layout: landscape ? 'landscape' : 'portrait', margins, bufferPages: true });
       doc.registerFont('Body', PDF_FONT_REGULAR);
       doc.registerFont('Bold', PDF_FONT_BOLD);
+      doc.registerFont('Italic', PDF_FONT_ITALIC);
+      doc.registerFont('BoldItalic', PDF_FONT_BOLD_ITALIC);
       doc.font('Body');
 
       const chunks: Buffer[] = [];
@@ -216,21 +269,30 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
       doc.font('Bold').fontSize(16).fillColor('#000000').text(viewModel.title, { width: contentWidth });
       doc.moveDown(0.5);
       doc.font('Body').fontSize(bodySize);
-      for (const item of viewModel.metadata) {
-        doc.font('Bold').text(`${item.label}: `, { continued: true, width: contentWidth }).font('Body').text(item.value);
+      const appendix = viewModel.metadataPlacement === 'appendix';
+      if (!appendix) {
+        for (const item of viewModel.metadata) {
+          doc.font('Bold').text(`${item.label}: `, { continued: true, width: contentWidth }).font('Body').text(item.value);
+        }
+        doc.moveDown(0.5);
       }
-      doc.moveDown(0.5);
       if (options.pageBreakAfterMetadata) doc.addPage();
 
       for (const section of viewModel.sections) {
-        ensureSpace(doc, 40, margins);
-        doc.font('Bold').fontSize(headingSize).text(section.heading, { width: contentWidth });
-        doc.moveDown(0.3);
+        if (section.heading) {
+          ensureSpace(doc, 40, margins);
+          doc.font('Bold').fontSize(headingSize).text(section.heading, { width: contentWidth });
+          doc.moveDown(0.3);
+        }
         doc.font('Body').fontSize(bodySize);
-        for (const paragraph of section.paragraphs) {
-          ensureSpace(doc, 14, margins);
-          doc.text(paragraph, { width: contentWidth, align: 'left', lineGap });
-          doc.moveDown(0.2);
+        if (section.blocks) {
+          pdfBlocks(doc, section.blocks, { contentWidth, margins, bodySize, headingSize, lineGap });
+        } else {
+          for (const paragraph of section.paragraphs) {
+            ensureSpace(doc, 14, margins);
+            doc.text(paragraph, { width: contentWidth, align: 'left', lineGap });
+            doc.moveDown(0.2);
+          }
         }
         doc.moveDown(0.4);
       }
@@ -243,10 +305,15 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
         doc.moveDown(0.4);
       }
 
-      ensureSpace(doc, 60, margins);
+      if (appendix) doc.addPage(); else ensureSpace(doc, 60, margins);
       doc.font('Bold').fontSize(headingSize).text(viewModel.traceabilityHeading, { width: contentWidth });
       doc.moveDown(0.3);
       doc.font('Body').fontSize(bodySize);
+      if (appendix) {
+        for (const item of viewModel.metadata) {
+          doc.font('Bold').text(`${item.label}: `, { continued: true, width: contentWidth }).font('Body').text(item.value);
+        }
+      }
       for (const item of viewModel.traceability) {
         doc.font('Bold').text(`${item.label}: `, { continued: true, width: contentWidth }).font('Body').text(item.value);
       }
@@ -276,6 +343,54 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
       reject(error instanceof Error ? error : new Error('Не удалось сформировать PDF.'));
     }
   });
+}
+
+function pdfFontFor(run: InlineRun, base: 'Body' | 'Bold' = 'Body'): string {
+  const bold = run.bold || base === 'Bold';
+  return bold && run.italic ? 'BoldItalic' : bold ? 'Bold' : run.italic ? 'Italic' : 'Body';
+}
+
+/** Writes bold/italic runs as ONE wrapped paragraph (PDFKit's `continued` chaining). */
+function pdfRuns(doc: PDFKit.PDFDocument, runs: InlineRun[], opts: { width: number; lineGap?: number; base?: 'Body' | 'Bold' }): void {
+  const visible = runs.filter(r => r.text !== '');
+  visible.forEach((run, index) => {
+    doc.font(pdfFontFor(run, opts.base)).text(run.text, { continued: index < visible.length - 1, width: opts.width, align: 'left', lineGap: opts.lineGap ?? 0 });
+  });
+  if (visible.length === 0) doc.text('', { width: opts.width });
+}
+
+const PDF_LIST_INDENT = 16;
+
+function pdfBlocks(
+  doc: PDFKit.PDFDocument, blocks: NonNullable<ExportSection['blocks']>,
+  ctx: { contentWidth: number; margins: PdfMargins; bodySize: number; headingSize: number; lineGap: number },
+): void {
+  for (const block of blocks) {
+    if (block.kind === 'heading') {
+      ensureSpace(doc, 40, ctx.margins);
+      const size = block.level === 1 ? ctx.headingSize : block.level === 2 ? Math.max(ctx.bodySize + 2, ctx.headingSize - 2) : ctx.bodySize + 1;
+      doc.moveDown(0.3).fontSize(size);
+      pdfRuns(doc, block.runs, { width: ctx.contentWidth, base: 'Bold' });
+      doc.moveDown(0.3).font('Body').fontSize(ctx.bodySize);
+    } else if (block.kind === 'paragraph') {
+      ensureSpace(doc, 14, ctx.margins);
+      pdfRuns(doc, block.runs, { width: ctx.contentWidth, lineGap: ctx.lineGap });
+      doc.moveDown(0.2);
+    } else {
+      for (const item of block.items) {
+        ensureSpace(doc, 14, ctx.margins);
+        const left = ctx.margins.left;
+        const top = doc.y;
+        doc.font('Body').text(item.marker, left, top, { width: PDF_LIST_INDENT, lineBreak: false });
+        doc.x = left + PDF_LIST_INDENT;
+        doc.y = top;
+        pdfRuns(doc, item.runs, { width: ctx.contentWidth - PDF_LIST_INDENT, lineGap: ctx.lineGap });
+        doc.x = left;
+        doc.moveDown(0.1);
+      }
+      doc.moveDown(0.1);
+    }
+  }
 }
 
 function ensureSpace(doc: PDFKit.PDFDocument, minHeight: number, margins: PdfMargins): void {

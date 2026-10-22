@@ -177,7 +177,7 @@ export function ScientificWriter() {
     if (result) {
       return {
         documentType: form.documentType, title: form.title || undefined, generatedByAI: true,
-        sections: [{ heading: DOCUMENT_TYPE_LABELS[form.documentType], text: result.generatedText }],
+        sections: [{ heading: '', text: result.generatedText }],
         providedFields: result.evidence.provided, missingFields: result.evidence.missing, warnings: result.warnings,
         ...referenceFields,
       };

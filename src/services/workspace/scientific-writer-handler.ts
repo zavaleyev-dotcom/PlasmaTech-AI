@@ -80,7 +80,7 @@ export async function handleGenerate(raw: unknown, provider: WriterProvider): Pr
     const prompt = buildGenerationPrompt(input, evidence);
     const result = await provider.generate(prompt);
     const isRewriteLike = REWRITE_LIKE_MODES.includes(input.mode);
-    const preservation = isRewriteLike && input.sourceText ? checkPreservation(input.sourceText, result.text) : null;
+    const preservation = isRewriteLike && input.sourceText ? checkPreservation(input.sourceText, result.text, input.mode) : null;
     const changes = isRewriteLike && input.sourceText ? summarizeChanges(input.sourceText, result.text) : null;
     const warnings = buildSafetyWarnings(input, result.text, preservation);
     return { status: 200, body: { generatedText: result.text, evidence, preservation, changes, warnings, providerId: provider.id } };

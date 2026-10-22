@@ -215,21 +215,42 @@ function joinClauses(clauses: (string | undefined)[]): string {
 
 // ---------- APA (full reference), alphabetized bibliography by convention ----------
 
+/** Adds a terminal period only when the text does not already end in sentence punctuation -
+ *  author initials ("Smith J.") and titles ending in "?" must not become "J.." / "?.". */
+function endSentence(text: string): string { return /[.!?]$/.test(text) ? text : `${text}.`; }
+
 function formatAuthorsApa(authors: string[]): string | undefined {
   if (authors.length === 0) return undefined;
-  if (authors.length === 1) return `${authors[0]}.`;
-  if (authors.length === 2) return `${authors[0]} & ${authors[1]}.`;
-  return `${authors.slice(0, -1).join(', ')}, & ${authors[authors.length - 1]}.`;
+  if (authors.length === 1) return endSentence(authors[0]);
+  if (authors.length === 2) return endSentence(`${authors[0]} & ${authors[1]}`);
+  return endSentence(`${authors.slice(0, -1).join(', ')}, & ${authors[authors.length - 1]}`);
 }
+
+/** Which locator fields are meaningful depends on the source type: volume/issue exist only for
+ *  serials (journal/conference series); a book, thesis, report or web page has none, and for a
+ *  book chapter `pages` are the chapter's own pages. The container field means journal /
+ *  proceedings / host book / publisher / institution / site, again by type. The user's data is
+ *  only ever re-arranged or omitted from a position where it does not belong - never altered. */
+const hasSerialLocators = (type: ReferenceType) => type === 'journal_article' || type === 'conference_paper';
 
 export function formatReferenceApa(ref: Reference): string {
   const authors = formatAuthorsApa(ref.authors);
   const year = ref.year !== undefined ? `(${ref.year}).` : undefined;
-  const title = ref.title ? `${ref.title}.` : undefined;
-  const vi = volumeIssue(ref);
-  const containerParts = [ref.containerTitle, vi, ref.pages].filter((v): v is string => !!v);
-  const container = containerParts.length ? `${containerParts.join(', ')}.` : undefined;
-  const link = ref.doi ? `https://doi.org/${ref.doi}` : ref.url;
+  let title: string | undefined;
+  if (ref.title) title = ref.type === 'thesis' ? `${ref.title} [Dissertation${ref.containerTitle ? `, ${ref.containerTitle}` : ''}].` : endSentence(ref.title);
+  let container: string | undefined;
+  if (ref.type === 'journal_article' || ref.type === 'conference_paper') {
+    const parts = [ref.containerTitle, volumeIssue(ref), ref.pages].filter((v): v is string => !!v);
+    container = parts.length ? `${parts.join(', ')}.` : undefined;
+  } else if (ref.type === 'book_chapter') {
+    const host = ref.containerTitle ? `In ${ref.containerTitle}` : undefined;
+    const pages = ref.pages ? `(pp. ${ref.pages})` : undefined;
+    const text = [host, pages].filter(Boolean).join(' ');
+    container = text ? `${text}.` : undefined;
+  } else if (ref.type !== 'thesis' && ref.containerTitle) {
+    container = endSentence(ref.containerTitle);
+  }
+  const link = ref.doi ? `https://doi.org/${ref.doi}` : ref.url ? (ref.type === 'website' && ref.accessDate ? `Retrieved ${ref.accessDate}, from ${ref.url}` : ref.url) : undefined;
   return joinClauses([authors, year, title, container, link]);
 }
 
@@ -245,30 +266,69 @@ function formatAuthorsIeee(authors: string[]): string | undefined {
 export function formatReferenceIeee(ref: Reference, number: number): string {
   const authors = formatAuthorsIeee(ref.authors);
   const authorsClause = authors ? `${authors},` : undefined;
-  const title = ref.title ? `"${ref.title},"` : undefined;
-  const container = ref.containerTitle ? `${ref.containerTitle},` : undefined;
-  const vol = ref.volume ? `vol. ${ref.volume},` : undefined;
-  const no = ref.issue ? `no. ${ref.issue},` : undefined;
-  const pp = ref.pages ? `pp. ${ref.pages},` : undefined;
-  const year = ref.year !== undefined ? `${ref.year}${ref.doi || ref.url ? ',' : '.'}` : undefined;
+  const quoted = ref.title ? `"${ref.title},"` : undefined;
   const link = ref.doi ? `doi: ${ref.doi}.` : ref.url ? `${ref.url}.` : undefined;
-  const body = joinClauses([authorsClause, title, container, vol, no, pp, year, link]);
-  return `[${number}] ${body}`;
+  const yearWith = (text: string | undefined, hasMore: boolean) => (text ? `${text}${hasMore ? ',' : '.'}` : undefined);
+  const pp = ref.pages ? `pp. ${ref.pages}` : undefined;
+  let clauses: (string | undefined)[];
+  switch (ref.type) {
+    case 'conference_paper':
+      clauses = [authorsClause, quoted, ref.containerTitle ? `in Proc. ${ref.containerTitle},` : undefined, ref.year !== undefined ? `${ref.year},` : undefined, yearWith(pp, !!link), link];
+      break;
+    case 'book_chapter':
+      clauses = [authorsClause, quoted, ref.containerTitle ? `in ${ref.containerTitle},` : undefined, pp ? `${pp},` : undefined, yearWith(ref.year !== undefined ? String(ref.year) : undefined, !!link), link];
+      break;
+    case 'book':
+      clauses = [authorsClause, ref.title ? `${ref.title}.` : undefined, ref.containerTitle ? `${ref.containerTitle},` : undefined, yearWith(ref.year !== undefined ? String(ref.year) : undefined, !!link), link];
+      break;
+    case 'thesis':
+      clauses = [authorsClause, quoted, 'Dissertation,', ref.containerTitle ? `${ref.containerTitle},` : undefined, yearWith(ref.year !== undefined ? String(ref.year) : undefined, !!link), link];
+      break;
+    case 'report':
+      clauses = [authorsClause, quoted, ref.containerTitle ? `${ref.containerTitle},` : undefined, 'Rep.,', yearWith(ref.year !== undefined ? String(ref.year) : undefined, !!link), link];
+      break;
+    case 'website':
+      clauses = [authorsClause, ref.title ? `"${ref.title}."` : undefined, ref.containerTitle ? `${ref.containerTitle}.` : undefined, ref.url ? `${ref.url}${ref.accessDate ? ` (accessed ${ref.accessDate}).` : '.'}` : undefined];
+      break;
+    default: {
+      const container = ref.containerTitle ? `${ref.containerTitle},` : undefined;
+      const vol = ref.volume ? `vol. ${ref.volume},` : undefined;
+      const no = ref.issue ? `no. ${ref.issue},` : undefined;
+      const year = ref.year !== undefined ? `${ref.year}${link ? ',' : '.'}` : undefined;
+      clauses = [authorsClause, quoted, container, vol, no, pp ? `${pp},` : undefined, year, link];
+    }
+  }
+  return `[${number}] ${joinClauses(clauses)}`;
 }
 
 // ---------- GOST-style (numbered, citation order; explicitly named as a simplified style) ----------
 
 export function formatReferenceGost(ref: Reference, number: number): string {
-  const authors = ref.authors.length > 0 ? `${ref.authors.join(', ')}.` : undefined;
-  const title = ref.title ? ref.title : undefined;
-  const container = ref.containerTitle ? `// ${ref.containerTitle}.` : undefined;
+  const authors = ref.authors.length > 0 ? endSentence(ref.authors.join(', ')) : undefined;
   const year = ref.year !== undefined ? `– ${ref.year}.` : undefined;
-  const vi = volumeIssue(ref);
-  const volPart = vi ? `– Т./№ ${vi}.` : undefined;
   const pages = ref.pages ? `– С. ${ref.pages}.` : undefined;
-  const link = ref.doi ? `– DOI: ${ref.doi}.` : ref.url ? `– URL: ${ref.url}.` : undefined;
-  const body = joinClauses([authors, title, container, year, volPart, pages, link]);
-  return `${number}. ${body}`;
+  const doiOrUrl = ref.doi ? `– DOI: ${ref.doi}.` : ref.url ? `– URL: ${ref.url}.` : undefined;
+  let clauses: (string | undefined)[];
+  switch (ref.type) {
+    case 'book':
+    case 'report':
+      // The container field is the publisher/institution here: "– Publisher, year.", never "// ...".
+      clauses = [authors, ref.title ? endSentence(ref.title) : undefined, ref.containerTitle || ref.year !== undefined ? `– ${[ref.containerTitle, ref.year].filter(v => v !== undefined && v !== '').join(', ')}.` : undefined, pages, doiOrUrl];
+      break;
+    case 'thesis':
+      clauses = [authors, ref.title ? `${ref.title} : дис.` : 'дис.', ref.containerTitle || ref.year !== undefined ? `– ${[ref.containerTitle, ref.year].filter(v => v !== undefined && v !== '').join(', ')}.` : undefined, pages, doiOrUrl];
+      break;
+    case 'website':
+      clauses = [authors, ref.title ? `${ref.title} [Электронный ресурс].` : undefined, ref.containerTitle ? `– ${ref.containerTitle}.` : undefined, year, ref.url ? `– URL: ${ref.url}${ref.accessDate ? ` (дата обращения: ${ref.accessDate})` : ''}.` : undefined];
+      break;
+    default: {
+      // Journal, conference paper, book chapter: a component of a larger work ("//").
+      const container = ref.containerTitle ? `// ${ref.containerTitle}.` : undefined;
+      const vi = hasSerialLocators(ref.type) ? volumeIssue(ref) : undefined;
+      clauses = [authors, ref.title, container, year, vi ? `– Т./№ ${vi}.` : undefined, pages, doiOrUrl];
+    }
+  }
+  return `${number}. ${joinClauses(clauses)}`;
 }
 
 export interface FormattedBibliography { numbered: boolean; entries: { reference: Reference; text: string }[] }
