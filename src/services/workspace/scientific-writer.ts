@@ -574,9 +574,12 @@ export interface AddedSignificanceCheck { added: string[]; ok: boolean }
 // A marker is NOT an asserted claim only when a negation demonstrably scopes THAT marker:
 //   (A) a negator right before it, with at most one word in between - "не достоверен",
 //       "не является статистически значимым", "was not significant", "недостаточно достоверно" -
-//       except "не только"/"not only" (emphasis: "не только достоверен" asserts it);
-//   (B) a negated assessment verb right after it - "Достоверность не оценивалась",
-//       "Significance was not assessed";
+//       except constructions that AFFIRM despite the "не": "не только"/"not only" and
+//       "не менее"/"no less" ("не менее достоверен" = at least as reliable), and double negation
+//       ("не может не быть достоверным");
+//   (B) a negated assessment verb right after it, in the same coordination - "Достоверность не
+//       оценивалась", "Significance was not assessed" - but NOT after a conjunction: in
+//       "Результат достоверен и не проверялся" the "не" belongs to a separate, joined predicate;
 //   (C) a fixed "no data on / without assessment of" phrase directly before it.
 // Any other negator in the clause ("Без нагрева ... достоверно", "... получено без нагрева",
 // "Нагрев не применяли, результат достоверен") negates something else and suppresses nothing.
@@ -584,10 +587,12 @@ export interface AddedSignificanceCheck { added: string[]; ok: boolean }
 // the scope is unclear the marker counts as a claim - a warning is preferred to a silent pass.
 // This is a conservative lexical heuristic, not an understanding of the sentence.
 const NEGATOR_WORD = /^(?:не|нет|ни|недостаточно|not|no|never|cannot|insufficient|unable|\p{L}+n't)$/iu;
-const EMPHASIS_WORD = /^(?:только|лишь|просто|only|merely|just)$/iu;
+// A word right after "не"/"not" that makes the pair AFFIRM the marker instead of negating it.
+const AFFIRMING_AFTER_NEGATOR = /^(?:только|лишь|просто|менее|меньше|хуже|only|merely|just|less|worse)$/iu;
+const CONJUNCTION = '(?:и|а|но|да|или|либо|зато|хотя|причём|причем|and|but|or|yet|so|while|though|although|whereas)';
 const ASSESSMENT_VERBS = '(?:оцен\\p{L}*|определ\\p{L}*|провер\\p{L}*|подтвержд\\p{L}*|подтверждён|установ\\p{L}*|показан\\p{L}*|доказан\\p{L}*|исследовал\\p{L}*|рассчитыва\\p{L}*|анализиров\\p{L}*|'
   + 'assess\\p{L}*|evaluat\\p{L}*|test\\p{L}*|determin\\p{L}*|establish\\p{L}*|confirm\\p{L}*|demonstrat\\p{L}*|calculat\\p{L}*|examin\\p{L}*|check\\p{L}*|measur\\p{L}*|verif\\p{L}*|comput\\p{L}*)';
-const NEGATED_ASSESSMENT_AFTER = new RegExp(`^\\s*(?:[\\p{L}\\p{N}'-]+\\s+){0,2}(?:не|not|\\p{L}+n't)\\s+(?:[\\p{L}'-]+\\s+)?${ASSESSMENT_VERBS}`, 'iu');
+const NEGATED_ASSESSMENT_AFTER = new RegExp(`^\\s*(?:(?!${CONJUNCTION}(?![\\p{L}\\p{N}]))[\\p{L}\\p{N}'-]+\\s+)?(?:не|not|\\p{L}+n't)\\s+(?:[\\p{L}'-]+\\s+)?${ASSESSMENT_VERBS}`, 'iu');
 const NO_DATA_PHRASE_BEFORE = new RegExp(
   `(?:${WB_START}нет\\s+(?:данных|информации|сведений|оценки|подтверждения)\\s+(?:о|об|по|для)?|${WB_START}без\\s+(?:оценки|проверки|подтверждения|анализа|определения)|`
   + `${WB_START}no\\s+(?:data|evidence|information)\\s+(?:on|about|of|for)|${WB_START}without\\s+(?:assessment|assessing|testing|confirmation|evaluation)\\s+(?:of)?)\\s*$`, 'iu');
@@ -614,8 +619,10 @@ function isNegated(text: string, start: number, end: number): boolean {
   const words = wordsOf(before);
   const last = words[words.length - 1];
   const beforeLast = words[words.length - 2];
-  if (last && NEGATOR_WORD.test(last)) return true;
-  if (beforeLast && NEGATOR_WORD.test(beforeLast) && last && !EMPHASIS_WORD.test(last)) return true;
+  // Two negators close together ("не может не быть достоверным") cancel out: an assertion.
+  const doubleNegation = (index: number) => words.slice(Math.max(0, index - 2), index).some(w => NEGATOR_WORD.test(w));
+  if (last && NEGATOR_WORD.test(last)) return !doubleNegation(words.length - 1);
+  if (beforeLast && NEGATOR_WORD.test(beforeLast) && last && !AFFIRMING_AFTER_NEGATOR.test(last)) return !doubleNegation(words.length - 2);
   if (NO_DATA_PHRASE_BEFORE.test(before)) return true;
   return NEGATED_ASSESSMENT_AFTER.test(after);
 }

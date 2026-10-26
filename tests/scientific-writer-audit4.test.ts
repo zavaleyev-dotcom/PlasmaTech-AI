@@ -95,6 +95,63 @@ test('significance through the real generate handler: the audit example now retu
   assert.ok(!(clean.body.warnings as string[]).some(w => w.includes('значимости')));
 });
 
+test('significance: a negated verb in a JOINED predicate does not negate the marker ("достоверен и не проверялся")', () => {
+  const outputs: [string, string][] = [
+    ['Результат достоверен и не проверялся повторно.', 'достоверен'],
+    ['Результат достоверен, но не проверялся повторно.', 'достоверен'],
+    ['Результат достоверен, а не проверялся.', 'достоверен'],
+    ['Результат достоверен или не оценивался.', 'достоверен'],
+    ['Результат достоверен, хотя не оценивался.', 'достоверен'],
+  ];
+  for (const [output, word] of outputs) assert.deepEqual(checkNoAddedSignificanceClaims(SOURCE, output).added, [word], output);
+  for (const output of [
+    'The effect was significant and was not tested again.', 'The effect is significant but not assessed.', 'The effect is significant and not assessed.',
+    'The effect was significant while it was not checked.',
+  ]) assert.equal(checkNoAddedSignificanceClaims('The effect appeared.', output).ok, false, output);
+});
+
+test('significance: "не менее" / "no less" AFFIRM the marker (at least as reliable), like "не только"', () => {
+  for (const output of ['Результат не менее достоверен.', 'Результат не меньше достоверен.', 'Результат не хуже достоверен.', 'Не менее достоверное улучшение.']) {
+    assert.equal(checkNoAddedSignificanceClaims(SOURCE, output).ok, false, output);
+  }
+  for (const output of ['The result is no less significant.', 'The result is not less significant.', 'The result is not worse, significant.'.replace(', ', ' ')]) {
+    assert.equal(checkNoAddedSignificanceClaims('It improved.', output).ok, false, output);
+  }
+});
+
+test('significance: double negation is an assertion ("не может не быть достоверным"), and ambiguity prefers a warning', () => {
+  for (const output of ['Результат не может не быть достоверным.', 'Результат не мог не быть достоверным.']) assert.equal(checkNoAddedSignificanceClaims(SOURCE, output).ok, false, output);
+  assert.equal(checkNoAddedSignificanceClaims('It improved.', 'It cannot but be significant, and it was not nothing.').ok, false);
+});
+
+test('significance: the previously correct negations are still not claims (regression guard for the two fixes above)', () => {
+  for (const output of [
+    'Достоверность не оценивалась.', 'Результат не является достоверным.', 'Достоверность результата не определена.', 'Достоверность не подтверждена.',
+    'Результат не достоверен.', 'Различие не является статистически значимым.', 'Статистическая значимость не проверялась.', 'Нет данных о достоверности.',
+    'Без оценки достоверности.', 'Недостаточно достоверно.', 'Различие недостоверно.',
+  ]) assert.equal(checkNoAddedSignificanceClaims(SOURCE, output).ok, true, output);
+  for (const output of ['The change was not significant.', 'Significance was not assessed.', 'It did not change significantly.', 'No significant difference was found.']) {
+    assert.equal(checkNoAddedSignificanceClaims('It changed.', output).ok, true, output);
+  }
+  for (const output of ['Без нагрева покрытие достоверно повысило твёрдость.', 'Результат не только достоверен, но и воспроизводим.', 'Нагрев не применяли — результат достоверен.']) {
+    assert.equal(checkNoAddedSignificanceClaims(SOURCE, output).ok, false, output);
+  }
+  assert.equal(checkNoAddedSignificanceClaims('Достоверность не оценивалась.', 'Результат достоверен.').ok, false, 'a negated source does not excuse an assertion');
+  assert.equal(checkNoAddedSignificanceClaims('Достоверность не оценивалась.', 'Достоверность не оценивалась.').ok, true);
+});
+
+test('significance through the real generate handler: both reported sentences now return a warning', async () => {
+  const stub = (text: string): WriterProvider => ({ id: 'stub', configured: () => true, generate: async () => ({ text }) });
+  const raw = { documentType: 'article', mode: 'edit', targetLanguage: 'ru', sourceText: SOURCE };
+  for (const text of ['Результат достоверен и не проверялся повторно.', 'Результат не менее достоверен.']) {
+    const result = await handleGenerate(raw, stub(text));
+    assert.equal(result.status, 200);
+    assert.ok((result.body.warnings as string[]).some(w => w.includes('значимости') && w.includes('достоверен')), `${text}: ${JSON.stringify(result.body.warnings)}`);
+  }
+  const clean = await handleGenerate(raw, stub('Покрытие повысило твёрдость; достоверность не оценивалась.'));
+  assert.ok(!(clean.body.warnings as string[]).some(w => w.includes('значимости')));
+});
+
 // =====================================================================================
 // 2. Arithmetic with spaces stays literal
 // =====================================================================================
