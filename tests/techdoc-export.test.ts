@@ -17,7 +17,7 @@ function sampleDoc(): TechnicalProcessDocument {
   let doc = createDocumentFromPreset('magnetron-pvd');
   doc = { ...doc, general: { ...doc.general, processName: 'AlTiN_PVD', equipment: 'Установка X', purpose: 'Износостойкое покрытие', documentVersion: 'v1' } };
   doc = { ...doc, steps: updateStep(doc.steps, 6, {
-    temperatureC: 350, pressureMbar: 0.005, durationMin: 60,
+    temperatureC: 350, pressurePa: 0.5, durationMin: 60,
     gasUsage: [{ gas: 'Ar', flowSccm: 40 }], powerW: 3000, substrateBiasV: -80, notes: 'примечание к этапу',
   }) };
   doc = { ...doc, qualityChecks: [{ ...createQualityCheck('Толщина покрытия'), method: 'Калотест', criterion: '>= 2 мкм', result: '2.3 мкм', status: 'pass' }] };

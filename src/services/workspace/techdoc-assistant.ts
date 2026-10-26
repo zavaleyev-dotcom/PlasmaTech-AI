@@ -7,7 +7,13 @@
  *  file implements: no silent parameter substitution, ever. */
 
 import { solveDeposition, type ThicknessUnit, type RateUnit } from './engineering-calculators';
-import { parseTechnicalProcessDocument } from './techdoc-parse';
+import { parseTechnicalProcessDocument, parseSchemaVersion } from './techdoc-parse';
+import {
+  TECHDOC_SCHEMA_VERSION, DEFAULT_PRESSURE_UNIT, PRESSURE_UNIT_LABELS, isPressureUnit, paToDisplayText, UnsupportedSchemaVersionError,
+  type PressureUnit,
+} from './techdoc-schema';
+
+export { TECHDOC_SCHEMA_VERSION, PRESSURE_UNITS, PRESSURE_UNIT_LABELS, PA_PER_MBAR, pressureToPa, paToDisplayText, paToDisplayInputValue, parsePressureInput, parsePressureText, type PressureUnit } from './techdoc-schema';
 
 // ---------- shared validation helpers ----------
 
@@ -87,7 +93,9 @@ export interface ProcessStep {
   description?: string;
   durationMin?: number;
   temperatureC?: number;
-  pressureMbar?: number;
+  /** Canonical storage unit is pascal. Never `0` for "not set" (`undefined` means not set; `0` is a
+   *  real, if unusual, value). Shown in the document's `pressureUnit`. */
+  pressurePa?: number;
   gasUsage: GasUsage[];
   sourceConfiguration?: string;
   powerW?: number;
@@ -390,7 +398,8 @@ export function touchDocument(doc: TechnicalProcessDocument): TechnicalProcessDo
  *  HTTP input - reusing it here closes that gap instead of writing a second, possibly
  *  inconsistent validator. */
 export function tryRestoreDocument(rawJson: string | null | undefined): TechnicalProcessDocument | null {
-  return restoreDocumentWithReport(rawJson)?.document ?? null;
+  const result = restoreDocumentDetailed(rawJson);
+  return result.status === 'ok' ? result.document : null;
 }
 
 /** Same as tryRestoreDocument, plus how many source ids had to be repaired. A saved document
@@ -399,20 +408,49 @@ export function tryRestoreDocument(rawJson: string | null | undefined): Technica
  *  several sources at once. Duplicates are repaired on restore: the first record keeps its id,
  *  later repeats get a fresh unique one, and no source parameter is altered. */
 export function restoreDocumentWithReport(rawJson: string | null | undefined): { document: TechnicalProcessDocument; repairedSourceIds: number } | null {
-  if (!rawJson) return null;
+  const result = restoreDocumentDetailed(rawJson);
+  return result.status === 'ok' ? { document: result.document, repairedSourceIds: result.repairedSourceIds } : null;
+}
+
+export type RestoreResult =
+  | { status: 'empty' }
+  /** `migratedFromSchema` is set when the saved document was an OLDER schema and was converted in
+   *  memory (e.g. 1 -> 2: step pressure mbar -> Pa). Nothing is written back by restoring: the
+   *  stored copy stays as it was until the user saves explicitly. */
+  | { status: 'ok'; document: TechnicalProcessDocument; repairedSourceIds: number; migratedFromSchema?: number }
+  /** Saved by a NEWER schema than this build knows: not parsed, not converted, not loaded. */
+  | { status: 'future_version'; schemaVersion: number }
+  | { status: 'invalid' };
+
+/** Restores a saved document and says WHY when it cannot: nothing saved, a newer unknown schema
+ *  (the caller must tell the user and must not overwrite it silently), or unusable data. Never
+ *  throws and never writes to storage. */
+export function restoreDocumentDetailed(rawJson: string | null | undefined): RestoreResult {
+  if (!rawJson) return { status: 'empty' };
   try {
-    const parsed = parseTechnicalProcessDocument(JSON.parse(rawJson));
+    const json: unknown = JSON.parse(rawJson);
+    const savedSchema = json !== null && typeof json === 'object' && !Array.isArray(json) ? parseSchemaVersion((json as Record<string, unknown>).schemaVersion) : 1;
+    const parsed = parseTechnicalProcessDocument(json);
     validateDocument(parsed);
     const { sources, repaired } = ensureUniqueSourceIds(parsed.sources);
-    return { document: repaired === 0 ? parsed : { ...parsed, sources }, repairedSourceIds: repaired };
-  } catch {
-    return null;
+    return {
+      status: 'ok', document: repaired === 0 ? parsed : { ...parsed, sources }, repairedSourceIds: repaired,
+      ...(savedSchema < TECHDOC_SCHEMA_VERSION ? { migratedFromSchema: savedSchema } : {}),
+    };
+  } catch (error) {
+    return error instanceof UnsupportedSchemaVersionError ? { status: 'future_version', schemaVersion: error.schemaVersion } : { status: 'invalid' };
   }
 }
 
 // ---------- TechnicalProcessDocument (top level) ----------
 
 export interface TechnicalProcessDocument {
+  /** Version of the STORAGE FORMAT (see techdoc-schema.ts) - not the revision of the document's
+   *  content, which is `traceability.version`. */
+  schemaVersion: number;
+  /** Display unit of every step pressure in the editor, previews and exports. Changing it never
+   *  changes a stored value (those are always pascal). */
+  pressureUnit: PressureUnit;
   general: GeneralInfo;
   initialData: InitialData;
   steps: ProcessStep[];
@@ -426,6 +464,8 @@ export interface TechnicalProcessDocument {
 export function createBlankDocument(): TechnicalProcessDocument {
   const now = new Date().toISOString();
   return {
+    schemaVersion: TECHDOC_SCHEMA_VERSION,
+    pressureUnit: DEFAULT_PRESSURE_UNIT,
     general: { processName: '' },
     initialData: {},
     steps: [],
@@ -458,6 +498,8 @@ export function createDocumentFromPreset(presetId: string): TechnicalProcessDocu
   const now = new Date().toISOString();
   const steps = renumber(preset.stepTypes.map(type => ({ ...createStep(type, undefined, 'preset'), order: 0 })));
   return {
+    schemaVersion: TECHDOC_SCHEMA_VERSION,
+    pressureUnit: DEFAULT_PRESSURE_UNIT,
     general: { processName: '' },
     initialData: {},
     steps,
@@ -472,6 +514,7 @@ export function createDocumentFromPreset(presetId: string): TechnicalProcessDocu
 // ---------- validation (item 7): only objectively invalid values, never invented limits ----------
 
 export function validateDocument(doc: TechnicalProcessDocument): void {
+  if (!isPressureUnit(doc.pressureUnit)) throw new Error('Единица давления: допустимо Па или мбар.');
   if (!doc.general.processName || !doc.general.processName.trim()) {
     throw new Error('Название процесса: обязательное поле, введите значение.');
   }
@@ -483,7 +526,7 @@ export function validateDocument(doc: TechnicalProcessDocument): void {
 
     checkOptionalNonNegative(step.durationMin, `Этап №${step.order}: длительность`);
     checkOptionalAboveAbsoluteZero(step.temperatureC, `Этап №${step.order}: температура`);
-    checkOptionalNonNegative(step.pressureMbar, `Этап №${step.order}: давление`);
+    checkOptionalNonNegative(step.pressurePa, `Этап №${step.order}: давление`);
     checkOptionalNonNegative(step.powerW, `Этап №${step.order}: мощность`);
     checkOptionalNonNegative(step.currentA, `Этап №${step.order}: ток`);
     checkOptionalFinite(step.substrateBiasV, `Этап №${step.order}: substrate bias`); // bias is routinely negative in PVD - finite only, never non-negative
@@ -521,6 +564,13 @@ function fmtNum(value: number | undefined, unit: string, dash = false): string {
   if (value === undefined) return dash ? DASH : NOT_SET;
   return `${value}${unit}`;
 }
+/** A stored pressure (Pa) shown in the document's display unit, e.g. "0.5 Па" / "0.005 мбар".
+ *  `0` is shown as "0 Па" (a value), `undefined` as "не задано"/"—" (no value). */
+export function formatPressure(pa: number | undefined, unit: PressureUnit, dash = false): string {
+  const shown = paToDisplayText(pa, unit);
+  return shown === undefined ? (dash ? DASH : NOT_SET) : `${shown} ${PRESSURE_UNIT_LABELS[unit]}`;
+}
+
 function fmtStr(value: string | undefined, dash = false): string {
   if (value === undefined || value === '') return dash ? DASH : NOT_SET;
   return value;
@@ -573,7 +623,7 @@ export function buildInstructionView(doc: TechnicalProcessDocument): string {
     if (step.description) lines.push(step.description);
     lines.push(`- Длительность: ${fmtNum(step.durationMin, ' мин')}`);
     lines.push(`- Температура: ${fmtNum(step.temperatureC, '°C')}`);
-    lines.push(`- Давление: ${fmtNum(step.pressureMbar, ' мбар')}`);
+    lines.push(`- Давление: ${formatPressure(step.pressurePa, doc.pressureUnit)}`);
     lines.push(`- Газы: ${fmtGases(step.gasUsage)}`);
     lines.push(`- Источник/мощность: ${fmtSourcePower(step)}`);
     lines.push(`- Substrate bias: ${fmtNum(step.substrateBiasV, ' В')}`);
@@ -632,7 +682,7 @@ export function buildTechnologicalCard(doc: TechnicalProcessDocument): TechCardR
     operation: step.enabled ? step.name : `${step.name} (отключён)`,
     duration: fmtNum(step.durationMin, ' мин', true),
     temperature: fmtNum(step.temperatureC, '°C', true),
-    pressure: fmtNum(step.pressureMbar, ' мбар', true),
+    pressure: formatPressure(step.pressurePa, doc.pressureUnit, true),
     gases: fmtGases(step.gasUsage),
     sourcePower: fmtSourcePower(step),
     bias: fmtNum(step.substrateBiasV, ' В', true),
@@ -678,7 +728,7 @@ export function buildBriefRecipe(doc: TechnicalProcessDocument): string {
     if (!step.enabled) continue;
     const parts = [
       step.temperatureC !== undefined ? `T: ${step.temperatureC}°C` : null,
-      step.pressureMbar !== undefined ? `P: ${step.pressureMbar} мбар` : null,
+      step.pressurePa !== undefined ? `P: ${formatPressure(step.pressurePa, doc.pressureUnit)}` : null,
       step.durationMin !== undefined ? `t: ${step.durationMin} мин` : null,
       step.powerW !== undefined ? `W: ${step.powerW} Вт` : null,
     ].filter(Boolean);

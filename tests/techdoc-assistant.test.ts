@@ -39,7 +39,7 @@ test('createDocumentFromPreset: creates the expected stage structure with no pre
     assert.equal(step.name, STEP_TYPE_LABELS[step.type]);
     assert.equal(step.durationMin, undefined);
     assert.equal(step.temperatureC, undefined);
-    assert.equal(step.pressureMbar, undefined);
+    assert.equal(step.pressurePa, undefined);
     assert.equal(step.powerW, undefined);
     assert.deepEqual(step.gasUsage, []);
   }
@@ -63,10 +63,10 @@ test('every preset produces a stage list drawn only from the supported step-type
 
 test('user-entered values are preserved exactly - no rounding, correction, or substitution by the system', () => {
   let doc = createDocumentFromPreset('magnetron-pvd');
-  doc = { ...doc, steps: updateStep(doc.steps, 1, { temperatureC: 187.654321, pressureMbar: 0.00013579, notes: '  raw text, not touched  ' }) };
+  doc = { ...doc, steps: updateStep(doc.steps, 1, { temperatureC: 187.654321, pressurePa: 0.013579, notes: '  raw text, not touched  ' }) };
   const step = doc.steps.find(s => s.order === 1)!;
   assert.equal(step.temperatureC, 187.654321);
-  assert.equal(step.pressureMbar, 0.00013579);
+  assert.equal(step.pressurePa, 0.013579);
   assert.equal(step.notes, '  raw text, not touched  ');
   assert.equal(step.origin, 'user'); // editing a preset step marks it user-modified
 });
@@ -91,7 +91,7 @@ test('validateDocument: rejects NaN/Infinity, negative time/pressure/flow/power,
   assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { temperatureC: NaN }) }), /температура/);
   assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { temperatureC: Infinity }) }), /температура/);
   assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { durationMin: -5 }) }), /длительность/);
-  assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { pressureMbar: -1 }) }), /давление/);
+  assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { pressurePa: -1 }) }), /давление/);
   assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { powerW: -100 }) }), /мощность/);
   assert.throws(() => validateDocument({ ...doc, steps: updateStep(doc.steps, 1, { gasUsage: [{ gas: 'Ar', flowSccm: -1 }] }) }), /расход газа/);
 });
@@ -234,12 +234,12 @@ test('provenance after copy (Codex regression): duplicating a preset-sourced ste
 
 test('technological card output: shows "—" for every unset field, and real values for what was entered', () => {
   let doc = withName(createDocumentFromPreset('magnetron-pvd'));
-  doc = { ...doc, steps: updateStep(doc.steps, 6, { temperatureC: 350, pressureMbar: 0.005, gasUsage: [{ gas: 'Ar', flowSccm: 40 }] }) };
+  doc = { ...doc, steps: updateStep(doc.steps, 6, { temperatureC: 350, pressurePa: 0.5, gasUsage: [{ gas: 'Ar', flowSccm: 40 }] }) };
   const card = buildTechnologicalCard(doc);
   assert.equal(card.length, doc.steps.length);
   const mainCoating = card.find(r => r.number === 6)!;
   assert.equal(mainCoating.temperature, '350°C');
-  assert.equal(mainCoating.pressure, '0.005 мбар');
+  assert.equal(mainCoating.pressure, '0.5 Па');
   assert.equal(mainCoating.gases, 'Ar (40 см³/мин)');
   const untouched = card.find(r => r.number === 1)!;
   assert.equal(untouched.duration, '—');

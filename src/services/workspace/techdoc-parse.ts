@@ -22,6 +22,7 @@ import {
   type TechnicalProcessDocument, type GeneralInfo, type InitialData, type ProcessStep, type GasUsage,
   type SourceSet, type MagnetronSource, type ArcSource, type GasLine, type QualityCheck, type SafetySection, type Traceability,
 } from './techdoc-assistant';
+import { TECHDOC_SCHEMA_VERSION, DEFAULT_PRESSURE_UNIT, isPressureUnit, migrateMbarToPa, UnsupportedSchemaVersionError } from './techdoc-schema';
 
 const MAX_SHORT_TEXT = 300;
 const MAX_LONG_TEXT = 5000;
@@ -103,7 +104,20 @@ function parseGasUsage(raw: unknown, label: string): GasUsage[] {
   });
 }
 
-function parseStep(raw: unknown, index: number): ProcessStep {
+function parseStepPressure(o: Record<string, unknown>, label: string, legacyPressure: boolean): number | undefined {
+  const pa = asOptionalNumber(o.pressurePa, `${label}: давление`);
+  if (pa !== undefined) return pa;
+  if (!legacyPressure) return undefined;
+  const mbar = asOptionalNumber(o.pressureMbar, `${label}: давление`);
+  return mbar === undefined ? undefined : migrateMbarToPa(mbar);
+}
+
+/** `legacyPressure`: the document is schema 1, whose step pressure was stored in mbar as
+ *  `pressureMbar`. It is converted to the canonical pascal exactly here, once - the parsed
+ *  document is always the current schema, so a later save/restore never converts it again. A step
+ *  that already carries `pressurePa` keeps it untouched (never overwritten by a conversion), and
+ *  in a current-schema document a stray `pressureMbar` is ignored, never converted. */
+function parseStep(raw: unknown, index: number, legacyPressure: boolean): ProcessStep {
   const o = asObject(raw, `Этап[${index}]`);
   const label = `Этап №${index + 1}`;
   return {
@@ -114,7 +128,7 @@ function parseStep(raw: unknown, index: number): ProcessStep {
     description: asOptionalString(o.description, `${label}: описание`, MAX_LONG_TEXT),
     durationMin: asOptionalNumber(o.durationMin, `${label}: длительность`),
     temperatureC: asOptionalNumber(o.temperatureC, `${label}: температура`),
-    pressureMbar: asOptionalNumber(o.pressureMbar, `${label}: давление`),
+    pressurePa: parseStepPressure(o, label, legacyPressure),
     gasUsage: parseGasUsage(o.gasUsage, `${label}: газы`),
     sourceConfiguration: asOptionalString(o.sourceConfiguration, `${label}: источник`),
     powerW: asOptionalNumber(o.powerW, `${label}: мощность`),
@@ -234,17 +248,39 @@ function parseTraceability(raw: unknown): Traceability {
  *  no single field can be used to exhaust memory/CPU. */
 export function parseTechnicalProcessDocument(raw: unknown): TechnicalProcessDocument {
   const o = asObject(raw, 'document');
+  const schemaVersion = parseSchemaVersion(o.schemaVersion);
+  const legacyPressure = schemaVersion < 2;
   const stepsRaw = asArray(o.steps, 'Этапы процесса', MAX_STEPS);
   const qualityChecksRaw = asArray(o.qualityChecks, 'Контроль качества', MAX_QUALITY_CHECKS);
   const gasSystemRaw = asArray(o.gasSystem, 'Газовая система', MAX_SMALL_ARRAY);
   return {
+    // Always the CURRENT schema: whatever was read here has been migrated in memory.
+    schemaVersion: TECHDOC_SCHEMA_VERSION,
+    pressureUnit: parsePressureUnit(o.pressureUnit),
     general: parseGeneralInfo(o.general),
     initialData: parseInitialData(o.initialData),
-    steps: stepsRaw.map((s, i) => parseStep(s, i)),
+    steps: stepsRaw.map((s, i) => parseStep(s, i, legacyPressure)),
     sources: parseSourceSet(o.sources),
     gasSystem: gasSystemRaw.map((g, i) => parseGasLine(g, i)),
     qualityChecks: qualityChecksRaw.map((q, i) => parseQualityCheck(q, i)),
     safety: parseSafety(o.safety),
     traceability: parseTraceability(o.traceability),
   };
+}
+
+/** Absent -> 1 (documents saved before the field existed). A newer-than-known version is refused
+ *  with UnsupportedSchemaVersionError BEFORE anything else is read: its structure is unknown, and
+ *  guessing could corrupt it. Anything that is not a positive integer is a malformed document. */
+export function parseSchemaVersion(value: unknown): number {
+  if (value === undefined || value === null) return 1;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) throw new Error('Версия схемы документа: ожидается целое число не меньше 1.');
+  if (value > TECHDOC_SCHEMA_VERSION) throw new UnsupportedSchemaVersionError(value);
+  return value;
+}
+
+/** Display unit; absent (every pre-existing document) -> the default, pascals. */
+function parsePressureUnit(value: unknown) {
+  if (value === undefined || value === null) return DEFAULT_PRESSURE_UNIT;
+  if (!isPressureUnit(value)) throw new Error('Единица давления: допустимо Па или мбар.');
+  return value;
 }

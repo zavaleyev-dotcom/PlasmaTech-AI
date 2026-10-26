@@ -2,14 +2,15 @@
 
 import { useEffect, useState } from 'react';
 import {
-  createBlankDocument, createDocumentFromPreset, validateDocument, touchDocument, restoreDocumentWithReport,
+  createBlankDocument, createDocumentFromPreset, validateDocument, touchDocument, restoreDocumentDetailed,
+  PRESSURE_UNITS, PRESSURE_UNIT_LABELS, paToDisplayInputValue, parsePressureInput,
   PROCESS_PRESETS, STEP_TYPES, STEP_TYPE_LABELS, QUALITY_CHECK_CATEGORIES,
   addStep, removeStep, duplicateStep, moveStep, toggleStepEnabled, updateStep, calculateStepDurationFromDeposition,
   addGasLine, removeGasLine, updateGasLine,
   addMagnetron, removeMagnetron, updateMagnetron, addArcSource, removeArcSource, updateArcSource,
   createQualityCheck,
   buildTechnologicalCard, buildRouteCard, buildInstructionView, buildBriefRecipe,
-  type TechnicalProcessDocument, type ProcessStep, type StepType, type QualityCheck,
+  type TechnicalProcessDocument, type ProcessStep, type StepType, type QualityCheck, type PressureUnit,
 } from '@/services/workspace/techdoc-assistant';
 import { DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, type DocumentType, type ExportFormat } from '@/services/workspace/techdoc-export-types';
 
@@ -19,9 +20,11 @@ type ViewMode = 'instruction' | 'techcard' | 'routecard' | 'recipe';
  *  or browsers. See the honest wording in save()'s notice below. */
 const STORAGE_KEY = 'techdoc-assistant:document';
 
+const FUTURE_VERSION_NOTICE = (version: number) => `В этом браузере сохранён документ более новой схемы (версия ${version}); эта версия приложения её не понимает, поэтому документ не загружен. Он не изменён и не удалён. Сохранение поверх него отключено, пока вы явно не подтвердите замену.`;
+
 function num(v: string): number | undefined { return v.trim() === '' ? undefined : Number(v); }
 
-function StepCard({ step, total, onChange }: { step: ProcessStep; total: number; onChange: (updater: (steps: ProcessStep[]) => ProcessStep[]) => void }) {
+function StepCard({ step, total, pressureUnit, onChange }: { step: ProcessStep; total: number; pressureUnit: PressureUnit; onChange: (updater: (steps: ProcessStep[]) => ProcessStep[]) => void }) {
   const [calcOpen, setCalcOpen] = useState(false);
   const [thickness, setThickness] = useState('1000');
   const [rate, setRate] = useState('10');
@@ -55,8 +58,8 @@ function StepCard({ step, total, onChange }: { step: ProcessStep; total: number;
       <label className="text-sm">Температура, °C
         <input type="number" step="any" className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={step.temperatureC ?? ''} onChange={e => patch({ temperatureC: num(e.target.value) })} />
       </label>
-      <label className="text-sm">Давление, мбар
-        <input type="number" step="any" className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={step.pressureMbar ?? ''} onChange={e => patch({ pressureMbar: num(e.target.value) })} />
+      <label className="text-sm">Давление, {PRESSURE_UNIT_LABELS[pressureUnit]}
+        <input type="number" step="any" min={0} className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={paToDisplayInputValue(step.pressurePa, pressureUnit) ?? ''} onChange={e => patch({ pressurePa: parsePressureInput(e.target.value, pressureUnit) })} />
       </label>
       <label className="text-sm">Источник (описание)
         <input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={step.sourceConfiguration ?? ''} onChange={e => patch({ sourceConfiguration: e.target.value || undefined })} />
@@ -218,6 +221,7 @@ export function TechDocAssistant() {
   const [view, setView] = useState<ViewMode>('instruction');
   const [error, setError] = useState('');
   const [savedNotice, setSavedNotice] = useState('');
+  const [futureVersion, setFutureVersion] = useState<number | null>(null);
   const [newStepType, setNewStepType] = useState<StepType>(STEP_TYPES[0]);
 
   function updateSteps(updater: (steps: ProcessStep[]) => ProcessStep[]) {
@@ -227,10 +231,18 @@ export function TechDocAssistant() {
   useEffect(() => {
     const initial = setTimeout(() => {
       try {
-        const restored = restoreDocumentWithReport(localStorage.getItem(STORAGE_KEY));
-        if (restored) {
+        const restored = restoreDocumentDetailed(localStorage.getItem(STORAGE_KEY));
+        if (restored.status === 'ok') {
           setDoc(restored.document);
-          if (restored.repairedSourceIds > 0) setSavedNotice(`В сохранённом документе повторялись идентификаторы источников (исправлено: ${restored.repairedSourceIds}). Параметры источников не изменены.`);
+          const notes: string[] = [];
+          if (restored.migratedFromSchema !== undefined) {
+            notes.push(`Рецепт сохранён в старой схеме (версия ${restored.migratedFromSchema}): давление переведено из мбар в паскали (1 мбар = 100 Па) и показано в Па; физические значения не изменены. Сохранённая копия остаётся прежней, пока вы не нажмёте «Сохранить структуру».`);
+          }
+          if (restored.repairedSourceIds > 0) notes.push(`В сохранённом документе повторялись идентификаторы источников (исправлено: ${restored.repairedSourceIds}). Параметры источников не изменены.`);
+          if (notes.length > 0) setSavedNotice(notes.join(' '));
+        } else if (restored.status === 'future_version') {
+          setFutureVersion(restored.schemaVersion);
+          setSavedNotice(FUTURE_VERSION_NOTICE(restored.schemaVersion));
         }
       } catch {
         // localStorage itself unavailable (e.g. private browsing) - keep the blank document
@@ -239,17 +251,29 @@ export function TechDocAssistant() {
     return () => clearTimeout(initial);
   }, []);
 
-  function save() {
+  function save(replaceNewerSchema = false) {
     setSavedNotice('');
     try {
       validateDocument(doc);
       const touched = touchDocument(doc);
-      setDoc(touched);
-      setError('');
       try {
+        // A document saved by a NEWER schema is never overwritten silently: its structure is not
+        // understood here, so writing over it would destroy data this build cannot recreate.
+        const existing = restoreDocumentDetailed(localStorage.getItem(STORAGE_KEY));
+        if (existing.status === 'future_version' && !replaceNewerSchema) {
+          setFutureVersion(existing.schemaVersion);
+          setSavedNotice(FUTURE_VERSION_NOTICE(existing.schemaVersion));
+          setError('');
+          return;
+        }
+        setDoc(touched);
+        setError('');
         localStorage.setItem(STORAGE_KEY, JSON.stringify(touched));
+        setFutureVersion(null);
         setSavedNotice(`Структура сохранена в этом браузере (версия ${touched.traceability.version}). Данные хранятся только локально (localStorage) - не передаются на сервер и недоступны на других устройствах или в другом браузере.`);
       } catch {
+        setDoc(touched);
+        setError('');
         setSavedNotice(`Версия документа обновлена (${touched.traceability.version}), но локальное сохранение в браузере сейчас недоступно (хранилище заблокировано или переполнено) - изменения сохранятся только до перезагрузки страницы.`);
       }
     } catch (err) {
@@ -307,8 +331,14 @@ export function TechDocAssistant() {
         </select>
         <button type="button" className="button primary" onClick={() => updateSteps(steps => addStep(steps, newStepType))}>Добавить этап</button>
       </div>
+      <label className="text-sm block mt-3">Единица давления (ввод, предпросмотр и экспорт)
+        <select className="rounded-md border border-[#dce0e5] p-3 mt-1 block" value={doc.pressureUnit} onChange={e => setDoc(prev => ({ ...prev, pressureUnit: e.target.value as PressureUnit }))}>
+          {PRESSURE_UNITS.map(unit => <option key={unit} value={unit}>{PRESSURE_UNIT_LABELS[unit]}</option>)}
+        </select>
+      </label>
+      <p className="muted small">1 мбар = 100 Па. Давление хранится в паскалях; переключение единицы меняет только отображение, но не физическое значение. Научная запись вводится так: 1e-5.</p>
       <div className="flex flex-col gap-4 mt-4">
-        {doc.steps.map(step => <StepCard key={step.order} step={step} total={doc.steps.length} onChange={updateSteps} />)}
+        {doc.steps.map(step => <StepCard key={step.order} step={step} total={doc.steps.length} pressureUnit={doc.pressureUnit} onChange={updateSteps} />)}
       </div>
     </section>
 
@@ -389,10 +419,11 @@ export function TechDocAssistant() {
     </fieldset>
 
     <div className="flex gap-2">
-      <button type="button" className="button primary" onClick={save}>Сохранить структуру</button>
+      <button type="button" className="button primary" onClick={() => save()}>Сохранить структуру</button>
     </div>
     {error && <p role="alert">{error}</p>}
     {savedNotice && <p role="status">{savedNotice}</p>}
+    {futureVersion !== null && <button type="button" className="button secondary" onClick={() => save(true)}>Заменить сохранённый документ (схема {futureVersion}) текущим</button>}
 
     <section className="content-card">
       <h2>H. Предпросмотр документа</h2>

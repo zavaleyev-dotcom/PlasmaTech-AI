@@ -7,8 +7,8 @@
 
 import 'server-only';
 import {
-  validateDocument, buildTechnologicalCard, buildRouteCard, buildBriefRecipe,
-  type TechnicalProcessDocument,
+  validateDocument, buildTechnologicalCard, buildRouteCard, buildBriefRecipe, formatPressure,
+  type TechnicalProcessDocument, type PressureUnit,
 } from './techdoc-assistant';
 import {
   DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, FILENAME_SEGMENT,
@@ -126,14 +126,14 @@ function stepDescriptionBlock(step: TechnicalProcessDocument['steps'][number]): 
   return step.description && step.description.trim() !== '' ? `\nОписание: ${step.description}` : '';
 }
 
-function stepParagraph(step: TechnicalProcessDocument['steps'][number]): string {
+function stepParagraph(step: TechnicalProcessDocument['steps'][number], unit: PressureUnit): string {
   const gases = step.gasUsage.length > 0
     ? step.gasUsage.map(g => `${g.gas || NOT_SET}${g.flowSccm !== undefined ? ` (${g.flowSccm} см³/мин)` : ''}`).join(', ')
     : NOT_SET;
   const source = [step.sourceConfiguration, step.powerW !== undefined ? `${step.powerW} Вт` : null, step.currentA !== undefined ? `${step.currentA} А` : null]
     .filter((part): part is string => Boolean(part)).join(', ') || NOT_SET;
   return `№${step.order}. ${step.name}${!step.enabled ? ' (отключён)' : ''} — длительность: ${showNum(step.durationMin, ' мин')}; `
-    + `температура: ${showNum(step.temperatureC, '°C')}; давление: ${showNum(step.pressureMbar, ' мбар')}; газы: ${gases}; `
+    + `температура: ${showNum(step.temperatureC, '°C')}; давление: ${formatPressure(step.pressurePa, unit)}; газы: ${gases}; `
     + `источник/мощность: ${source}; bias: ${showNum(step.substrateBiasV, ' В')}; вращение: ${showNum(step.rotationRpm, ' об/мин')}; `
     + `расстояние: ${showNum(step.distanceMm, ' мм')}; критерий приёмки: ${show(step.acceptanceCriteria)}; примечание: ${show(step.notes)}`
     + stepDescriptionBlock(step);
@@ -205,7 +205,7 @@ export function buildDocumentViewModel(doc: TechnicalProcessDocument, documentTy
     { heading: '6. Последовательность операций', paragraphs: doc.steps.length > 0
       ? doc.steps.map(s => `№${s.order}. ${s.name}${!s.enabled ? ' (отключён)' : ''}`)
       : [NOT_SET] },
-    { heading: '7. Параметры процесса', paragraphs: [...sourceAndGasSummary(doc), ...(doc.steps.length > 0 ? doc.steps.map(stepParagraph) : [NOT_SET])] },
+    { heading: '7. Параметры процесса', paragraphs: [...sourceAndGasSummary(doc), ...(doc.steps.length > 0 ? doc.steps.map(s => stepParagraph(s, doc.pressureUnit)) : [NOT_SET])] },
     { heading: '8. Контроль качества', paragraphs: qualityChecks.length > 0 ? [`Определено параметров контроля: ${qualityChecks.length}. См. таблицу ниже.`] : [NOT_SET] },
     { heading: '9. Требования безопасности', paragraphs: warnings.length > 0 ? warnings : [NOT_SET] },
   ];
