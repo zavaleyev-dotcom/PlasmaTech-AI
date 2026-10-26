@@ -132,7 +132,10 @@ function parseStep(raw: unknown, index: number): ProcessStep {
 function parseMagnetron(raw: unknown, index: number): MagnetronSource {
   const o = asObject(raw, `Магнетрон[${index}]`);
   return {
-    id: asRequiredString(o.id ?? `magnetron-${index}`, `Магнетрон[${index}]: id`),
+    // A missing id stays empty: it is assigned later by ensureUniqueSourceIds, AFTER every explicit id
+    // in the list is reserved. An index-based fallback here would take an id (e.g. "magnetron-0")
+    // that a later record explicitly owns, and the owner would be the one renamed.
+    id: asRequiredString(o.id ?? '', `Магнетрон[${index}]: id`),
     enabled: asBoolean(o.enabled, `Магнетрон[${index}]: включён`, true),
     material: asOptionalString(o.material, `Магнетрон[${index}]: материал`),
     powerW: asOptionalNumber(o.powerW, `Магнетрон[${index}]: мощность`),
@@ -143,7 +146,7 @@ function parseMagnetron(raw: unknown, index: number): MagnetronSource {
 function parseArcSource(raw: unknown, index: number): ArcSource {
   const o = asObject(raw, `Arc-источник[${index}]`);
   return {
-    id: asRequiredString(o.id ?? `arc-${index}`, `Arc-источник[${index}]: id`),
+    id: asRequiredString(o.id ?? '', `Arc-источник[${index}]: id`),
     enabled: asBoolean(o.enabled, `Arc-источник[${index}]: включён`, true),
     cathodeMaterial: asOptionalString(o.cathodeMaterial, `Arc-источник[${index}]: материал катода`),
     arcCurrentA: asOptionalNumber(o.arcCurrentA, `Arc-источник[${index}]: ток дуги`),

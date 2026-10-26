@@ -118,6 +118,14 @@ function sourceAndGasSummary(doc: TechnicalProcessDocument): string[] {
   return lines;
 }
 
+/** The step's free-text description, exactly as typed - line breaks, units and technical
+ *  designations untouched (the renderers turn each "\n" into a real line break). It is shown in
+ *  the on-screen instruction preview (buildInstructionView) and must reach the printed document
+ *  too; a step without a description adds nothing, same as the preview. */
+function stepDescriptionBlock(step: TechnicalProcessDocument['steps'][number]): string {
+  return step.description && step.description.trim() !== '' ? `\nОписание: ${step.description}` : '';
+}
+
 function stepParagraph(step: TechnicalProcessDocument['steps'][number]): string {
   const gases = step.gasUsage.length > 0
     ? step.gasUsage.map(g => `${g.gas || NOT_SET}${g.flowSccm !== undefined ? ` (${g.flowSccm} см³/мин)` : ''}`).join(', ')
@@ -127,7 +135,8 @@ function stepParagraph(step: TechnicalProcessDocument['steps'][number]): string 
   return `№${step.order}. ${step.name}${!step.enabled ? ' (отключён)' : ''} — длительность: ${showNum(step.durationMin, ' мин')}; `
     + `температура: ${showNum(step.temperatureC, '°C')}; давление: ${showNum(step.pressureMbar, ' мбар')}; газы: ${gases}; `
     + `источник/мощность: ${source}; bias: ${showNum(step.substrateBiasV, ' В')}; вращение: ${showNum(step.rotationRpm, ' об/мин')}; `
-    + `расстояние: ${showNum(step.distanceMm, ' мм')}; критерий приёмки: ${show(step.acceptanceCriteria)}; примечание: ${show(step.notes)}`;
+    + `расстояние: ${showNum(step.distanceMm, ' мм')}; критерий приёмки: ${show(step.acceptanceCriteria)}; примечание: ${show(step.notes)}`
+    + stepDescriptionBlock(step);
 }
 
 export function buildDocumentViewModel(doc: TechnicalProcessDocument, documentType: DocumentType): DocumentViewModel {

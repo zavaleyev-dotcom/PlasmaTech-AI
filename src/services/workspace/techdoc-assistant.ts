@@ -202,11 +202,70 @@ export function createDefaultSourceSet(): SourceSet {
   return { magnetrons: [], arcSources: [], icpRf: { enabled: false }, ionSource: { enabled: false } };
 }
 
-let sourceIdCounter = 0;
-function nextSourceId(prefix: string): string { sourceIdCounter += 1; return `${prefix}-${sourceIdCounter}`; }
+/** A new source id is derived from the sources that ALREADY exist in the list - never from a
+ *  module-level counter. The old counter restarted at 0 on every page load, so after a saved
+ *  document was restored (ids "magnetron-1", "magnetron-2", ...) the next "add" minted
+ *  "magnetron-1" again: two records with one id, and an update/remove by id then hit both.
+ *  The next id is one past the highest numeric suffix present, and is re-checked against the
+ *  whole id set, so it can never equal an existing id whatever the list contains (restored data,
+ *  hand-edited ids, ids with huge or non-numeric suffixes). */
+function nextSourceId(prefix: string, existing: readonly { id: string }[]): string {
+  const used = new Set(existing.map(item => item.id));
+  const pattern = new RegExp(`^${prefix}-(\\d{1,9})$`);
+  let max = 0;
+  for (const id of used) {
+    const match = pattern.exec(id);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  let n = max + 1;
+  while (used.has(`${prefix}-${n}`)) n += 1;
+  return `${prefix}-${n}`;
+}
+
+/** Ids that occur more than once in one list, or are empty - what makes update/remove-by-id
+ *  ambiguous. Pure check; changes nothing. */
+export function findDuplicateSourceIds(sources: SourceSet): { magnetrons: string[]; arcSources: string[] } {
+  const duplicated = (items: readonly { id: string }[]) => {
+    const seen = new Set<string>();
+    const repeated = new Set<string>();
+    for (const { id } of items) { if (id.trim() === '' || seen.has(id)) repeated.add(id); seen.add(id); }
+    return [...repeated];
+  };
+  return { magnetrons: duplicated(sources.magnetrons), arcSources: duplicated(sources.arcSources) };
+}
+
+function withUniqueIds<T extends { id: string }>(items: readonly T[], prefix: string): { items: T[]; repaired: number } {
+  // The FIRST record that uses an id keeps it; only later repeats (and empty ids) get a fresh
+  // id. Nothing but `id` is ever touched - every user-entered parameter is kept as is.
+  const kept = new Set<string>();
+  const needsNewId = items.map(item => {
+    if (item.id.trim() === '' || kept.has(item.id)) return true;
+    kept.add(item.id);
+    return false;
+  });
+  const taken: { id: string }[] = [...kept].map(id => ({ id }));
+  let repaired = 0;
+  const result = items.map((item, index) => {
+    if (!needsNewId[index]) return item;
+    const id = nextSourceId(prefix, taken);
+    taken.push({ id });
+    repaired += 1;
+    return { ...item, id };
+  });
+  return { items: result, repaired };
+}
+
+/** Makes every magnetron id and every arc-source id unique within its list (see withUniqueIds).
+ *  Returns the same SourceSet content when nothing needed repair. */
+export function ensureUniqueSourceIds(sources: SourceSet): { sources: SourceSet; repaired: number } {
+  const magnetrons = withUniqueIds(sources.magnetrons, 'magnetron');
+  const arcSources = withUniqueIds(sources.arcSources, 'arc');
+  const repaired = magnetrons.repaired + arcSources.repaired;
+  return repaired === 0 ? { sources, repaired: 0 } : { sources: { ...sources, magnetrons: magnetrons.items, arcSources: arcSources.items }, repaired };
+}
 
 export function addMagnetron(sources: SourceSet): SourceSet {
-  return { ...sources, magnetrons: [...sources.magnetrons, { id: nextSourceId('magnetron'), enabled: true }] };
+  return { ...sources, magnetrons: [...sources.magnetrons, { id: nextSourceId('magnetron', sources.magnetrons), enabled: true }] };
 }
 export function removeMagnetron(sources: SourceSet, id: string): SourceSet {
   return { ...sources, magnetrons: sources.magnetrons.filter(m => m.id !== id) };
@@ -216,7 +275,7 @@ export function updateMagnetron(sources: SourceSet, id: string, patch: Partial<M
 }
 
 export function addArcSource(sources: SourceSet): SourceSet {
-  return { ...sources, arcSources: [...sources.arcSources, { id: nextSourceId('arc'), enabled: true, filtered: false }] };
+  return { ...sources, arcSources: [...sources.arcSources, { id: nextSourceId('arc', sources.arcSources), enabled: true, filtered: false }] };
 }
 export function removeArcSource(sources: SourceSet, id: string): SourceSet {
   return { ...sources, arcSources: sources.arcSources.filter(a => a.id !== id) };
@@ -331,11 +390,21 @@ export function touchDocument(doc: TechnicalProcessDocument): TechnicalProcessDo
  *  HTTP input - reusing it here closes that gap instead of writing a second, possibly
  *  inconsistent validator. */
 export function tryRestoreDocument(rawJson: string | null | undefined): TechnicalProcessDocument | null {
+  return restoreDocumentWithReport(rawJson)?.document ?? null;
+}
+
+/** Same as tryRestoreDocument, plus how many source ids had to be repaired. A saved document
+ *  can contain duplicate (or empty) magnetron/arc ids - written by the old counter-based id
+ *  generator after an earlier restore - and with duplicates an update or delete by id changes
+ *  several sources at once. Duplicates are repaired on restore: the first record keeps its id,
+ *  later repeats get a fresh unique one, and no source parameter is altered. */
+export function restoreDocumentWithReport(rawJson: string | null | undefined): { document: TechnicalProcessDocument; repairedSourceIds: number } | null {
   if (!rawJson) return null;
   try {
     const parsed = parseTechnicalProcessDocument(JSON.parse(rawJson));
     validateDocument(parsed);
-    return parsed;
+    const { sources, repaired } = ensureUniqueSourceIds(parsed.sources);
+    return { document: repaired === 0 ? parsed : { ...parsed, sources }, repairedSourceIds: repaired };
   } catch {
     return null;
   }
@@ -429,8 +498,8 @@ export function validateDocument(doc: TechnicalProcessDocument): void {
 
   for (const line of doc.gasSystem) checkOptionalNonNegative(line.flow, `Газовая линия ${line.gas || line.id}: расход`);
 
-  for (const magnetron of doc.sources.magnetrons) checkOptionalNonNegative(magnetron.powerW, `Магнетрон ${magnetron.id}: мощность`);
-  for (const arc of doc.sources.arcSources) checkOptionalNonNegative(arc.arcCurrentA, `Arc-источник ${arc.id}: ток дуги`);
+  doc.sources.magnetrons.forEach((magnetron, index) => checkOptionalNonNegative(magnetron.powerW, `Магнетрон ${magnetron.id || `#${index + 1}`}: мощность`));
+  doc.sources.arcSources.forEach((arc, index) => checkOptionalNonNegative(arc.arcCurrentA, `Arc-источник ${arc.id || `#${index + 1}`}: ток дуги`));
   checkOptionalNonNegative(doc.sources.icpRf.powerW, 'ICP/RF: мощность');
   checkOptionalFinite(doc.sources.icpRf.biasV, 'ICP/RF: bias');
   checkOptionalFinite(doc.sources.ionSource.voltageV, 'Ion source: напряжение');

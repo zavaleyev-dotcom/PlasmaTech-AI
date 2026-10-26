@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import {
-  createBlankDocument, createDocumentFromPreset, validateDocument, touchDocument, tryRestoreDocument,
+  createBlankDocument, createDocumentFromPreset, validateDocument, touchDocument, restoreDocumentWithReport,
   PROCESS_PRESETS, STEP_TYPES, STEP_TYPE_LABELS, QUALITY_CHECK_CATEGORIES,
   addStep, removeStep, duplicateStep, moveStep, toggleStepEnabled, updateStep, calculateStepDurationFromDeposition,
   addGasLine, removeGasLine, updateGasLine,
@@ -227,8 +227,11 @@ export function TechDocAssistant() {
   useEffect(() => {
     const initial = setTimeout(() => {
       try {
-        const restored = tryRestoreDocument(localStorage.getItem(STORAGE_KEY));
-        if (restored) setDoc(restored);
+        const restored = restoreDocumentWithReport(localStorage.getItem(STORAGE_KEY));
+        if (restored) {
+          setDoc(restored.document);
+          if (restored.repairedSourceIds > 0) setSavedNotice(`В сохранённом документе повторялись идентификаторы источников (исправлено: ${restored.repairedSourceIds}). Параметры источников не изменены.`);
+        }
       } catch {
         // localStorage itself unavailable (e.g. private browsing) - keep the blank document
       }
