@@ -6,11 +6,14 @@ import {
   PRESSURE_UNITS, PRESSURE_UNIT_LABELS, paToDisplayInputValue, parsePressureInput,
   PROCESS_PRESETS, STEP_TYPES, STEP_TYPE_LABELS, QUALITY_CHECK_CATEGORIES,
   addStep, removeStep, duplicateStep, moveStep, toggleStepEnabled, updateStep, calculateStepDurationFromDeposition,
-  addGasLine, removeGasLine, updateGasLine,
-  addMagnetron, removeMagnetron, updateMagnetron, addArcSource, removeArcSource, updateArcSource,
+  addGasLine, updateGasLine,
+  addMagnetron, updateMagnetron, addArcSource, updateArcSource,
+  addSourceAssignment, updateSourceAssignment, removeSourceAssignment, addGasAssignment, updateGasAssignment, removeGasAssignment,
+  removeSourceFromDocument, removeGasLineFromDocument, collectStepWarnings,
+  SOURCE_KIND_LABELS, ASSIGNMENT_MODES, ASSIGNMENT_MODE_LABELS,
   createQualityCheck,
   buildTechnologicalCard, buildRouteCard, buildInstructionView, buildBriefRecipe,
-  type TechnicalProcessDocument, type ProcessStep, type StepType, type QualityCheck, type PressureUnit,
+  type TechnicalProcessDocument, type ProcessStep, type StepType, type QualityCheck, type PressureUnit, type SourceSet, type GasLine, type SourceKind, type AssignmentMode,
 } from '@/services/workspace/techdoc-assistant';
 import { DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, type DocumentType, type ExportFormat } from '@/services/workspace/techdoc-export-types';
 
@@ -20,11 +23,92 @@ type ViewMode = 'instruction' | 'techcard' | 'routecard' | 'recipe';
  *  or browsers. See the honest wording in save()'s notice below. */
 const STORAGE_KEY = 'techdoc-assistant:document';
 
+const UNREADABLE_NOTICE = (reason: string) => `Сохранённый документ не загружен: ${reason} Он не изменён и не удалён. Сохранение поверх него отключено, пока вы явно не подтвердите замену.`;
 const FUTURE_VERSION_NOTICE = (version: number) => `В этом браузере сохранён документ более новой схемы (версия ${version}); эта версия приложения её не понимает, поэтому документ не загружен. Он не изменён и не удалён. Сохранение поверх него отключено, пока вы явно не подтвердите замену.`;
 
 function num(v: string): number | undefined { return v.trim() === '' ? undefined : Number(v); }
 
-function StepCard({ step, total, pressureUnit, onChange }: { step: ProcessStep; total: number; pressureUnit: PressureUnit; onChange: (updater: (steps: ProcessStep[]) => ProcessStep[]) => void }) {
+const ASSIGNMENT_STEP_TYPES: StepType[] = ['adhesion_underlayer', 'multilayer_coating'];
+const INPUT = 'rounded-md border border-[#dce0e5] p-2 mt-1 block';
+
+/** Which sources of section D and which gas lines of section E are USED on this step, and how.
+ *  Materials and gas names are read from D/E, never typed here. */
+function StepAssignments({ step, sources, gasSystem, onChange }: { step: ProcessStep; sources: SourceSet; gasSystem: GasLine[]; onChange: (updater: (steps: ProcessStep[]) => ProcessStep[]) => void }) {
+  const [sourcePick, setSourcePick] = useState('');
+  const [linePick, setLinePick] = useState('');
+
+  const allSources = [
+    ...sources.magnetrons.map(m => ({ kind: 'magnetron' as SourceKind, id: m.id, usable: m.enabled, text: `${m.material?.trim() ? m.material : 'материал не задан'}` })),
+    ...sources.arcSources.map(a => ({ kind: 'arc' as SourceKind, id: a.id, usable: a.enabled, text: `${a.cathodeMaterial?.trim() ? a.cathodeMaterial : 'материал не задан'}${a.filtered ? ', фильтрованный' : ''}` })),
+  ];
+  const freeSources = allSources.filter(x => !step.sourceAssignments.some(a => a.kind === x.kind && a.sourceId === x.id));
+  const freeLines = gasSystem.filter(l => !step.gasAssignments.some(a => a.lineId === l.id));
+  const patchSource = (kind: SourceKind, id: string, p: Parameters<typeof updateSourceAssignment>[4]) => onChange(steps => updateSourceAssignment(steps, step.order, kind, id, p));
+  const patchGas = (id: string, p: Parameters<typeof updateGasAssignment>[3]) => onChange(steps => updateGasAssignment(steps, step.order, id, p));
+
+  return <div className="mt-3 content-card">
+    <h4>Источники на этапе (из раздела D)</h4>
+    <p className="muted small">Раздел D описывает оборудование установки; здесь задаётся, что включено именно на этом этапе. Материал мишени или катода берётся из раздела D. Время - в минутах от начала этапа. «Последовательно» - интервал не пересекается с интервалами других включённых источников этапа.</p>
+    {step.sourceAssignments.length === 0 && <p className="muted small">Источники на этапе не назначены.</p>}
+    {step.sourceAssignments.map(a => {
+      const known = allSources.find(x => x.kind === a.kind && x.id === a.sourceId);
+      return <div key={`${a.kind}:${a.sourceId}`} className="flex flex-wrap gap-3 items-end mt-2 border border-[#dce0e5] rounded-md p-2">
+        <strong className="text-sm">{SOURCE_KIND_LABELS[a.kind]} {a.sourceId}<br /><span className="muted small">{known ? (a.kind === 'magnetron' ? 'мишень: ' : 'катод: ') + known.text : 'нет в разделе D'}</span></strong>
+        <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={a.enabled} onChange={e => patchSource(a.kind, a.sourceId, { enabled: e.target.checked })} /> Включён на этапе</label>
+        {a.kind === 'magnetron'
+          ? <label className="text-sm">Мощность на этапе, Вт<input type="number" step="any" min={0} className={INPUT} value={a.powerW ?? ''} onChange={e => patchSource(a.kind, a.sourceId, { powerW: num(e.target.value) })} /></label>
+          : <label className="text-sm">Ток дуги на этапе, А<input type="number" step="any" min={0} className={INPUT} value={a.currentA ?? ''} onChange={e => patchSource(a.kind, a.sourceId, { currentA: num(e.target.value) })} /></label>}
+        <label className="text-sm">Начало, мин<input type="number" step="any" min={0} className={INPUT} value={a.startMin ?? ''} onChange={e => patchSource(a.kind, a.sourceId, { startMin: num(e.target.value) })} /></label>
+        <label className="text-sm">Длительность, мин<input type="number" step="any" min={0} className={INPUT} value={a.durationMin ?? ''} onChange={e => patchSource(a.kind, a.sourceId, { durationMin: num(e.target.value) })} /></label>
+        <label className="text-sm">Режим
+          <select className={INPUT} value={a.mode} onChange={e => patchSource(a.kind, a.sourceId, { mode: e.target.value as AssignmentMode })}>
+            {ASSIGNMENT_MODES.map(mode => <option key={mode} value={mode}>{ASSIGNMENT_MODE_LABELS[mode]}</option>)}
+          </select>
+        </label>
+        <button type="button" className="button secondary" onClick={() => onChange(steps => removeSourceAssignment(steps, step.order, a.kind, a.sourceId))}>Снять назначение</button>
+      </div>;
+    })}
+    <div className="flex flex-wrap gap-2 items-end mt-2">
+      <label className="text-sm">Назначить источник
+        <select className={INPUT} value={sourcePick} onChange={e => setSourcePick(e.target.value)}>
+          <option value="">{freeSources.length === 0 ? (allSources.length === 0 ? 'Сначала добавьте источники в разделе D' : 'Все источники уже назначены') : 'Выберите источник…'}</option>
+          {freeSources.map(x => <option key={`${x.kind}:${x.id}`} value={`${x.kind}:${x.id}`} disabled={!x.usable}>{SOURCE_KIND_LABELS[x.kind]} {x.id} ({x.text}){x.usable ? '' : ' - отключён в установке'}</option>)}
+        </select>
+      </label>
+      <button type="button" className="button secondary" disabled={!sourcePick} onClick={() => {
+        const [kind, ...rest] = sourcePick.split(':');
+        onChange(steps => addSourceAssignment(steps, step.order, kind as SourceKind, rest.join(':')));
+        setSourcePick('');
+      }}>Назначить</button>
+    </div>
+
+    <h4 className="mt-4">Газовые линии на этапе (из раздела E)</h4>
+    <p className="muted small">Газ берётся из раздела E. Расход задаётся в sccm (стандартные см³/мин) и не пересчитывается из других единиц.</p>
+    {step.gasAssignments.length === 0 && <p className="muted small">Газовые линии на этапе не назначены.</p>}
+    {step.gasAssignments.map(a => {
+      const line = gasSystem.find(l => l.id === a.lineId);
+      return <div key={a.lineId} className="flex flex-wrap gap-3 items-end mt-2 border border-[#dce0e5] rounded-md p-2">
+        <strong className="text-sm">Линия {a.lineId}<br /><span className="muted small">{line ? `газ: ${line.gas.trim() ? line.gas : 'не указан в разделе E'}` : 'нет в разделе E'}</span></strong>
+        <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={a.enabled} onChange={e => patchGas(a.lineId, { enabled: e.target.checked })} /> Подача включена</label>
+        <label className="text-sm">Расход, sccm<input type="number" step="any" min={0} className={INPUT} value={a.flowSccm ?? ''} onChange={e => patchGas(a.lineId, { flowSccm: num(e.target.value) })} /></label>
+        <label className="text-sm">Начало подачи, мин<input type="number" step="any" min={0} className={INPUT} value={a.startMin ?? ''} onChange={e => patchGas(a.lineId, { startMin: num(e.target.value) })} /></label>
+        <label className="text-sm">Длительность подачи, мин<input type="number" step="any" min={0} className={INPUT} value={a.durationMin ?? ''} onChange={e => patchGas(a.lineId, { durationMin: num(e.target.value) })} /></label>
+        <button type="button" className="button secondary" onClick={() => onChange(steps => removeGasAssignment(steps, step.order, a.lineId))}>Снять назначение</button>
+      </div>;
+    })}
+    <div className="flex flex-wrap gap-2 items-end mt-2">
+      <label className="text-sm">Назначить газовую линию
+        <select className={INPUT} value={linePick} onChange={e => setLinePick(e.target.value)}>
+          <option value="">{freeLines.length === 0 ? (gasSystem.length === 0 ? 'В разделе E нет линий' : 'Все линии уже назначены') : 'Выберите линию…'}</option>
+          {freeLines.map(l => <option key={l.id} value={l.id} disabled={!l.enabled}>Линия {l.id} ({l.gas.trim() ? l.gas : 'газ не указан'}){l.enabled ? '' : ' - отключена'}</option>)}
+        </select>
+      </label>
+      <button type="button" className="button secondary" disabled={!linePick} onClick={() => { onChange(steps => addGasAssignment(steps, step.order, linePick)); setLinePick(''); }}>Назначить</button>
+    </div>
+  </div>;
+}
+
+function StepCard({ step, total, pressureUnit, sources, gasSystem, onChange }: { step: ProcessStep; total: number; pressureUnit: PressureUnit; sources: SourceSet; gasSystem: GasLine[]; onChange: (updater: (steps: ProcessStep[]) => ProcessStep[]) => void }) {
   const [calcOpen, setCalcOpen] = useState(false);
   const [thickness, setThickness] = useState('1000');
   const [rate, setRate] = useState('10');
@@ -64,10 +148,10 @@ function StepCard({ step, total, pressureUnit, onChange }: { step: ProcessStep; 
       <label className="text-sm">Источник (описание)
         <input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={step.sourceConfiguration ?? ''} onChange={e => patch({ sourceConfiguration: e.target.value || undefined })} />
       </label>
-      <label className="text-sm">Мощность, Вт
+      <label className="text-sm">Мощность этапа (общая), Вт
         <input type="number" step="any" className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={step.powerW ?? ''} onChange={e => patch({ powerW: num(e.target.value) })} />
       </label>
-      <label className="text-sm">Ток, А
+      <label className="text-sm">Ток этапа (общий), А
         <input type="number" step="any" className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={step.currentA ?? ''} onChange={e => patch({ currentA: num(e.target.value) })} />
       </label>
       <label className="text-sm">Substrate bias, В
@@ -90,11 +174,14 @@ function StepCard({ step, total, pressureUnit, onChange }: { step: ProcessStep; 
       <input className="w-full rounded-md border border-[#dce0e5] p-3 mt-1" value={step.notes ?? ''} onChange={e => patch({ notes: e.target.value || undefined })} />
     </label>
 
+    {(ASSIGNMENT_STEP_TYPES.includes(step.type) || step.sourceAssignments.length > 0 || step.gasAssignments.length > 0) &&
+      <StepAssignments step={step} sources={sources} gasSystem={gasSystem} onChange={onChange} />}
+
     <div className="mt-3">
-      <h4>Газы для этапа</h4>
+      <h4>Газы для этапа (общий список)</h4>
       {step.gasUsage.map((g, i) => <div key={i} className="flex gap-2 mt-2">
         <input className="rounded-md border border-[#dce0e5] p-2" placeholder="Газ" value={g.gas} onChange={e => patch({ gasUsage: step.gasUsage.map((x, j) => j === i ? { ...x, gas: e.target.value } : x) })} />
-        <input type="number" step="any" className="rounded-md border border-[#dce0e5] p-2" placeholder="Расход, см³/мин" value={g.flowSccm ?? ''} onChange={e => patch({ gasUsage: step.gasUsage.map((x, j) => j === i ? { ...x, flowSccm: num(e.target.value) } : x) })} />
+        <input type="number" step="any" className="rounded-md border border-[#dce0e5] p-2" placeholder="Расход, sccm" value={g.flowSccm ?? ''} onChange={e => patch({ gasUsage: step.gasUsage.map((x, j) => j === i ? { ...x, flowSccm: num(e.target.value) } : x) })} />
         <button type="button" className="button secondary" onClick={() => patch({ gasUsage: step.gasUsage.filter((_, j) => j !== i) })}>Убрать</button>
       </div>)}
       <button type="button" className="button secondary mt-2" onClick={() => patch({ gasUsage: [...step.gasUsage, { gas: '' }] })}>Добавить газ</button>
@@ -222,7 +309,21 @@ export function TechDocAssistant() {
   const [error, setError] = useState('');
   const [savedNotice, setSavedNotice] = useState('');
   const [futureVersion, setFutureVersion] = useState<number | null>(null);
+  const [unreadableReason, setUnreadableReason] = useState<string | null>(null);
   const [newStepType, setNewStepType] = useState<StepType>(STEP_TYPES[0]);
+  const stepWarnings = collectStepWarnings(doc);
+
+  /** A source / gas line that steps still use is NOT deleted: the user is told which steps use it. */
+  function removeSource(kind: SourceKind, id: string) {
+    const result = removeSourceFromDocument(doc, kind, id);
+    if (result.blockedBySteps.length > 0) { setError(`${SOURCE_KIND_LABELS[kind]} ${id} используется на этапах ${result.blockedBySteps.map(n => `№${n}`).join(', ')}. Сначала снимите назначение на этих этапах.`); return; }
+    setError(''); setDoc(result.document);
+  }
+  function removeLine(id: string) {
+    const result = removeGasLineFromDocument(doc, id);
+    if (result.blockedBySteps.length > 0) { setError(`Линия ${id} используется на этапах ${result.blockedBySteps.map(n => `№${n}`).join(', ')}. Сначала снимите назначение на этих этапах.`); return; }
+    setError(''); setDoc(result.document);
+  }
 
   function updateSteps(updater: (steps: ProcessStep[]) => ProcessStep[]) {
     setDoc(prev => ({ ...prev, steps: updater(prev.steps) }));
@@ -235,11 +336,18 @@ export function TechDocAssistant() {
         if (restored.status === 'ok') {
           setDoc(restored.document);
           const notes: string[] = [];
-          if (restored.migratedFromSchema !== undefined) {
+          if (restored.migratedFromSchema === 1) {
             notes.push(`Рецепт сохранён в старой схеме (версия ${restored.migratedFromSchema}): давление переведено из мбар в паскали (1 мбар = 100 Па) и показано в Па; физические значения не изменены. Сохранённая копия остаётся прежней, пока вы не нажмёте «Сохранить структуру».`);
           }
+          if (restored.migratedFromSchema === 2) notes.push('Рецепт сохранён в схеме версии 2: к этапам добавлены (пустые) списки назначенных источников и газовых линий. Все прежние параметры сохранены без изменений.');
+          if (restored.migratedFromSchema === 1) notes.push('Рецепт из схемы 1 также получил пустые списки назначенных источников и газовых линий на этапах.');
           if (restored.repairedSourceIds > 0) notes.push(`В сохранённом документе повторялись идентификаторы источников (исправлено: ${restored.repairedSourceIds}). Параметры источников не изменены.`);
+          if (restored.repairedGasLineIds > 0) notes.push(`В сохранённом документе повторялись идентификаторы газовых линий (исправлено: ${restored.repairedGasLineIds}). Параметры линий не изменены.`);
           if (notes.length > 0) setSavedNotice(notes.join(' '));
+        } else if (restored.status === 'invalid' && restored.reason) {
+          // Not silently blank: the saved data stays untouched in storage, and the reason is shown.
+          setUnreadableReason(restored.reason);
+          setSavedNotice(UNREADABLE_NOTICE(restored.reason));
         } else if (restored.status === 'future_version') {
           setFutureVersion(restored.schemaVersion);
           setSavedNotice(FUTURE_VERSION_NOTICE(restored.schemaVersion));
@@ -266,10 +374,17 @@ export function TechDocAssistant() {
           setError('');
           return;
         }
+        if (existing.status === 'invalid' && existing.reason && !replaceNewerSchema) {
+          setUnreadableReason(existing.reason);
+          setSavedNotice(UNREADABLE_NOTICE(existing.reason));
+          setError('');
+          return;
+        }
         setDoc(touched);
         setError('');
         localStorage.setItem(STORAGE_KEY, JSON.stringify(touched));
         setFutureVersion(null);
+        setUnreadableReason(null);
         setSavedNotice(`Структура сохранена в этом браузере (версия ${touched.traceability.version}). Данные хранятся только локально (localStorage) - не передаются на сервер и недоступны на других устройствах или в другом браузере.`);
       } catch {
         setDoc(touched);
@@ -338,27 +453,28 @@ export function TechDocAssistant() {
       </label>
       <p className="muted small">1 мбар = 100 Па. Давление хранится в паскалях; переключение единицы меняет только отображение, но не физическое значение. Научная запись вводится так: 1e-5.</p>
       <div className="flex flex-col gap-4 mt-4">
-        {doc.steps.map(step => <StepCard key={step.order} step={step} total={doc.steps.length} pressureUnit={doc.pressureUnit} onChange={updateSteps} />)}
+        {doc.steps.map(step => <StepCard key={step.order} step={step} total={doc.steps.length} pressureUnit={doc.pressureUnit} sources={doc.sources} gasSystem={doc.gasSystem} onChange={updateSteps} />)}
       </div>
     </section>
 
     <fieldset className="content-card">
       <legend><h2>D. Источники</h2></legend>
+      <p className="muted small">Справочник оборудования установки. Включение источника, его мощность или ток и время работы задаются отдельно на каждом этапе (карточки «Адгезионный подслой» и «Многослойное покрытие»). Значения мощности/тока здесь - справочные.</p>
       <h3>Магнетроны</h3>
       {doc.sources.magnetrons.map(m => <div key={m.id} className="flex flex-wrap gap-2 items-end mt-2">
         <input className="rounded-md border border-[#dce0e5] p-2" placeholder="Материал" value={m.material ?? ''} onChange={e => setDoc({ ...doc, sources: updateMagnetron(doc.sources, m.id, { material: e.target.value || undefined }) })} />
-        <input type="number" className="rounded-md border border-[#dce0e5] p-2" placeholder="Мощность, Вт" value={m.powerW ?? ''} onChange={e => setDoc({ ...doc, sources: updateMagnetron(doc.sources, m.id, { powerW: num(e.target.value) }) })} />
+        <input type="number" className="rounded-md border border-[#dce0e5] p-2" placeholder="Мощность, Вт (справочно)" value={m.powerW ?? ''} onChange={e => setDoc({ ...doc, sources: updateMagnetron(doc.sources, m.id, { powerW: num(e.target.value) }) })} />
         <input className="rounded-md border border-[#dce0e5] p-2" placeholder="Режим (DC/pulsed DC/RF)" value={m.mode ?? ''} onChange={e => setDoc({ ...doc, sources: updateMagnetron(doc.sources, m.id, { mode: e.target.value || undefined }) })} />
-        <button type="button" className="button secondary" onClick={() => setDoc({ ...doc, sources: removeMagnetron(doc.sources, m.id) })}>Удалить</button>
+        <button type="button" className="button secondary" onClick={() => removeSource('magnetron', m.id)}>Удалить</button>
       </div>)}
       <button type="button" className="button secondary mt-2" onClick={() => setDoc({ ...doc, sources: addMagnetron(doc.sources) })}>Добавить магнетрон</button>
 
       <h3 className="mt-4">Arc-источники</h3>
       {doc.sources.arcSources.map(a => <div key={a.id} className="flex flex-wrap gap-2 items-end mt-2">
         <input className="rounded-md border border-[#dce0e5] p-2" placeholder="Материал катода" value={a.cathodeMaterial ?? ''} onChange={e => setDoc({ ...doc, sources: updateArcSource(doc.sources, a.id, { cathodeMaterial: e.target.value || undefined }) })} />
-        <input type="number" className="rounded-md border border-[#dce0e5] p-2" placeholder="Ток дуги, А" value={a.arcCurrentA ?? ''} onChange={e => setDoc({ ...doc, sources: updateArcSource(doc.sources, a.id, { arcCurrentA: num(e.target.value) }) })} />
+        <input type="number" className="rounded-md border border-[#dce0e5] p-2" placeholder="Ток дуги, А (справочно)" value={a.arcCurrentA ?? ''} onChange={e => setDoc({ ...doc, sources: updateArcSource(doc.sources, a.id, { arcCurrentA: num(e.target.value) }) })} />
         <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={a.filtered} onChange={e => setDoc({ ...doc, sources: updateArcSource(doc.sources, a.id, { filtered: e.target.checked }) })} /> Фильтрованная</label>
-        <button type="button" className="button secondary" onClick={() => setDoc({ ...doc, sources: removeArcSource(doc.sources, a.id) })}>Удалить</button>
+        <button type="button" className="button secondary" onClick={() => removeSource('arc', a.id)}>Удалить</button>
       </div>)}
       <button type="button" className="button secondary mt-2" onClick={() => setDoc({ ...doc, sources: addArcSource(doc.sources) })}>Добавить arc-источник</button>
 
@@ -380,12 +496,13 @@ export function TechDocAssistant() {
 
     <fieldset className="content-card">
       <legend><h2>E. Газовая система</h2></legend>
+      <p className="muted small">Справочник газовых линий. Какие линии используются на этапе, с каким расходом (sccm) и в какое время - задаётся в карточке этапа.</p>
       {doc.gasSystem.map(line => <div key={line.id} className="flex flex-wrap gap-2 items-end mt-2">
         <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={line.enabled} onChange={e => setDoc({ ...doc, gasSystem: updateGasLine(doc.gasSystem, line.id, { enabled: e.target.checked }) })} /> Вкл.</label>
         <input className="rounded-md border border-[#dce0e5] p-2" placeholder="Газ (например Ar, C2H2, произвольный)" value={line.gas} onChange={e => setDoc({ ...doc, gasSystem: updateGasLine(doc.gasSystem, line.id, { gas: e.target.value }) })} />
         <input type="number" className="rounded-md border border-[#dce0e5] p-2" placeholder="Расход" value={line.flow ?? ''} onChange={e => setDoc({ ...doc, gasSystem: updateGasLine(doc.gasSystem, line.id, { flow: num(e.target.value) }) })} />
         <input className="rounded-md border border-[#dce0e5] p-2" placeholder="Ед." value={line.unit} onChange={e => setDoc({ ...doc, gasSystem: updateGasLine(doc.gasSystem, line.id, { unit: e.target.value }) })} />
-        <button type="button" className="button secondary" onClick={() => setDoc({ ...doc, gasSystem: removeGasLine(doc.gasSystem, line.id) })}>Удалить</button>
+        <button type="button" className="button secondary" onClick={() => removeLine(line.id)}>Удалить</button>
       </div>)}
       <button type="button" className="button secondary mt-2" onClick={() => setDoc({ ...doc, gasSystem: addGasLine(doc.gasSystem) })}>Добавить линию</button>
     </fieldset>
@@ -423,7 +540,12 @@ export function TechDocAssistant() {
     </div>
     {error && <p role="alert">{error}</p>}
     {savedNotice && <p role="status">{savedNotice}</p>}
+    {stepWarnings.length > 0 && <div role="status" className="content-card">
+      <h3>Замечания к данным этапов</h3>
+      <ul className="list-disc">{stepWarnings.map(w => <li key={w}>{w}</li>)}</ul>
+    </div>}
     {futureVersion !== null && <button type="button" className="button secondary" onClick={() => save(true)}>Заменить сохранённый документ (схема {futureVersion}) текущим</button>}
+    {unreadableReason !== null && futureVersion === null && <button type="button" className="button secondary" onClick={() => save(true)}>Заменить нечитаемый сохранённый документ текущим</button>}
 
     <section className="content-card">
       <h2>H. Предпросмотр документа</h2>

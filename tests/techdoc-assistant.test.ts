@@ -154,8 +154,8 @@ test('validateDocument (F08): "Допустимая температура" (ini
 test('validateDocument: rejects a duplicate step order and an empty process name', () => {
   const doc = withName(createBlankDocument());
   const withSteps = { ...doc, steps: [
-    { order: 1, name: 'A', type: 'loading' as const, enabled: true, gasUsage: [], origin: 'user' as const, calculatedFields: [] },
-    { order: 1, name: 'B', type: 'cooling' as const, enabled: true, gasUsage: [], origin: 'user' as const, calculatedFields: [] },
+    { order: 1, name: 'A', type: 'loading' as const, enabled: true, gasUsage: [], sourceAssignments: [], gasAssignments: [], origin: 'user' as const, calculatedFields: [] },
+    { order: 1, name: 'B', type: 'cooling' as const, enabled: true, gasUsage: [], sourceAssignments: [], gasAssignments: [], origin: 'user' as const, calculatedFields: [] },
   ] };
   assert.throws(() => validateDocument(withSteps), /Дублирующийся номер этапа/);
   assert.throws(() => validateDocument({ ...doc, general: { processName: '   ' } }), /Название процесса/);
@@ -240,7 +240,7 @@ test('technological card output: shows "—" for every unset field, and real val
   const mainCoating = card.find(r => r.number === 6)!;
   assert.equal(mainCoating.temperature, '350°C');
   assert.equal(mainCoating.pressure, '0.5 Па');
-  assert.equal(mainCoating.gases, 'Ar (40 см³/мин)');
+  assert.equal(mainCoating.gases, 'Ar (40 sccm)');
   const untouched = card.find(r => r.number === 1)!;
   assert.equal(untouched.duration, '—');
   assert.equal(untouched.temperature, '—');

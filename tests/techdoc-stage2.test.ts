@@ -50,24 +50,24 @@ const pressureOf = (doc: TechnicalProcessDocument, order = 6) => doc.steps.find(
 // Schema version
 // =====================================================================================
 
-test('schema: new documents carry schemaVersion 2 and the default display unit Pa; it is separate from traceability.version', () => {
-  assert.equal(TECHDOC_SCHEMA_VERSION, 2);
+test('schema: new documents carry the current schemaVersion (3) and the default display unit Pa; it is separate from traceability.version', () => {
+  assert.equal(TECHDOC_SCHEMA_VERSION, 3);
   for (const doc of [createBlankDocument(), createDocumentFromPreset('pecvd')]) {
-    assert.equal(doc.schemaVersion, 2);
+    assert.equal(doc.schemaVersion, 3);
     assert.equal(doc.pressureUnit, 'pa');
     assert.equal(doc.traceability.version, 1, 'the document revision is a different counter');
   }
   const named = { ...createBlankDocument(), general: { processName: 'X' } };
   const touched = touchDocument(touchDocument(named));
   assert.equal(touched.traceability.version, 3, 'saving bumps the revision');
-  assert.equal(touched.schemaVersion, 2, '...and never the schema version');
+  assert.equal(touched.schemaVersion, 3, '...and never the schema version');
 });
 
 test('schema: a current document round-trips through JSON with schemaVersion and pressureUnit intact', () => {
   let doc = { ...createDocumentFromPreset('magnetron-pvd'), general: { processName: 'X' }, pressureUnit: 'mbar' as const };
   doc = { ...doc, steps: updateStep(doc.steps, 6, { pressurePa: 0.5 }) };
   const restored = restoreOk(doc);
-  assert.equal(restored.document.schemaVersion, 2);
+  assert.equal(restored.document.schemaVersion, 3);
   assert.equal(restored.document.pressureUnit, 'mbar');
   assert.equal(restored.migratedFromSchema, undefined, 'nothing to migrate');
   assert.deepEqual(json(restored.document), json(doc));
@@ -81,7 +81,7 @@ test('migration: 0.005 mbar -> 0.5 Pa (the audit example), shown in Pa by defaul
   const result = restoreOk(legacyDoc());
   assert.equal(pressureOf(result.document), 0.5);
   assert.equal(result.migratedFromSchema, 1);
-  assert.equal(result.document.schemaVersion, 2);
+  assert.equal(result.document.schemaVersion, 3, 'migrated all the way to the current schema');
   assert.equal(result.document.pressureUnit, 'pa');
   assert.ok(!JSON.stringify(result.document).includes('pressureMbar'), 'the old field is gone from the migrated document');
 });
@@ -194,7 +194,7 @@ test('invalid: malformed schemaVersion / pressureUnit values are rejected, not g
 });
 
 test('future schema: a newer unknown version is reported, never parsed, converted or loaded', () => {
-  for (const version of [3, 4, 99, 1000000]) {
+  for (const version of [4, 5, 99, 1000000]) {
     const future = { ...legacyDoc(), schemaVersion: version };
     const result = restoreDocumentDetailed(JSON.stringify(future));
     assert.deepEqual(result, { status: 'future_version', schemaVersion: version });

@@ -7,9 +7,12 @@
 
 import 'server-only';
 import {
-  validateDocument, buildTechnologicalCard, buildRouteCard, buildBriefRecipe, formatPressure,
+  validateDocument, buildTechnologicalCard, buildRouteCard, buildBriefRecipe, formatPressure, buildStepAssignmentLines,
+  sourceAssignmentFields, gasAssignmentFields, cardDetailHeading, hasLongSourceList, hasLongGasList,
+  PRESSURE_UNIT_LABELS, SEQUENTIAL_MODE_MEANING, SCCM_MEANING,
   type TechnicalProcessDocument, type PressureUnit,
 } from './techdoc-assistant';
+import { CARD_COLUMN_WEIGHTS, SOURCE_DETAIL_WEIGHTS, GAS_DETAIL_WEIGHTS, CARD_CELL_LINE_BUDGET, CONTINUATION_CELL, splitTallRows } from './techdoc-card-layout';
 import {
   DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, FILENAME_SEGMENT,
   type DocumentType, type ExportFormat,
@@ -35,7 +38,7 @@ export function buildExportFilename(doc: TechnicalProcessDocument, documentType:
 // ---------- DocumentViewModel (item 4): the ONE normalized layer both DOCX and PDF render from ----------
 
 export interface ViewModelSection { heading: string; paragraphs: string[] }
-export interface ViewModelTable { heading: string; columns: string[]; rows: string[][] }
+export interface ViewModelTable { heading: string; columns: string[]; rows: string[][]; columnWeights?: number[] }
 export interface ViewModelMetadataItem { label: string; value: string }
 export interface ViewModelQualityCheck { parameter: string; method: string; criterion: string; unit: string; result: string; status: string }
 export interface ViewModelTraceability { version: string; createdAt: string; updatedAt: string; processName: string; source: string; calculatedFieldsNote: string }
@@ -108,13 +111,13 @@ function sourceAndGasSummary(doc: TechnicalProcessDocument): string[] {
   const src = doc.sources;
   const lines: string[] = [];
   if (src.magnetrons.length === 0) lines.push(`Магнетроны: ${NOT_SET}`);
-  for (const m of src.magnetrons) lines.push(`Магнетрон (${m.enabled ? 'включён' : 'отключён'}): материал — ${show(m.material)}, мощность — ${showNum(m.powerW, ' Вт')}, режим — ${show(m.mode)}`);
+  for (const m of src.magnetrons) lines.push(`Магнетрон ${m.id} (в установке: ${m.enabled ? 'доступен' : 'отключён'}): материал — ${show(m.material)}, мощность — ${showNum(m.powerW, ' Вт')}, режим — ${show(m.mode)}`);
   if (src.arcSources.length === 0) lines.push(`Arc-источники: ${NOT_SET}`);
-  for (const a of src.arcSources) lines.push(`Arc-источник (${a.enabled ? 'включён' : 'отключён'}${a.filtered ? ', фильтрованный' : ''}): материал катода — ${show(a.cathodeMaterial)}, ток дуги — ${showNum(a.arcCurrentA, ' А')}`);
+  for (const a of src.arcSources) lines.push(`Arc-источник ${a.id} (в установке: ${a.enabled ? 'доступен' : 'отключён'}${a.filtered ? ', фильтрованный' : ''}): материал катода — ${show(a.cathodeMaterial)}, ток дуги — ${showNum(a.arcCurrentA, ' А')}`);
   lines.push(`ICP/RF: ${src.icpRf.enabled ? `включён, мощность — ${showNum(src.icpRf.powerW, ' Вт')}, bias — ${showNum(src.icpRf.biasV, ' В')}` : 'не используется'}`);
   lines.push(`Ion source: ${src.ionSource.enabled ? `включён, напряжение — ${showNum(src.ionSource.voltageV, ' В')}, ток — ${showNum(src.ionSource.currentA, ' А')}, мощность — ${showNum(src.ionSource.powerW, ' Вт')}` : 'не используется'}`);
   if (doc.gasSystem.length === 0) lines.push(`Газовая система: ${NOT_SET}`);
-  for (const line of doc.gasSystem) lines.push(`Газовая линия (${line.enabled ? 'включена' : 'отключена'}): газ — ${show(line.gas)}, расход — ${showNum(line.flow, ` ${line.unit}`)}`);
+  for (const line of doc.gasSystem) lines.push(`Газовая линия ${line.id} (в системе: ${line.enabled ? 'включена' : 'отключена'}): газ — ${show(line.gas)}, расход (справочно) — ${showNum(line.flow, ` ${line.unit}`)}`);
   return lines;
 }
 
@@ -126,9 +129,81 @@ function stepDescriptionBlock(step: TechnicalProcessDocument['steps'][number]): 
   return step.description && step.description.trim() !== '' ? `\nОписание: ${step.description}` : '';
 }
 
-function stepParagraph(step: TechnicalProcessDocument['steps'][number], unit: PressureUnit): string {
+/** Every source and gas-line assignment of the step - ON/OFF, material (from D), power/current,
+ *  time window, mode, flow - one line each, from the same builder the on-screen preview uses. */
+function stepAssignmentBlock(doc: TechnicalProcessDocument, step: TechnicalProcessDocument['steps'][number]): string {
+  const { sources, gases, notes, warnings } = buildStepAssignmentLines(doc, step);
+  const out: string[] = [];
+  if (sources.length > 0) out.push('Источники на этапе (из раздела D):', ...sources.map(text => `• ${text}`));
+  if (gases.length > 0) out.push('Газовые линии на этапе (из раздела E):', ...gases.map(text => `• ${text}`));
+  out.push(...notes);
+  if (warnings.length > 0) out.push('Замечания к данным этапа:', ...warnings.map(text => `• ${text}`));
+  return out.length > 0 ? `\n${out.join('\n')}` : '';
+}
+
+/** A card cell holds the step's general values AND all its source/gas assignments (full text).
+ *  The note says so, and states what "последовательно" means, so the table is not read as less
+ *  (or more) than it is. Absent when no step carries assignments. */
+/** One table per step that has a long source or gas list: every assignment is its OWN short row, and every
+ *  row repeats the step number and name - so a table that runs onto further pages (the column header is
+ *  repeated by the renderer) never separates a value from the step it belongs to. */
+function cardDetailTables(doc: TechnicalProcessDocument): ViewModelTable[] {
+  const tables: ViewModelTable[] = [];
+  for (const step of doc.steps) {
+    const stepName = step.enabled ? step.name : `${step.name} (отключён)`;
+    if (hasLongSourceList(doc, step)) {
+      const rows = step.sourceAssignments.map(a => {
+        const f = sourceAssignmentFields(doc, a);
+        return [String(step.order), stepName, f.source, f.material, f.state, f.value, f.time, f.mode];
+      });
+      tables.push({
+        heading: cardDetailHeading(step, 'sources'),
+        columns: ['№ этапа', 'Этап', 'Источник', 'Материал', 'Состояние', 'Мощность / ток', 'Время', 'Режим'],
+        columnWeights: [...SOURCE_DETAIL_WEIGHTS],
+        rows: splitTallRows(rows, SOURCE_DETAIL_WEIGHTS, [0, 1, 2]),
+      });
+    }
+    if (hasLongGasList(doc, step)) {
+      const rows = step.gasAssignments.map(a => {
+        const f = gasAssignmentFields(doc, a);
+        return [String(step.order), stepName, f.line, f.gas, f.state, f.flow, f.time];
+      });
+      tables.push({
+        heading: cardDetailHeading(step, 'gases'),
+        columns: ['№ этапа', 'Этап', 'Линия', 'Газ', 'Состояние', 'Расход', 'Время подачи'],
+        columnWeights: [...GAS_DETAIL_WEIGHTS],
+        rows: splitTallRows(rows, GAS_DETAIL_WEIGHTS, [0, 1, 2]),
+      });
+    }
+  }
+  return tables;
+}
+
+function cardNotes(doc: TechnicalProcessDocument, split: boolean): ViewModelSection[] {
+  const withAssignments = doc.steps.filter(step => step.sourceAssignments.length > 0 || step.gasAssignments.length > 0);
+  const anyLong = doc.steps.some(step => hasLongSourceList(doc, step) || hasLongGasList(doc, step));
+  const paragraphs: string[] = [];
+  if (withAssignments.length > 0) {
+    paragraphs.push(`В колонках «Источник/мощность» и «Газы» через «;» перечислены общие значения этапа и все назначения источников и газовых линий данного этапа${anyLong ? ' (кроме этапов с длинными перечнями - см. ниже)' : ''}.`);
+    if (doc.steps.some(step => step.sourceAssignments.some(a => a.enabled && a.mode === 'sequential'))) paragraphs.push(`Последовательный режим: ${SEQUENTIAL_MODE_MEANING}.`);
+    if (anyLong) {
+      paragraphs.push(`Для этапов, у которых перечень назначений источников или газовых линий слишком велик для одной ячейки карты (более ${CARD_CELL_LINE_BUDGET} строк текста в колонке), в таблице карты указано только число назначений; полный перечень (каждое назначение отдельной строкой с номером и названием этапа) приведён в таблицах «Этап №…: источники» и «Этап №…: газовые линии» ниже. Ничего не опущено.`);
+    }
+    paragraphs.push(unitsNote(doc));
+  }
+  if (split) {
+    paragraphs.push(`Значение, не помещающееся на одной странице, разбито на части «[k/n]» в нескольких строках: каждая строка повторяет номер и название этапа (и источник или линию); «${CONTINUATION_CELL}» означает, что значение указано в первой строке. Части идут по порядку и являются непрерывными фрагментами исходного значения; маркер «[k/n] » (скобки, дробь и один пробел) - только нумерация: чтобы получить исходное значение, отбросьте этот префикс у каждой части и соедините части подряд, ничего не добавляя. Ничего не опущено.`);
+  }
+  return paragraphs.length > 0 ? [{ heading: 'Примечание', paragraphs }] : [];
+}
+
+function unitsNote(doc: TechnicalProcessDocument): string {
+  return `Единицы: давление — ${PRESSURE_UNIT_LABELS[doc.pressureUnit]} (хранится в паскалях); расход газа — ${SCCM_MEANING}.`;
+}
+
+function stepParagraph(doc: TechnicalProcessDocument, step: TechnicalProcessDocument['steps'][number], unit: PressureUnit): string {
   const gases = step.gasUsage.length > 0
-    ? step.gasUsage.map(g => `${g.gas || NOT_SET}${g.flowSccm !== undefined ? ` (${g.flowSccm} см³/мин)` : ''}`).join(', ')
+    ? step.gasUsage.map(g => `${g.gas || NOT_SET}${g.flowSccm !== undefined ? ` (${g.flowSccm} sccm)` : ''}`).join(', ')
     : NOT_SET;
   const source = [step.sourceConfiguration, step.powerW !== undefined ? `${step.powerW} Вт` : null, step.currentA !== undefined ? `${step.currentA} А` : null]
     .filter((part): part is string => Boolean(part)).join(', ') || NOT_SET;
@@ -136,6 +211,7 @@ function stepParagraph(step: TechnicalProcessDocument['steps'][number], unit: Pr
     + `температура: ${showNum(step.temperatureC, '°C')}; давление: ${formatPressure(step.pressurePa, unit)}; газы: ${gases}; `
     + `источник/мощность: ${source}; bias: ${showNum(step.substrateBiasV, ' В')}; вращение: ${showNum(step.rotationRpm, ' об/мин')}; `
     + `расстояние: ${showNum(step.distanceMm, ' мм')}; критерий приёмки: ${show(step.acceptanceCriteria)}; примечание: ${show(step.notes)}`
+    + stepAssignmentBlock(doc, step)
     + stepDescriptionBlock(step);
 }
 
@@ -149,11 +225,18 @@ export function buildDocumentViewModel(doc: TechnicalProcessDocument, documentTy
   const footer = `${DOCUMENT_TYPE_LABELS[documentType]} • ${show(g.processName)} • версия ${doc.traceability.version}`;
 
   if (documentType === 'technologicalCard') {
-    const rows = buildTechnologicalCard(doc);
+    const rows = buildTechnologicalCard(doc, { compactLongLists: true });
+    const tables: ViewModelTable[] = [{
+      heading: DOCUMENT_TYPE_LABELS.technologicalCard,
+      columns: ['№', 'Операция', 'Время', 'Температура', 'Давление', 'Газы', 'Источник/мощность', 'Bias', 'Контроль', 'Примечание'],
+      // The Gases and Source/power cells carry every assignment of the step in full, so they get most of the width.
+      columnWeights: [...CARD_COLUMN_WEIGHTS],
+      // A free-text cell (acceptance criterion, note) too long for one page is split into marked continuation rows.
+      rows: splitTallRows(rows.map(r => [String(r.number), r.operation, r.duration, r.temperature, r.pressure, r.gases, r.sourcePower, r.bias, r.control, r.note]), CARD_COLUMN_WEIGHTS, [0, 1]),
+    }, ...cardDetailTables(doc)];
+    const split = tables.some(t => t.rows.some(row => row.includes(CONTINUATION_CELL)));
     return {
-      documentType, title: `${DOCUMENT_TYPE_LABELS.technologicalCard}: ${show(g.processName)}`, metadata, sections: [],
-      tables: [{ heading: DOCUMENT_TYPE_LABELS.technologicalCard, columns: ['№', 'Операция', 'Время', 'Температура', 'Давление', 'Газы', 'Источник/мощность', 'Bias', 'Контроль', 'Примечание'],
-        rows: rows.map(r => [String(r.number), r.operation, r.duration, r.temperature, r.pressure, r.gases, r.sourcePower, r.bias, r.control, r.note]) }],
+      documentType, title: `${DOCUMENT_TYPE_LABELS.technologicalCard}: ${show(g.processName)}`, metadata, sections: cardNotes(doc, split), tables,
       warnings, qualityChecks, traceability, traceabilityHeading: 'Traceability', footer,
     };
   }
@@ -205,7 +288,7 @@ export function buildDocumentViewModel(doc: TechnicalProcessDocument, documentTy
     { heading: '6. Последовательность операций', paragraphs: doc.steps.length > 0
       ? doc.steps.map(s => `№${s.order}. ${s.name}${!s.enabled ? ' (отключён)' : ''}`)
       : [NOT_SET] },
-    { heading: '7. Параметры процесса', paragraphs: [...sourceAndGasSummary(doc), ...(doc.steps.length > 0 ? doc.steps.map(s => stepParagraph(s, doc.pressureUnit)) : [NOT_SET])] },
+    { heading: '7. Параметры процесса', paragraphs: [...sourceAndGasSummary(doc), ...(doc.steps.length > 0 ? doc.steps.map(s => stepParagraph(doc, s, doc.pressureUnit)) : [NOT_SET]), unitsNote(doc)] },
     { heading: '8. Контроль качества', paragraphs: qualityChecks.length > 0 ? [`Определено параметров контроля: ${qualityChecks.length}. См. таблицу ниже.`] : [NOT_SET] },
     { heading: '9. Требования безопасности', paragraphs: warnings.length > 0 ? warnings : [NOT_SET] },
   ];

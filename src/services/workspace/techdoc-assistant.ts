@@ -9,11 +9,15 @@
 import { solveDeposition, type ThicknessUnit, type RateUnit } from './engineering-calculators';
 import { parseTechnicalProcessDocument, parseSchemaVersion } from './techdoc-parse';
 import {
+  estimateLines, columnWidthPt, CARD_COLUMN_WEIGHTS, CARD_SOURCE_COLUMN, CARD_GAS_COLUMN, CARD_CELL_LINE_BUDGET, TYPICAL_CHAR_PT,
+} from './techdoc-card-layout';
+import {
   TECHDOC_SCHEMA_VERSION, DEFAULT_PRESSURE_UNIT, PRESSURE_UNIT_LABELS, isPressureUnit, paToDisplayText, UnsupportedSchemaVersionError,
-  type PressureUnit,
+  SOURCE_KINDS, SOURCE_KIND_LABELS, ASSIGNMENT_MODES, ASSIGNMENT_MODE_LABELS, SEQUENTIAL_MODE_MEANING, SCCM_MEANING,
+  type PressureUnit, type SourceKind, type StepSourceAssignment, type StepGasAssignment,
 } from './techdoc-schema';
 
-export { TECHDOC_SCHEMA_VERSION, PRESSURE_UNITS, PRESSURE_UNIT_LABELS, PA_PER_MBAR, pressureToPa, paToDisplayText, paToDisplayInputValue, parsePressureInput, parsePressureText, type PressureUnit } from './techdoc-schema';
+export { TECHDOC_SCHEMA_VERSION, PRESSURE_UNITS, PRESSURE_UNIT_LABELS, PA_PER_MBAR, pressureToPa, paToDisplayText, paToDisplayInputValue, parsePressureInput, parsePressureText, SOURCE_KINDS, SOURCE_KIND_LABELS, ASSIGNMENT_MODES, ASSIGNMENT_MODE_LABELS, SEQUENTIAL_MODE_MEANING, SCCM_MEANING, type PressureUnit, type SourceKind, type AssignmentMode, type StepSourceAssignment, type StepGasAssignment } from './techdoc-schema';
 
 // ---------- shared validation helpers ----------
 
@@ -107,13 +111,18 @@ export interface ProcessStep {
   acceptanceCriteria?: string;
   /** How this step's skeleton was created - never how each field was edited. */
   origin: StepOrigin;
+  /** Magnetron / arc sources USED on this step (references to section D, see techdoc-schema.ts).
+   *  Empty by default - nothing is assigned or filled in automatically. */
+  sourceAssignments: StepSourceAssignment[];
+  /** Gas lines of section E USED on this step, with their own flow and timing. */
+  gasAssignments: StepGasAssignment[];
   /** Field names populated via an explicit calculation action (item 14) - empty until the user
    *  actually runs a calculation; never set implicitly. */
   calculatedFields: string[];
 }
 
 export function createStep(type: StepType, name?: string, origin: StepOrigin = 'user'): Omit<ProcessStep, 'order'> {
-  return { name: name ?? STEP_TYPE_LABELS[type], type, enabled: true, gasUsage: [], origin, calculatedFields: [] };
+  return { name: name ?? STEP_TYPE_LABELS[type], type, enabled: true, gasUsage: [], sourceAssignments: [], gasAssignments: [], origin, calculatedFields: [] };
 }
 
 function renumber(steps: ProcessStep[]): ProcessStep[] {
@@ -147,7 +156,11 @@ export function duplicateStep(steps: ProcessStep[], order: number): ProcessStep[
   // EXISTING updateStep() already clears the stamp correctly the moment the user edits that
   // field on the copy (see the "edit the copied step" test), so provenance still updates the
   // instant the value stops being the calculator's own output.
-  const copy: ProcessStep = { ...steps[index], gasUsage: steps[index].gasUsage.map(g => ({ ...g })), origin: 'user', calculatedFields: [...steps[index].calculatedFields] };
+  const copy: ProcessStep = {
+    ...steps[index], gasUsage: steps[index].gasUsage.map(g => ({ ...g })),
+    sourceAssignments: steps[index].sourceAssignments.map(a => ({ ...a })), gasAssignments: steps[index].gasAssignments.map(a => ({ ...a })),
+    origin: 'user', calculatedFields: [...steps[index].calculatedFields],
+  };
   const next = [...steps.slice(0, index + 1), copy, ...steps.slice(index + 1)];
   return renumber(next);
 }
@@ -301,13 +314,299 @@ export function createDefaultGasLines(): GasLine[] {
 }
 
 export function addGasLine(lines: GasLine[]): GasLine[] {
-  return [...lines, { id: `gas-${lines.length + 1}-${Date.now()}`, gas: '', unit: 'sccm', enabled: false }];
+  // Unique among the CURRENT lines (derived like source ids): step assignments reference a line by this id.
+  return [...lines, { id: nextSourceId('gas', lines), gas: '', unit: 'sccm', enabled: false }];
 }
 export function removeGasLine(lines: GasLine[], id: string): GasLine[] {
   return lines.filter(l => l.id !== id);
 }
 export function updateGasLine(lines: GasLine[], id: string, patch: Partial<GasLine>): GasLine[] {
   return lines.map(l => l.id === id ? { ...l, ...patch } : l);
+}
+
+// ---------- Step assignments of sources and gas lines (schema 3) ----------
+//
+// Section D (sources) and section E (gas lines) describe the EQUIPMENT: what exists and, for each
+// item, what it is. An assignment says what is USED on one step: a reference (`sourceId`/`lineId`)
+// plus ON/OFF, the step-specific power/current/flow and the time window. Materials and gas names
+// are never copied into an assignment - they are read from D/E, so one fact has one place to edit.
+
+function mapStep(steps: ProcessStep[], order: number, update: (step: ProcessStep) => ProcessStep): ProcessStep[] {
+  if (!steps.some(step => step.order === order)) throw new Error(`Этап №${order} не найден.`);
+  return steps.map(step => step.order === order ? { ...update(step), origin: 'user' as const } : step);
+}
+
+const sameSource = (kind: SourceKind, sourceId: string) => (a: StepSourceAssignment) => a.kind === kind && a.sourceId === sourceId;
+
+/** Assigns an existing source to a step, ON, in parallel mode, with NO power/current/time filled
+ *  in. Assigning the same source to the same step twice changes nothing (no duplicates). */
+export function addSourceAssignment(steps: ProcessStep[], order: number, kind: SourceKind, sourceId: string): ProcessStep[] {
+  return mapStep(steps, order, step => step.sourceAssignments.some(sameSource(kind, sourceId))
+    ? step
+    : { ...step, sourceAssignments: [...step.sourceAssignments, { sourceId, kind, enabled: true, mode: 'parallel' }] });
+}
+export function updateSourceAssignment(
+  steps: ProcessStep[], order: number, kind: SourceKind, sourceId: string,
+  patch: Partial<Omit<StepSourceAssignment, 'sourceId' | 'kind'>>,
+): ProcessStep[] {
+  return mapStep(steps, order, step => ({ ...step, sourceAssignments: step.sourceAssignments.map(a => sameSource(kind, sourceId)(a) ? { ...a, ...patch } : a) }));
+}
+export function removeSourceAssignment(steps: ProcessStep[], order: number, kind: SourceKind, sourceId: string): ProcessStep[] {
+  return mapStep(steps, order, step => ({ ...step, sourceAssignments: step.sourceAssignments.filter(a => !sameSource(kind, sourceId)(a)) }));
+}
+
+export function addGasAssignment(steps: ProcessStep[], order: number, lineId: string): ProcessStep[] {
+  return mapStep(steps, order, step => step.gasAssignments.some(a => a.lineId === lineId)
+    ? step
+    : { ...step, gasAssignments: [...step.gasAssignments, { lineId, enabled: true }] });
+}
+export function updateGasAssignment(steps: ProcessStep[], order: number, lineId: string, patch: Partial<Omit<StepGasAssignment, 'lineId'>>): ProcessStep[] {
+  return mapStep(steps, order, step => ({ ...step, gasAssignments: step.gasAssignments.map(a => a.lineId === lineId ? { ...a, ...patch } : a) }));
+}
+export function removeGasAssignment(steps: ProcessStep[], order: number, lineId: string): ProcessStep[] {
+  return mapStep(steps, order, step => ({ ...step, gasAssignments: step.gasAssignments.filter(a => a.lineId !== lineId) }));
+}
+
+/** Numbers of the steps that use a source / a gas line. */
+export function findSourceUsage(doc: Pick<TechnicalProcessDocument, 'steps'>, kind: SourceKind, sourceId: string): number[] {
+  return doc.steps.filter(step => step.sourceAssignments.some(sameSource(kind, sourceId))).map(step => step.order);
+}
+export function findGasLineUsage(doc: Pick<TechnicalProcessDocument, 'steps'>, lineId: string): number[] {
+  return doc.steps.filter(step => step.gasAssignments.some(a => a.lineId === lineId)).map(step => step.order);
+}
+
+export interface RemovalResult { document: TechnicalProcessDocument; blockedBySteps: number[] }
+
+/** Deleting a source (or gas line) that steps still use would leave those steps pointing at
+ *  nothing, or silently erase their settings - so it is REFUSED: the document is returned
+ *  unchanged together with the steps that still use it. Unused ones are removed. */
+export function removeSourceFromDocument(doc: TechnicalProcessDocument, kind: SourceKind, sourceId: string): RemovalResult {
+  const blockedBySteps = findSourceUsage(doc, kind, sourceId);
+  if (blockedBySteps.length > 0) return { document: doc, blockedBySteps };
+  const sources = kind === 'magnetron' ? removeMagnetron(doc.sources, sourceId) : removeArcSource(doc.sources, sourceId);
+  return { document: { ...doc, sources }, blockedBySteps };
+}
+export function removeGasLineFromDocument(doc: TechnicalProcessDocument, lineId: string): RemovalResult {
+  const blockedBySteps = findGasLineUsage(doc, lineId);
+  if (blockedBySteps.length > 0) return { document: doc, blockedBySteps };
+  return { document: { ...doc, gasSystem: removeGasLine(doc.gasSystem, lineId) }, blockedBySteps };
+}
+
+const TIME_EPS = 1e-9;
+const trimNumber = (value: number) => Number(value.toPrecision(12)); // display of a derived sum only (0.1 + 0.2)
+
+/** "0–30 мин" when start and duration are both known; otherwise says exactly what is missing.
+ *  A duration of 0 is a VALUE (the source/line does not run: an empty interval), clearly different
+ *  from "not set". A sum that is not a finite number is reported as such - "Infinity" is never
+ *  printed. */
+export function formatTimeWindow(startMin: number | undefined, durationMin: number | undefined): string {
+  if ([startMin, durationMin].some(v => v !== undefined && !Number.isFinite(v))) return 'некорректное значение времени';
+  const zero = 'длительность 0 мин (нулевой интервал: работы нет)';
+  if (startMin !== undefined && durationMin !== undefined) {
+    const end = startMin + durationMin;
+    if (!Number.isFinite(end)) return `начало ${startMin} мин, длительность ${durationMin} мин (конец интервала не определён: слишком большие значения)`;
+    return durationMin === 0 ? `начало ${startMin} мин, ${zero}` : `${startMin}–${trimNumber(end)} мин`;
+  }
+  if (startMin !== undefined) return `начало ${startMin} мин, длительность не задана`;
+  if (durationMin !== undefined) return durationMin === 0 ? `начало не задано, ${zero}` : `начало не задано, длительность ${durationMin} мин`;
+  return 'не задано';
+}
+
+interface SourceRef { enabled: boolean; label: string; description: string; material: string }
+
+function lookupSource(doc: Pick<TechnicalProcessDocument, 'sources'>, kind: SourceKind, sourceId: string): SourceRef | undefined {
+  const label = `${SOURCE_KIND_LABELS[kind]} ${sourceId}`;
+  if (kind === 'magnetron') {
+    const m = doc.sources.magnetrons.find(x => x.id === sourceId);
+    if (!m) return undefined;
+    const material = m.material?.trim() ? m.material : 'материал не задан';
+    return { enabled: m.enabled, label, material, description: `мишень: ${material}` };
+  }
+  const a = doc.sources.arcSources.find(x => x.id === sourceId);
+  if (!a) return undefined;
+  const material = `${a.cathodeMaterial?.trim() ? a.cathodeMaterial : 'материал не задан'}${a.filtered ? ', фильтрованный' : ''}`;
+  return { enabled: a.enabled, label, material, description: `катод: ${material}` };
+}
+
+/** One source assignment as a single line: which source and its material (from section D), ON/OFF,
+ *  power or current, the time window and the mode. OFF is stated as OFF; unset values are
+ *  stated as unset - nothing is filled in. */
+export function formatSourceAssignment(doc: Pick<TechnicalProcessDocument, 'sources'>, a: StepSourceAssignment): string {
+  const ref = lookupSource(doc, a.kind, a.sourceId);
+  const head = `${SOURCE_KIND_LABELS[a.kind]} ${a.sourceId} (${ref ? ref.description : 'нет в разделе D'})`;
+  if (!a.enabled) return `${head}: ОТКЛ на этапе`;
+  const value = a.kind === 'magnetron'
+    ? `мощность — ${a.powerW !== undefined ? `${a.powerW} Вт` : 'не задана'}`
+    : `ток дуги — ${a.currentA !== undefined ? `${a.currentA} А` : 'не задан'}`;
+  return `${head}: ВКЛ, ${value}, время — ${formatTimeWindow(a.startMin, a.durationMin)}, режим — ${ASSIGNMENT_MODE_LABELS[a.mode]}`;
+}
+
+export function formatGasAssignment(doc: Pick<TechnicalProcessDocument, 'gasSystem'>, a: StepGasAssignment): string {
+  const line = doc.gasSystem.find(l => l.id === a.lineId);
+  const head = `Линия ${a.lineId} (газ: ${line ? (line.gas.trim() ? line.gas : 'не указан в разделе E') : 'нет в разделе E'})`;
+  if (!a.enabled) return `${head}: ОТКЛ на этапе`;
+  return `${head}: ВКЛ, расход — ${a.flowSccm !== undefined ? `${a.flowSccm} sccm` : 'не задан'}, подача — ${formatTimeWindow(a.startMin, a.durationMin)}`;
+}
+
+/** One source assignment split into table cells (the same facts, wording and OFF/unset rules as
+ *  formatSourceAssignment): used where each assignment gets a row of its own. */
+export function sourceAssignmentFields(doc: Pick<TechnicalProcessDocument, 'sources'>, a: StepSourceAssignment): { source: string; material: string; state: string; value: string; time: string; mode: string } {
+  const ref = lookupSource(doc, a.kind, a.sourceId);
+  const base = { source: `${SOURCE_KIND_LABELS[a.kind]} ${a.sourceId}`, material: ref ? ref.material : 'нет в разделе D' };
+  if (!a.enabled) return { ...base, state: 'ОТКЛ', value: '—', time: '—', mode: '—' };
+  const value = a.kind === 'magnetron'
+    ? `мощность — ${a.powerW !== undefined ? `${a.powerW} Вт` : 'не задана'}`
+    : `ток дуги — ${a.currentA !== undefined ? `${a.currentA} А` : 'не задан'}`;
+  return { ...base, state: 'ВКЛ', value, time: formatTimeWindow(a.startMin, a.durationMin), mode: ASSIGNMENT_MODE_LABELS[a.mode] };
+}
+
+export function gasAssignmentFields(doc: Pick<TechnicalProcessDocument, 'gasSystem'>, a: StepGasAssignment): { line: string; gas: string; state: string; flow: string; time: string } {
+  const line = doc.gasSystem.find(l => l.id === a.lineId);
+  const base = { line: `Линия ${a.lineId}`, gas: line ? (line.gas.trim() ? line.gas : 'не указан в разделе E') : 'нет в разделе E' };
+  if (!a.enabled) return { ...base, state: 'ОТКЛ', flow: '—', time: '—' };
+  return { ...base, state: 'ВКЛ', flow: a.flowSccm !== undefined ? `${a.flowSccm} sccm` : 'не задан', time: formatTimeWindow(a.startMin, a.durationMin) };
+}
+
+/** A card cell moves to a detail table when its text would need more than CARD_CELL_LINE_BUDGET lines in
+ *  its real column (see techdoc-card-layout.ts for how the number was measured) - decided by the SIZE of
+ *  the content, not by how many assignments there are: four short ones stay inline, four assignments
+ *  with very long gas names do not. */
+const cellTooTall = (text: string, column: number) => estimateLines(text, columnWidthPt(CARD_COLUMN_WEIGHTS, column), TYPICAL_CHAR_PT) > CARD_CELL_LINE_BUDGET;
+export const hasLongSourceList = (doc: TechnicalProcessDocument, step: ProcessStep) => step.sourceAssignments.length > 0 && cellTooTall(fmtSourcePower(doc, step), CARD_SOURCE_COLUMN);
+export const hasLongGasList = (doc: TechnicalProcessDocument, step: ProcessStep) => step.gasAssignments.length > 0 && cellTooTall(fmtStepGases(doc, step), CARD_GAS_COLUMN);
+export function cardDetailHeading(step: ProcessStep, kind: 'sources' | 'gases'): string {
+  return `Этап №${step.order} «${step.name}»: ${kind === 'sources' ? 'источники' : 'газовые линии'}`;
+}
+
+/** Everything a step's assignments contribute to a document, as lines - the single source for the
+ *  on-screen preview and the exports, so they cannot disagree. */
+export function buildStepAssignmentLines(doc: TechnicalProcessDocument, step: ProcessStep): { sources: string[]; gases: string[]; notes: string[]; warnings: string[] } {
+  const sources = step.sourceAssignments.map(a => formatSourceAssignment(doc, a));
+  const gases = step.gasAssignments.map(a => formatGasAssignment(doc, a));
+  const notes: string[] = [];
+  if (step.sourceAssignments.some(a => a.enabled && a.mode === 'sequential')) notes.push(`Последовательный режим: ${SEQUENTIAL_MODE_MEANING}.`);
+  if (step.gasAssignments.some(a => a.enabled && a.flowSccm !== undefined)) notes.push(`Расход газа: ${SCCM_MEANING}.`);
+  const warnings = collectStepWarningItems(doc).filter(w => w.order === step.order).map(w => w.text);
+  return { sources, gases, notes, warnings };
+}
+
+/** Consistency of every step's assignments with section D / E and with the step's own timing. Only
+ *  objective contradictions throw (see validateDocument): a dangling or unusable reference,
+ *  negative times, an interval outside the step, a duplicate, a sequential source that overlaps
+ *  another. Missing values are never errors here - an ON source with no power is "not set". */
+function validateAssignments(doc: TechnicalProcessDocument): void {
+  const lineIds = new Set<string>();
+  for (const line of doc.gasSystem) {
+    if (lineIds.has(line.id)) throw new Error(`Газовая система: повторяется идентификатор линии «${line.id}». Идентификаторы линий должны быть уникальными.`);
+    lineIds.add(line.id);
+  }
+  for (const step of doc.steps) {
+    const where = `Этап №${step.order}`;
+    const within = (label: string, start: number | undefined, duration: number | undefined) => {
+      checkOptionalNonNegative(start, `${where}: ${label}: начало`);
+      checkOptionalNonNegative(duration, `${where}: ${label}: длительность`);
+      if (start !== undefined && duration !== undefined && !Number.isFinite(start + duration)) {
+        throw new Error(`${where}: ${label}: начало + длительность не является конечным числом (слишком большие значения).`);
+      }
+    };
+    const insideStep = (label: string, start: number | undefined, duration: number | undefined) => {
+      if (step.durationMin === undefined) return;
+      const limit = step.durationMin + TIME_EPS;
+      if (start !== undefined && start > limit) throw new Error(`${where}: ${label}: начало (${start} мин) позже конца этапа (${step.durationMin} мин).`);
+      if ((start ?? 0) + (duration ?? 0) > limit) throw new Error(`${where}: ${label}: интервал выходит за пределы этапа (${formatTimeWindow(start, duration)}; длительность этапа ${step.durationMin} мин).`);
+    };
+
+    const seen = new Set<string>();
+    for (const a of step.sourceAssignments) {
+      const label = `${SOURCE_KIND_LABELS[a.kind] ?? a.kind} ${a.sourceId}`;
+      if (!(SOURCE_KINDS as readonly string[]).includes(a.kind)) throw new Error(`${where}: недопустимый тип источника «${a.kind}».`);
+      if (!(ASSIGNMENT_MODES as readonly string[]).includes(a.mode)) throw new Error(`${where}: ${label}: недопустимый режим работы.`);
+      const key = `${a.kind}:${a.sourceId}`;
+      if (seen.has(key)) throw new Error(`${where}: ${label} назначен на этап дважды.`);
+      seen.add(key);
+      const ref = lookupSource(doc, a.kind, a.sourceId);
+      if (!ref) throw new Error(`${where}: назначен ${label}, которого нет в разделе D «Источники» (возможно, удалён). Снимите назначение или добавьте источник.`);
+      if (a.enabled && !ref.enabled) throw new Error(`${where}: ${label} отключён в установке (раздел D), его нельзя включить на этапе.`);
+      checkOptionalNonNegative(a.kind === 'magnetron' ? a.powerW : a.currentA, `${where}: ${label}: ${a.kind === 'magnetron' ? 'мощность' : 'ток дуги'}`);
+      within(label, a.startMin, a.durationMin);
+      if (a.enabled) insideStep(label, a.startMin, a.durationMin);
+    }
+
+    const running = step.sourceAssignments.filter(a => a.enabled);
+    for (const a of running.filter(x => x.mode === 'sequential')) {
+      const label = `${SOURCE_KIND_LABELS[a.kind]} ${a.sourceId}`;
+      if (a.startMin === undefined || a.durationMin === undefined) throw new Error(`${where}: ${label}: для последовательного режима нужно задать начало и длительность работы.`);
+      const aEnd = a.startMin + a.durationMin;
+      if (a.durationMin === 0) continue; // an empty interval (0 min = no work) overlaps nothing
+      for (const b of running) {
+        if (b === a || b.startMin === undefined || b.durationMin === undefined || b.durationMin === 0) continue;
+        const bEnd = b.startMin + b.durationMin;
+        if (a.startMin < bEnd - TIME_EPS && b.startMin < aEnd - TIME_EPS) {
+          throw new Error(`${where}: ${label} работает последовательно, но его интервал (${formatTimeWindow(a.startMin, a.durationMin)}) пересекается с интервалом ${SOURCE_KIND_LABELS[b.kind]} ${b.sourceId} (${formatTimeWindow(b.startMin, b.durationMin)}).`);
+        }
+      }
+    }
+
+    const seenLines = new Set<string>();
+    for (const a of step.gasAssignments) {
+      const label = `линия ${a.lineId}`;
+      if (seenLines.has(a.lineId)) throw new Error(`${where}: ${label} назначена на этап дважды.`);
+      seenLines.add(a.lineId);
+      const line = doc.gasSystem.find(l => l.id === a.lineId);
+      if (!line) throw new Error(`${where}: назначена ${label}, которой нет в разделе E «Газовая система» (возможно, удалена). Снимите назначение или добавьте линию.`);
+      if (a.enabled && !line.enabled) throw new Error(`${where}: ${label} отключена в газовой системе (раздел E), её нельзя использовать на этапе.`);
+      checkOptionalNonNegative(a.flowSccm, `${where}: ${label}: расход`);
+      within(label, a.startMin, a.durationMin);
+      if (a.enabled) insideStep(label, a.startMin, a.durationMin);
+    }
+  }
+}
+
+export interface StepWarning { order: number; text: string }
+
+/** Non-blocking remarks per step: things that cannot be verified or that need the user's attention
+ *  but are not contradictions (so an incomplete draft can still be saved and exported). The same
+ *  list feeds the editor, the preview and the DOCX/PDF instruction - nothing is shown in one and
+ *  hidden in another. */
+export function collectStepWarningItems(doc: TechnicalProcessDocument): StepWarning[] {
+  const warnings: StepWarning[] = [];
+  for (const step of doc.steps) {
+    const warn = (text: string) => warnings.push({ order: step.order, text });
+    const running = step.sourceAssignments.filter(a => a.enabled);
+    const label = (a: StepSourceAssignment) => `${SOURCE_KIND_LABELS[a.kind]} ${a.sourceId}`;
+
+    // The step's own general power/current/gas fields AND structured assignments: both are kept, the
+    // app picks neither and does not treat them as equivalent (even for the same material or gas).
+    const generalSource = [step.powerW !== undefined ? `мощность этапа ${step.powerW} Вт` : null, step.currentA !== undefined ? `ток этапа ${step.currentA} А` : null].filter(Boolean);
+    if (generalSource.length > 0 && step.sourceAssignments.length > 0) {
+      warn(`заданы и общие значения этапа (${generalSource.join(', ')}), и назначения источников. Значения не считаются эквивалентными и приоритет не выбирается - проверьте, какие из них действуют.`);
+    }
+    if (step.gasUsage.length > 0 && step.gasAssignments.length > 0) {
+      warn('задан и общий список газов этапа, и назначения газовых линий. Значения не считаются эквивалентными (даже при одинаковом газе) и приоритет не выбирается - проверьте, какие из них действуют.');
+    }
+
+    for (const a of running.filter(x => x.mode === 'sequential')) {
+      for (const b of running.filter(x => x !== a && (x.startMin === undefined || x.durationMin === undefined))) {
+        warn(`у ${label(b)} не заданы начало и длительность - непересечение с последовательным ${label(a)} проверить нельзя.`);
+      }
+    }
+    const timed = [...running, ...step.gasAssignments.filter(a => a.enabled)].some(a => a.startMin !== undefined || a.durationMin !== undefined);
+    if (timed && step.durationMin === undefined) warn('не задана длительность этапа - интервалы источников и газов нельзя сверить с границами этапа.');
+
+    for (const a of running.filter(x => x.durationMin === 0)) warn(`${label(a)} включён, но его длительность 0 мин - фактически он не работает на этапе.`);
+    for (const a of step.gasAssignments.filter(x => x.enabled)) {
+      if (a.durationMin === 0) warn(`линия ${a.lineId} включена, но длительность подачи 0 мин - газ фактически не подаётся.`);
+      const line = doc.gasSystem.find(l => l.id === a.lineId);
+      if (!line) continue;
+      if (!line.gas.trim()) warn(`для линии ${line.id} в разделе E не указан газ.`);
+      if (line.unit.trim().toLowerCase() !== 'sccm') warn(`линия ${line.id} ведётся в разделе E в единицах «${line.unit}»; расход на этапе задаётся в sccm и не пересчитывается.`);
+    }
+  }
+  return warnings;
+}
+
+export function collectStepWarnings(doc: TechnicalProcessDocument): string[] {
+  return collectStepWarningItems(doc).map(w => `Этап №${w.order}: ${w.text}`);
 }
 
 // ---------- Quality checks (item 11) - categories only, no invented norms ----------
@@ -415,30 +714,69 @@ export function restoreDocumentWithReport(rawJson: string | null | undefined): {
 export type RestoreResult =
   | { status: 'empty' }
   /** `migratedFromSchema` is set when the saved document was an OLDER schema and was converted in
-   *  memory (e.g. 1 -> 2: step pressure mbar -> Pa). Nothing is written back by restoring: the
-   *  stored copy stays as it was until the user saves explicitly. */
-  | { status: 'ok'; document: TechnicalProcessDocument; repairedSourceIds: number; migratedFromSchema?: number }
+   *  memory (1 -> pressure mbar -> Pa; 1 or 2 -> empty step assignments). Nothing is written back
+   *  by restoring: the stored copy stays as it was until the user saves explicitly. */
+  | { status: 'ok'; document: TechnicalProcessDocument; repairedSourceIds: number; repairedGasLineIds: number; migratedFromSchema?: number }
   /** Saved by a NEWER schema than this build knows: not parsed, not converted, not loaded. */
   | { status: 'future_version'; schemaVersion: number }
-  | { status: 'invalid' };
+  /** Unusable data. `reason` (when known) is a safe, human-readable explanation to show the user. */
+  | { status: 'invalid'; reason?: string };
 
 /** Restores a saved document and says WHY when it cannot: nothing saved, a newer unknown schema
  *  (the caller must tell the user and must not overwrite it silently), or unusable data. Never
  *  throws and never writes to storage. */
+class DocumentIntegrityError extends Error {}
+
+/** Repairing a duplicated id (first owner keeps it, later ones get a new id) is only safe while NO
+ *  step refers to that id. If a step's assignment points at an id that two or more records share, it
+ *  is impossible to know which record was meant - guessing would silently bind the step to the wrong
+ *  source or gas. That is refused with an explanation instead. */
+function assertNoAmbiguousReferences(doc: TechnicalProcessDocument): void {
+  const duplicated = (items: readonly { id: string }[]) => {
+    const seen = new Set<string>();
+    const repeated = new Set<string>();
+    for (const { id } of items) { if (id.trim() === '') continue; if (seen.has(id)) repeated.add(id); seen.add(id); }
+    return repeated;
+  };
+  const lines = duplicated(doc.gasSystem);
+  const magnetrons = duplicated(doc.sources.magnetrons);
+  const arcs = duplicated(doc.sources.arcSources);
+  for (const step of doc.steps) {
+    for (const a of step.gasAssignments) {
+      if (!lines.has(a.lineId)) continue;
+      const candidates = doc.gasSystem.filter(l => l.id === a.lineId).map(l => l.gas.trim() || 'газ не указан').join(' / ');
+      throw new DocumentIntegrityError(`Этап №${step.order}: назначена линия ${a.lineId}, но в разделе E несколько линий с таким идентификатором (${candidates}). Определить, какая имеется в виду, нельзя. Документ не загружен и не изменён - исправьте идентификаторы линий вручную.`);
+    }
+    for (const a of step.sourceAssignments) {
+      const repeated = a.kind === 'magnetron' ? magnetrons : arcs;
+      if (!repeated.has(a.sourceId)) continue;
+      const pool = a.kind === 'magnetron' ? doc.sources.magnetrons.filter(m => m.id === a.sourceId).map(m => m.material) : doc.sources.arcSources.filter(x => x.id === a.sourceId).map(x => x.cathodeMaterial);
+      throw new DocumentIntegrityError(`Этап №${step.order}: назначен ${SOURCE_KIND_LABELS[a.kind]} ${a.sourceId}, но в разделе D несколько источников с таким идентификатором (${pool.map(m => m?.trim() || 'материал не задан').join(' / ')}). Определить, какой имеется в виду, нельзя. Документ не загружен и не изменён - исправьте идентификаторы источников вручную.`);
+    }
+  }
+}
+
 export function restoreDocumentDetailed(rawJson: string | null | undefined): RestoreResult {
   if (!rawJson) return { status: 'empty' };
   try {
     const json: unknown = JSON.parse(rawJson);
     const savedSchema = json !== null && typeof json === 'object' && !Array.isArray(json) ? parseSchemaVersion((json as Record<string, unknown>).schemaVersion) : 1;
     const parsed = parseTechnicalProcessDocument(json);
-    validateDocument(parsed);
+    assertNoAmbiguousReferences(parsed);
+    // Duplicate ids are repaired BEFORE validation (validation rejects a repeated gas line id):
+    // the first record keeps its id, later repeats get a fresh one, nothing else changes.
     const { sources, repaired } = ensureUniqueSourceIds(parsed.sources);
+    const gas = withUniqueIds(parsed.gasSystem, 'gas');
+    const document = repaired === 0 && gas.repaired === 0 ? parsed : { ...parsed, sources, gasSystem: gas.items };
+    validateDocument(document);
     return {
-      status: 'ok', document: repaired === 0 ? parsed : { ...parsed, sources }, repairedSourceIds: repaired,
+      status: 'ok', document, repairedSourceIds: repaired, repairedGasLineIds: gas.repaired,
       ...(savedSchema < TECHDOC_SCHEMA_VERSION ? { migratedFromSchema: savedSchema } : {}),
     };
   } catch (error) {
-    return error instanceof UnsupportedSchemaVersionError ? { status: 'future_version', schemaVersion: error.schemaVersion } : { status: 'invalid' };
+    if (error instanceof UnsupportedSchemaVersionError) return { status: 'future_version', schemaVersion: error.schemaVersion };
+    const reason = error instanceof SyntaxError ? 'Сохранённые данные повреждены (это не корректный JSON).' : error instanceof Error ? error.message : undefined;
+    return { status: 'invalid', reason };
   }
 }
 
@@ -553,6 +891,8 @@ export function validateDocument(doc: TechnicalProcessDocument): void {
   checkOptionalNonNegative(doc.initialData.quantity, 'Количество');
   checkOptionalNonNegative(doc.initialData.requiredThicknessUm, 'Требуемая толщина');
   checkOptionalAboveAbsoluteZero(doc.initialData.allowedTemperatureC, 'Допустимая температура');
+
+  validateAssignments(doc);
 }
 
 // ---------- formatting helper: never invent a value, always show "не задано" / "—" ----------
@@ -575,16 +915,32 @@ function fmtStr(value: string | undefined, dash = false): string {
   if (value === undefined || value === '') return dash ? DASH : NOT_SET;
   return value;
 }
+/** The step's own free-text gas list (`gasUsage`, kept from earlier versions). Flow is in sccm - the
+ *  unit the field has always held (it was mislabelled "см³/мин", which is not the same unit). */
 function fmtGases(usage: GasUsage[]): string {
   if (usage.length === 0) return DASH;
-  return usage.map(u => `${u.gas || NOT_SET}${u.flowSccm !== undefined ? ` (${u.flowSccm} см³/мин)` : ''}`).join(', ');
+  return usage.map(u => `${u.gas || NOT_SET}${u.flowSccm !== undefined ? ` (${u.flowSccm} sccm)` : ''}`).join(', ');
 }
-function fmtSourcePower(step: ProcessStep): string {
+function legacySourcePower(step: ProcessStep): string {
   const parts: string[] = [];
   if (step.sourceConfiguration) parts.push(step.sourceConfiguration);
   if (step.powerW !== undefined) parts.push(`${step.powerW} Вт`);
   if (step.currentA !== undefined) parts.push(`${step.currentA} А`);
   return parts.length > 0 ? parts.join(', ') : DASH;
+}
+/** Table-cell form: the step's general values AND every structured assignment, so a card or table
+ *  never shows fewer sources/gases than the editor holds. */
+function fmtSourcePower(doc: TechnicalProcessDocument, step: ProcessStep): string {
+  const general = legacySourcePower(step);
+  const assigned = step.sourceAssignments.map(a => formatSourceAssignment(doc, a));
+  const all = [...(general === DASH ? [] : [general]), ...assigned];
+  return all.length > 0 ? all.join('; ') : DASH;
+}
+function fmtStepGases(doc: TechnicalProcessDocument, step: ProcessStep): string {
+  const general = fmtGases(step.gasUsage);
+  const assigned = step.gasAssignments.map(a => formatGasAssignment(doc, a));
+  const all = [...(general === DASH ? [] : [general]), ...assigned];
+  return all.length > 0 ? all.join('; ') : DASH;
 }
 
 // ---------- document views (item 8): all built from the SAME data, no duplication ----------
@@ -624,27 +980,34 @@ export function buildInstructionView(doc: TechnicalProcessDocument): string {
     lines.push(`- Длительность: ${fmtNum(step.durationMin, ' мин')}`);
     lines.push(`- Температура: ${fmtNum(step.temperatureC, '°C')}`);
     lines.push(`- Давление: ${formatPressure(step.pressurePa, doc.pressureUnit)}`);
-    lines.push(`- Газы: ${fmtGases(step.gasUsage)}`);
-    lines.push(`- Источник/мощность: ${fmtSourcePower(step)}`);
+    const extra = buildStepAssignmentLines(doc, step);
+    const generalGases = fmtGases(step.gasUsage);
+    const generalSources = legacySourcePower(step);
+    lines.push(`- Газы: ${generalGases === DASH && extra.gases.length > 0 ? 'см. «Газовые линии на этапе» ниже' : generalGases}`);
+    lines.push(`- Источник/мощность: ${generalSources === DASH && extra.sources.length > 0 ? 'см. «Источники на этапе» ниже' : generalSources}`);
     lines.push(`- Substrate bias: ${fmtNum(step.substrateBiasV, ' В')}`);
     lines.push(`- Вращение: ${fmtNum(step.rotationRpm, ' об/мин')}`);
     lines.push(`- Расстояние: ${fmtNum(step.distanceMm, ' мм')}`);
     lines.push(`- Критерий приёмки: ${fmtStr(step.acceptanceCriteria)}`);
+    if (extra.sources.length > 0) { lines.push('- Источники на этапе (из раздела D):'); for (const text of extra.sources) lines.push(`  - ${text}`); }
+    if (extra.gases.length > 0) { lines.push('- Газовые линии на этапе (из раздела E):'); for (const text of extra.gases) lines.push(`  - ${text}`); }
+    for (const note of extra.notes) lines.push(`- ${note}`);
+    if (extra.warnings.length > 0) { lines.push('- Замечания к данным этапа:'); for (const text of extra.warnings) lines.push(`  - ${text}`); }
     if (step.notes) lines.push(`- Примечание: ${step.notes}`);
   }
   lines.push('');
-  lines.push('## D. Источники');
+  lines.push('## D. Источники (справочник оборудования; включение и параметры на этапах - в разделе C)');
   const src = doc.sources;
   if (src.magnetrons.length === 0) lines.push(`- Магнетроны: ${NOT_SET}`);
-  for (const m of src.magnetrons) lines.push(`- Магнетрон (${m.enabled ? 'включён' : 'отключён'}): материал — ${fmtStr(m.material)}, мощность — ${fmtNum(m.powerW, ' Вт')}, режим — ${fmtStr(m.mode)}`);
+  for (const m of src.magnetrons) lines.push(`- Магнетрон ${m.id} (в установке: ${m.enabled ? 'доступен' : 'отключён'}): материал — ${fmtStr(m.material)}, мощность — ${fmtNum(m.powerW, ' Вт')}, режим — ${fmtStr(m.mode)}`);
   if (src.arcSources.length === 0) lines.push(`- Arc-источники: ${NOT_SET}`);
-  for (const a of src.arcSources) lines.push(`- Arc-источник (${a.enabled ? 'включён' : 'отключён'}${a.filtered ? ', фильтрованный' : ''}): материал катода — ${fmtStr(a.cathodeMaterial)}, ток дуги — ${fmtNum(a.arcCurrentA, ' А')}`);
+  for (const a of src.arcSources) lines.push(`- Arc-источник ${a.id} (в установке: ${a.enabled ? 'доступен' : 'отключён'}${a.filtered ? ', фильтрованный' : ''}): материал катода — ${fmtStr(a.cathodeMaterial)}, ток дуги — ${fmtNum(a.arcCurrentA, ' А')}`);
   lines.push(`- ICP/RF: ${src.icpRf.enabled ? `включён, мощность — ${fmtNum(src.icpRf.powerW, ' Вт')}, bias — ${fmtNum(src.icpRf.biasV, ' В')}` : 'не используется'}`);
   lines.push(`- Ion source: ${src.ionSource.enabled ? `включён, напряжение — ${fmtNum(src.ionSource.voltageV, ' В')}, ток — ${fmtNum(src.ionSource.currentA, ' А')}, мощность — ${fmtNum(src.ionSource.powerW, ' Вт')}` : 'не используется'}`);
   lines.push('');
-  lines.push('## E. Газовая система');
+  lines.push('## E. Газовая система (справочник линий; подача на этапах - в разделе C)');
   if (doc.gasSystem.length === 0) lines.push(NOT_SET);
-  for (const line of doc.gasSystem) lines.push(`- Линия (${line.enabled ? 'включена' : 'отключена'}): газ — ${fmtStr(line.gas)}, расход — ${fmtNum(line.flow, ` ${line.unit}`)}`);
+  for (const line of doc.gasSystem) lines.push(`- Линия ${line.id} (в системе: ${line.enabled ? 'включена' : 'отключена'}): газ — ${fmtStr(line.gas)}, расход (справочно) — ${fmtNum(line.flow, ` ${line.unit}`)}`);
   lines.push('');
   lines.push('## F. Контроль качества');
   if (doc.qualityChecks.length === 0) lines.push(NOT_SET);
@@ -676,15 +1039,32 @@ export interface TechCardRow {
   gases: string; sourcePower: string; bias: string; control: string; note: string;
 }
 
-export function buildTechnologicalCard(doc: TechnicalProcessDocument): TechCardRow[] {
+/** `compactLongLists` (used for DOCX/PDF): a step with a long source/gas list shows only the COUNT in its
+ *  card row and points at the table that lists every assignment (see cardDetailHeading) - an explicit
+ *  reference, never a silently shortened cell. Without it (on-screen preview, markdown) every cell holds
+ *  the complete text. */
+export function buildTechnologicalCard(doc: TechnicalProcessDocument, options: { compactLongLists?: boolean } = {}): TechCardRow[] {
+  const compact = options.compactLongLists === true;
+  const sourceCell = (step: ProcessStep) => {
+    if (!(compact && hasLongSourceList(doc, step))) return fmtSourcePower(doc, step);
+    const general = legacySourcePower(step);
+    const on = step.sourceAssignments.filter(a => a.enabled).length;
+    return [...(general === DASH ? [] : [general]), `назначено источников: ${step.sourceAssignments.length} (включено ${on}) - полный перечень в таблице «${cardDetailHeading(step, 'sources')}» ниже`].join('; ');
+  };
+  const gasCell = (step: ProcessStep) => {
+    if (!(compact && hasLongGasList(doc, step))) return fmtStepGases(doc, step);
+    const general = fmtGases(step.gasUsage);
+    const on = step.gasAssignments.filter(a => a.enabled).length;
+    return [...(general === DASH ? [] : [general]), `назначено газовых линий: ${step.gasAssignments.length} (включено ${on}) - полный перечень в таблице «${cardDetailHeading(step, 'gases')}» ниже`].join('; ');
+  };
   return doc.steps.map(step => ({
     number: step.order,
     operation: step.enabled ? step.name : `${step.name} (отключён)`,
     duration: fmtNum(step.durationMin, ' мин', true),
     temperature: fmtNum(step.temperatureC, '°C', true),
     pressure: formatPressure(step.pressurePa, doc.pressureUnit, true),
-    gases: fmtGases(step.gasUsage),
-    sourcePower: fmtSourcePower(step),
+    gases: gasCell(step),
+    sourcePower: sourceCell(step),
     bias: fmtNum(step.substrateBiasV, ' В', true),
     control: fmtStr(step.acceptanceCriteria, true),
     note: fmtStr(step.notes, true),
@@ -724,6 +1104,12 @@ export function buildRouteCard(doc: TechnicalProcessDocument): RouteCardRow[] {
 
 export function buildBriefRecipe(doc: TechnicalProcessDocument): string {
   const lines: string[] = [`# Краткий рецепт: ${fmtStr(doc.general.processName)}`];
+  const assigned = (step: ProcessStep) => step.sourceAssignments.length > 0 || step.gasAssignments.length > 0;
+  // The recipe shows only temperature, pressure, time and power. When steps also carry source/gas
+  // assignments it says so, instead of looking complete.
+  if (doc.steps.some(step => step.enabled && assigned(step))) {
+    lines.push('Сокращённое представление: температура, давление, время и мощность этапа. Назначения источников и газовых линий указаны только числом - полные данные в технологической инструкции.');
+  }
   for (const step of doc.steps) {
     if (!step.enabled) continue;
     const parts = [
@@ -732,7 +1118,12 @@ export function buildBriefRecipe(doc: TechnicalProcessDocument): string {
       step.durationMin !== undefined ? `t: ${step.durationMin} мин` : null,
       step.powerW !== undefined ? `W: ${step.powerW} Вт` : null,
     ].filter(Boolean);
-    lines.push(`${step.order}. ${step.name} — ${parts.length ? parts.join(', ') : NOT_SET}`);
+    const onSources = step.sourceAssignments.filter(a => a.enabled).length;
+    const onGases = step.gasAssignments.filter(a => a.enabled).length;
+    const marker = assigned(step)
+      ? ` [назначено: источников ${step.sourceAssignments.length} (включено ${onSources}), газовых линий ${step.gasAssignments.length} (включено ${onGases}) - см. инструкцию]`
+      : '';
+    lines.push(`${step.order}. ${step.name} — ${parts.length ? parts.join(', ') : NOT_SET}${marker}`);
   }
   return lines.join('\n');
 }

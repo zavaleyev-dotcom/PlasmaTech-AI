@@ -9,10 +9,63 @@
  *    1 (a document with no `schemaVersion` field at all) - step pressure stored as `pressureMbar`
  *    2                                                    - step pressure stored as `pressurePa`,
  *                                                           plus a `pressureUnit` display setting
+ *    3                                                    - each step additionally carries
+ *                                                           `sourceAssignments` (magnetron / arc
+ *                                                           sources used on that step) and
+ *                                                           `gasAssignments` (gas lines used on
+ *                                                           that step); older documents get both
+ *                                                           as empty lists - nothing is guessed
  *
  *  A document from a NEWER schema than this build knows is never parsed or converted: its
  *  structure is unknown, so guessing would risk silently corrupting it. */
-export const TECHDOC_SCHEMA_VERSION = 2;
+export const TECHDOC_SCHEMA_VERSION = 3;
+
+// ---------- per-step assignments of equipment (schema 3) ----------
+
+export const SOURCE_KINDS = ['magnetron', 'arc'] as const;
+export type SourceKind = typeof SOURCE_KINDS[number];
+export const SOURCE_KIND_LABELS: Record<SourceKind, string> = { magnetron: 'Магнетрон', arc: 'Дуговой источник' };
+
+export const ASSIGNMENT_MODES = ['parallel', 'sequential'] as const;
+export type AssignmentMode = typeof ASSIGNMENT_MODES[number];
+export const ASSIGNMENT_MODE_LABELS: Record<AssignmentMode, string> = { parallel: 'одновременно', sequential: 'последовательно' };
+
+/** What "sequential" means, stated once and used by validation, previews and exports alike: during
+ *  its own interval NO other enabled source of the same step is running (touching at an
+ *  endpoint is allowed). "Parallel" places no constraint on overlap. */
+export const SEQUENTIAL_MODE_MEANING = 'интервал работы источника не пересекается с интервалами других включённых источников этого этапа (касание границ допускается; длительность 0 мин означает, что работы нет, и пересечением не считается)';
+
+/** The meaning of the flow unit used for gas on a step - the app never converts other units into it. */
+export const SCCM_MEANING = 'sccm - стандартные см³/мин; условия приведения (температура, давление) определяются оборудованием и приложением не пересчитываются';
+
+/** One equipment source USED on one step. The source itself (its material, nominal values, filtered
+ *  flag) lives only in section D and is referenced by `sourceId` + `kind` (ids are unique per
+ *  kind, so "magnetron-1" and "arc-1" are different sources): the assignment never carries its own
+ *  copy of a material. `enabled` is ON/OFF on THIS step; OFF is a deliberate state, different from
+ *  an ON source whose power/current/time are simply not filled in (`undefined`). Times are minutes
+ *  from the start of the step. */
+export interface StepSourceAssignment {
+  sourceId: string;
+  kind: SourceKind;
+  enabled: boolean;
+  /** Power of a magnetron on this step (never set for an arc source). */
+  powerW?: number;
+  /** Arc current on this step (never set for a magnetron). */
+  currentA?: number;
+  startMin?: number;
+  durationMin?: number;
+  mode: AssignmentMode;
+}
+
+/** One gas line of section E used on one step. The gas itself comes from the line (single source of
+ *  truth, like a source's material). `flowSccm` is always sccm. */
+export interface StepGasAssignment {
+  lineId: string;
+  enabled: boolean;
+  flowSccm?: number;
+  startMin?: number;
+  durationMin?: number;
+}
 
 export const PRESSURE_UNITS = ['pa', 'mbar'] as const;
 export type PressureUnit = typeof PRESSURE_UNITS[number];

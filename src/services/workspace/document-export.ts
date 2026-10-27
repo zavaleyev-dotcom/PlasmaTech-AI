@@ -35,7 +35,16 @@ export function sanitizeFilenameSegment(value: string, fallback: string): string
  *  every existing caller (TechDoc) provides and that tests read. An empty `heading` renders no
  *  heading at all (the content is already self-structured by `blocks`). */
 export interface ExportSection { heading: string; paragraphs: string[]; blocks?: Exclude<MdBlock, { kind: 'title-label' }>[] }
-export interface ExportTable { heading: string; columns: string[]; rows: string[][] }
+/** `columnWeights` (optional): relative widths, one per column - for tables whose columns differ a lot in
+ *  how much text they hold. Absent, or of the wrong length, means equal widths (the previous behaviour). */
+export interface ExportTable { heading: string; columns: string[]; rows: string[][]; columnWeights?: number[] }
+
+function columnShares(table: ExportTable): number[] {
+  const weights = table.columnWeights;
+  if (!weights || weights.length !== table.columns.length || weights.some(w => !Number.isFinite(w) || w <= 0)) return table.columns.map(() => 1 / table.columns.length);
+  const total = weights.reduce((sum, w) => sum + w, 0);
+  return weights.map(w => w / total);
+}
 export interface ExportMetadataItem { label: string; value: string }
 
 export interface GenericDocumentViewModel {
@@ -167,19 +176,20 @@ function metadataParagraph(item: ExportMetadataItem, size = BODY_SIZE): Paragrap
 }
 
 function docxTable(table: ExportTable): Table {
-  const columnWidth = Math.floor(100 / table.columns.length);
+  const shares = columnShares(table);
+  const columnWidth = (index: number) => Math.max(1, Math.floor(shares[index] * 100));
   const headerRow = new TableRow({
     tableHeader: true,
-    children: table.columns.map(col => new TableCell({
-      width: { size: columnWidth, type: WidthType.PERCENTAGE },
+    children: table.columns.map((col, index) => new TableCell({
+      width: { size: columnWidth(index), type: WidthType.PERCENTAGE },
       verticalAlign: VerticalAlign.CENTER,
       shading: { fill: 'E2E2E2' },
       children: [new Paragraph({ children: [new TextRun({ text: col, font: DOCX_FONT, size: SMALL_SIZE, bold: true })] })],
     })),
   });
   const bodyRows = (table.rows.length > 0 ? table.rows : [table.columns.map(() => DASH)]).map(row => new TableRow({
-    children: row.map(cell => new TableCell({
-      width: { size: columnWidth, type: WidthType.PERCENTAGE },
+    children: row.map((cell, index) => new TableCell({
+      width: { size: columnWidth(index), type: WidthType.PERCENTAGE },
       children: [new Paragraph({ children: [new TextRun({ text: cell, font: DOCX_FONT, size: SMALL_SIZE })] })],
     })),
   }));
@@ -286,13 +296,13 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
 
       const contentWidth = doc.page.width - margins.left - margins.right;
 
-      doc.font('Bold').fontSize(16).fillColor('#000000').text(viewModel.title, { width: contentWidth });
+      doc.font('Bold').fontSize(16).fillColor('#000000').text(pdfText(viewModel.title), { width: contentWidth });
       doc.moveDown(0.5);
       doc.font('Body').fontSize(bodySize);
       const appendix = viewModel.metadataPlacement === 'appendix';
       if (!appendix) {
         for (const item of viewModel.metadata) {
-          doc.font('Bold').text(`${item.label}: `, { continued: true, width: contentWidth }).font('Body').text(item.value);
+          doc.font('Bold').text(pdfText(`${item.label}: `), { continued: true, width: contentWidth }).font('Body').text(pdfText(item.value));
         }
         doc.moveDown(0.5);
       }
@@ -301,7 +311,7 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
       for (const section of viewModel.sections) {
         if (section.heading) {
           ensureSpace(doc, 40, margins);
-          doc.font('Bold').fontSize(headingSize).text(section.heading, { width: contentWidth });
+          doc.font('Bold').fontSize(headingSize).text(pdfText(section.heading), { width: contentWidth });
           doc.moveDown(0.3);
         }
         doc.font('Body').fontSize(bodySize);
@@ -310,7 +320,7 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
         } else {
           for (const paragraph of section.paragraphs) {
             ensureSpace(doc, 14, margins);
-            doc.text(paragraph, { width: contentWidth, align: 'left', lineGap });
+            doc.text(pdfText(paragraph), { width: contentWidth, align: 'left', lineGap });
             doc.moveDown(0.2);
           }
         }
@@ -319,26 +329,26 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
 
       for (const table of viewModel.tables) {
         ensureSpace(doc, 40, margins);
-        doc.font('Bold').fontSize(headingSize).text(table.heading, { width: contentWidth });
+        doc.font('Bold').fontSize(headingSize).text(pdfText(table.heading), { width: contentWidth });
         doc.moveDown(0.3);
         drawTable(doc, table, contentWidth, margins);
         doc.moveDown(0.4);
       }
 
       if (appendix) doc.addPage(); else ensureSpace(doc, 60, margins);
-      doc.font('Bold').fontSize(headingSize).text(viewModel.traceabilityHeading, { width: contentWidth });
+      doc.font('Bold').fontSize(headingSize).text(pdfText(viewModel.traceabilityHeading), { width: contentWidth });
       doc.moveDown(0.3);
       doc.font('Body').fontSize(bodySize);
       if (appendix) {
         for (const item of viewModel.metadata) {
-          doc.font('Bold').text(`${item.label}: `, { continued: true, width: contentWidth }).font('Body').text(item.value);
+          doc.font('Bold').text(pdfText(`${item.label}: `), { continued: true, width: contentWidth }).font('Body').text(pdfText(item.value));
         }
       }
       for (const item of viewModel.traceability) {
-        doc.font('Bold').text(`${item.label}: `, { continued: true, width: contentWidth }).font('Body').text(item.value);
+        doc.font('Bold').text(pdfText(`${item.label}: `), { continued: true, width: contentWidth }).font('Body').text(pdfText(item.value));
       }
       doc.moveDown(0.5);
-      doc.font('Body').fontSize(8).fillColor('#666666').text(viewModel.footer, { width: contentWidth });
+      doc.font('Body').fontSize(8).fillColor('#666666').text(pdfText(viewModel.footer), { width: contentWidth });
 
       // F16: page numbers must be stamped onto the buffered pages BEFORE doc.end() finalizes
       // the document - switchToPage()/text() calls made after end() (e.g. inside the 'end'
@@ -371,9 +381,18 @@ function pdfFontFor(run: InlineRun, base: 'Body' | 'Bold' = 'Body'): string {
   return bold && run.italic ? 'BoldItalic' : bold ? 'Bold' : run.italic ? 'Italic' : 'Body';
 }
 
-/** A TAB cannot be positioned inside PDF text (PDFKit emits a NUL byte for it, which shows up
- *  as "a\u0000b"): it is displayed as 4 spaces. Display only - every other character is untouched. */
-function pdfText(text: string): string { return text.replace(/\t/g, '    '); }
+/** The text PDFKit is given, for BOTH measuring and drawing (one function, so the two can never differ).
+ *  Display only - the model, DOCX and Markdown keep the original characters. PDFKit cannot show:
+ *   - TAB (it emits a NUL byte and draws a missing-glyph box) -> 4 spaces;
+ *   - CR (CRLF, lone CR) -> a plain line break "\n" (a CR is drawn as a missing glyph);
+ *   - other control characters (NUL, BEL, VT, FF, ESC, DEL, ...) -> U+FFFD, a visible replacement mark.
+ *  Everything else - Cyrillic, µ, operators, exponents, units - is passed through untouched. */
+export function pdfText(text: string): string {
+  return text
+    .replace(/\r\n?/g, '\n')
+    .replace(/\t/g, '    ')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '\uFFFD');
+}
 
 /** Writes bold/italic runs as ONE wrapped paragraph (PDFKit's `continued` chaining). */
 function pdfRuns(doc: PDFKit.PDFDocument, runs: InlineRun[], opts: { width: number; lineGap?: number; base?: 'Body' | 'Bold' }): void {
@@ -442,17 +461,19 @@ function ensureSpace(doc: PDFKit.PDFDocument, minHeight: number, margins: PdfMar
 }
 
 function drawTable(doc: PDFKit.PDFDocument, table: ExportTable, contentWidth: number, margins: PdfMargins): void {
-  const columnWidth = contentWidth / table.columns.length;
+  const shares = columnShares(table);
+  const widths = shares.map(share => contentWidth * share);
+  const offsets = widths.map((_, i) => widths.slice(0, i).reduce((sum, w) => sum + w, 0));
   const rows = table.rows.length > 0 ? table.rows : [table.columns.map(() => DASH)];
 
   function drawHeader(): void {
     const startY = doc.y;
     doc.font('Bold').fontSize(8);
-    const rowHeight = Math.max(...table.columns.map(col => doc.heightOfString(col, { width: columnWidth - 6 }))) + 8;
+    const rowHeight = Math.max(...table.columns.map((col, i) => doc.heightOfString(pdfText(col), { width: widths[i] - 6 }))) + 8;
     doc.rect(margins.left, startY, contentWidth, rowHeight).fill('#E2E2E2');
     doc.fillColor('#000000');
     table.columns.forEach((col, i) => {
-      doc.text(col, margins.left + i * columnWidth + 3, startY + 4, { width: columnWidth - 6 });
+      doc.text(pdfText(col), margins.left + offsets[i] + 3, startY + 4, { width: widths[i] - 6 });
     });
     doc.y = startY + rowHeight;
   }
@@ -461,7 +482,7 @@ function drawTable(doc: PDFKit.PDFDocument, table: ExportTable, contentWidth: nu
   doc.font('Body').fontSize(8);
 
   for (const row of rows) {
-    const rowHeight = Math.max(...row.map(cell => doc.heightOfString(cell || DASH, { width: columnWidth - 6 }))) + 8;
+    const rowHeight = Math.max(...row.map((cell, i) => doc.heightOfString(pdfText(cell || DASH), { width: widths[i] - 6 }))) + 8;
     if (doc.y + rowHeight > doc.page.height - margins.bottom) {
       doc.addPage();
       drawHeader();
@@ -469,8 +490,11 @@ function drawTable(doc: PDFKit.PDFDocument, table: ExportTable, contentWidth: nu
     }
     const startY = doc.y;
     row.forEach((cell, i) => {
-      doc.text(cell || DASH, margins.left + i * columnWidth + 3, startY + 4, { width: columnWidth - 6 });
+      doc.text(pdfText(cell || DASH), margins.left + offsets[i] + 3, startY + 4, { width: widths[i] - 6 });
     });
     doc.y = startY + rowHeight;
   }
+  // The cell texts above were written at explicit x positions, which leaves the cursor in the last
+  // column: without this reset everything after a table (traceability, footer) starts at the right edge.
+  doc.x = margins.left;
 }

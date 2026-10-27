@@ -22,7 +22,10 @@ import {
   type TechnicalProcessDocument, type GeneralInfo, type InitialData, type ProcessStep, type GasUsage,
   type SourceSet, type MagnetronSource, type ArcSource, type GasLine, type QualityCheck, type SafetySection, type Traceability,
 } from './techdoc-assistant';
-import { TECHDOC_SCHEMA_VERSION, DEFAULT_PRESSURE_UNIT, isPressureUnit, migrateMbarToPa, UnsupportedSchemaVersionError } from './techdoc-schema';
+import {
+  TECHDOC_SCHEMA_VERSION, DEFAULT_PRESSURE_UNIT, isPressureUnit, migrateMbarToPa, UnsupportedSchemaVersionError, SOURCE_KINDS, ASSIGNMENT_MODES,
+  type StepSourceAssignment, type StepGasAssignment, type SourceKind, type AssignmentMode,
+} from './techdoc-schema';
 
 const MAX_SHORT_TEXT = 300;
 const MAX_LONG_TEXT = 5000;
@@ -117,7 +120,41 @@ function parseStepPressure(o: Record<string, unknown>, label: string, legacyPres
  *  document is always the current schema, so a later save/restore never converts it again. A step
  *  that already carries `pressurePa` keeps it untouched (never overwritten by a conversion), and
  *  in a current-schema document a stray `pressureMbar` is ignored, never converted. */
-function parseStep(raw: unknown, index: number, legacyPressure: boolean): ProcessStep {
+function parseSourceAssignment(raw: unknown, label: string, index: number): StepSourceAssignment {
+  const where = `${label}: назначение источника[${index}]`;
+  const o = asObject(raw, where);
+  if (typeof o.kind !== 'string' || !(SOURCE_KINDS as readonly string[]).includes(o.kind)) throw new Error(`${where}: недопустимый тип источника.`);
+  const kind = o.kind as SourceKind;
+  const sourceId = asRequiredString(o.sourceId, `${where}: sourceId`);
+  if (sourceId.trim() === '') throw new Error(`${where}: не указан источник.`);
+  const mode = o.mode === undefined || o.mode === null ? 'parallel' : o.mode;
+  if (typeof mode !== 'string' || !(ASSIGNMENT_MODES as readonly string[]).includes(mode)) throw new Error(`${where}: недопустимый режим работы.`);
+  return {
+    sourceId, kind, mode: mode as AssignmentMode,
+    enabled: asBoolean(o.enabled, `${where}: включён`, true),
+    // Only the value that belongs to the kind is read: a magnetron has no arc current and vice versa.
+    powerW: kind === 'magnetron' ? asOptionalNumber(o.powerW, `${where}: мощность`) : undefined,
+    currentA: kind === 'arc' ? asOptionalNumber(o.currentA, `${where}: ток дуги`) : undefined,
+    startMin: asOptionalNumber(o.startMin, `${where}: начало`),
+    durationMin: asOptionalNumber(o.durationMin, `${where}: длительность`),
+  };
+}
+
+function parseGasAssignment(raw: unknown, label: string, index: number): StepGasAssignment {
+  const where = `${label}: назначение газовой линии[${index}]`;
+  const o = asObject(raw, where);
+  const lineId = asRequiredString(o.lineId, `${where}: lineId`);
+  if (lineId.trim() === '') throw new Error(`${where}: не указана линия.`);
+  return {
+    lineId,
+    enabled: asBoolean(o.enabled, `${where}: включена`, true),
+    flowSccm: asOptionalNumber(o.flowSccm, `${where}: расход`),
+    startMin: asOptionalNumber(o.startMin, `${where}: начало`),
+    durationMin: asOptionalNumber(o.durationMin, `${where}: длительность`),
+  };
+}
+
+function parseStep(raw: unknown, index: number, legacyPressure: boolean, hasAssignments: boolean): ProcessStep {
   const o = asObject(raw, `Этап[${index}]`);
   const label = `Этап №${index + 1}`;
   return {
@@ -130,6 +167,10 @@ function parseStep(raw: unknown, index: number, legacyPressure: boolean): Proces
     temperatureC: asOptionalNumber(o.temperatureC, `${label}: температура`),
     pressurePa: parseStepPressure(o, label, legacyPressure),
     gasUsage: parseGasUsage(o.gasUsage, `${label}: газы`),
+    // Schema < 3 documents have no assignments: both lists start empty, nothing is inferred from
+    // the free-text `sourceConfiguration` / `gasUsage`, which stay exactly as they were.
+    sourceAssignments: hasAssignments ? asArray(o.sourceAssignments, `${label}: источники этапа`, MAX_SMALL_ARRAY).map((a, i) => parseSourceAssignment(a, label, i)) : [],
+    gasAssignments: hasAssignments ? asArray(o.gasAssignments, `${label}: газовые линии этапа`, MAX_SMALL_ARRAY).map((a, i) => parseGasAssignment(a, label, i)) : [],
     sourceConfiguration: asOptionalString(o.sourceConfiguration, `${label}: источник`),
     powerW: asOptionalNumber(o.powerW, `${label}: мощность`),
     currentA: asOptionalNumber(o.currentA, `${label}: ток`),
@@ -189,10 +230,30 @@ function parseSourceSet(raw: unknown): SourceSet {
   };
 }
 
+/** Gives every id-less gas line a fresh id, only after ALL explicit ids of the list are reserved
+ *  ("gas-N", one past the highest number in use, never an id already taken). Lines that already
+ *  have an id are returned untouched, so every existing reference to them keeps its meaning. */
+function fillMissingLineIds(lines: GasLine[]): GasLine[] {
+  const used = new Set(lines.filter(l => l.id.trim() !== '').map(l => l.id));
+  let max = 0;
+  for (const id of used) { const m = /^gas-(\d{1,9})$/.exec(id); if (m) max = Math.max(max, Number(m[1])); }
+  let next = max + 1;
+  return lines.map(line => {
+    if (line.id.trim() !== '') return line;
+    while (used.has(`gas-${next}`)) next += 1;
+    const id = `gas-${next}`;
+    used.add(id);
+    return { ...line, id };
+  });
+}
+
 function parseGasLine(raw: unknown, index: number): GasLine {
   const o = asObject(raw, `Газовая линия[${index}]`);
   return {
-    id: asRequiredString(o.id ?? `gas-${index}`, `Газовая линия[${index}]: id`),
+    // A missing id stays empty here and is filled by fillMissingLineIds AFTER every explicit id is reserved.
+    // An index-based fallback would hand out an id (e.g. "gas-0") that a later line explicitly owns,
+    // and step assignments referencing that id would silently bind to the wrong gas.
+    id: asRequiredString(o.id ?? '', `Газовая линия[${index}]: id`),
     gas: asRequiredString(o.gas ?? '', `Газовая линия[${index}]: газ`),
     flow: asOptionalNumber(o.flow, `Газовая линия[${index}]: расход`),
     unit: asRequiredString(o.unit ?? 'sccm', `Газовая линия[${index}]: единица`, 20),
@@ -250,6 +311,7 @@ export function parseTechnicalProcessDocument(raw: unknown): TechnicalProcessDoc
   const o = asObject(raw, 'document');
   const schemaVersion = parseSchemaVersion(o.schemaVersion);
   const legacyPressure = schemaVersion < 2;
+  const hasAssignments = schemaVersion >= 3;
   const stepsRaw = asArray(o.steps, 'Этапы процесса', MAX_STEPS);
   const qualityChecksRaw = asArray(o.qualityChecks, 'Контроль качества', MAX_QUALITY_CHECKS);
   const gasSystemRaw = asArray(o.gasSystem, 'Газовая система', MAX_SMALL_ARRAY);
@@ -259,9 +321,9 @@ export function parseTechnicalProcessDocument(raw: unknown): TechnicalProcessDoc
     pressureUnit: parsePressureUnit(o.pressureUnit),
     general: parseGeneralInfo(o.general),
     initialData: parseInitialData(o.initialData),
-    steps: stepsRaw.map((s, i) => parseStep(s, i, legacyPressure)),
+    steps: stepsRaw.map((s, i) => parseStep(s, i, legacyPressure, hasAssignments)),
     sources: parseSourceSet(o.sources),
-    gasSystem: gasSystemRaw.map((g, i) => parseGasLine(g, i)),
+    gasSystem: fillMissingLineIds(gasSystemRaw.map((g, i) => parseGasLine(g, i))),
     qualityChecks: qualityChecksRaw.map((q, i) => parseQualityCheck(q, i)),
     safety: parseSafety(o.safety),
     traceability: parseTraceability(o.traceability),
