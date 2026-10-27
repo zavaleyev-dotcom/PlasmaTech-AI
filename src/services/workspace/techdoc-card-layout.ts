@@ -40,11 +40,12 @@ export function columnWidthPt(weights: readonly number[], index: number): number
 
 /** Number of text lines `text` needs in a column `widthPt` wide, simulating word wrap at `charPt` per
  *  character (a word longer than a line is broken, as the renderer does). Every whitespace character
- *  (space, TAB, ...) occupies one character cell; "\n" starts a new line. Empty text is one line. */
+ *  (space, TAB, ...) occupies one character cell; CRLF, a lone CR and LF each start one new line. Empty text is one line. */
 export function estimateLines(text: string, widthPt: number, charPt: number): number {
   const capacity = Math.max(1, Math.floor(widthPt / charPt));
   let lines = 0;
-  for (const paragraph of text.split('\n')) {
+  // the PDF boundary turns CRLF and a lone CR into LF (pdfText in document-export.ts): count them the same way
+  for (const paragraph of text.split(/\r\n|\r|\n/)) {
     let used = 0;
     let count = 1;
     for (const token of paragraph.match(/\s+|\S+/g) ?? []) {

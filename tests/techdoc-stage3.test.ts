@@ -1377,3 +1377,59 @@ test('short tables are unaffected by the exact-split work: a short card keeps it
   assert.equal(vm.tables.length, 1);
   assert.ok(vm.tables[0].rows.every(r => !r.some(c => /^\[\d+\/\d+\] /.test(c) || c === CONTINUATION_CELL)));
 });
+
+// =====================================================================================
+// Line breaks: CRLF, lone CR and LF are counted exactly as the PDF boundary renders them
+// =====================================================================================
+
+import { pdfText as displayText } from '../src/services/workspace/document-export';
+
+test('line estimate agrees with the PDF display text: CRLF, a lone CR and LF are each one line break', () => {
+  for (const text of ['a\nb\nc', 'a\r\nb\r\nc', 'a\rb\rc', 'a\r\nb\rc\nd', '\r\r\r', 'a\r\n\r\nb']) {
+    assert.equal(estimateLines(text, 500, TYPICAL_CHAR_PT), displayText(text).split('\n').length, JSON.stringify(text));
+    assert.equal(estimateLines(text, 500, WORST_CHAR_PT), estimateLines(displayText(text), 500, WORST_CHAR_PT));
+  }
+  assert.equal(estimateLines('a\rb', 500, 6.4), 2);
+  assert.equal(estimateLines('a\r\nb', 500, 6.4), 2, 'CRLF is ONE break, not two');
+});
+
+test('audit case: a gas name of 00..84 joined by lone CR (254 characters) is split before it can overflow, context repeated, text exact, PDF checked', async () => {
+  const name = Array.from({ length: 85 }, (_, i) => String(i).padStart(2, '0')).join('\r');
+  assert.equal(name.length, 254);
+  const doc = longGasDoc([name]);
+  const step2 = step(doc, 2);
+  assert.equal(hasLongGasList(doc, step2), true);
+  const vm = buildDocumentViewModel(doc, 'technologicalCard');
+  const rows = vm.tables[1].rows;
+  assert.ok(rows.length >= 2, '85 lines do not fit one page: the record is split');
+  rows.forEach((row, i) => {
+    assert.deepEqual(row.slice(0, 3), ['2', 'Адгезионный подслой', 'Линия gas-1'], 'step number, name and line in every piece');
+    assert.ok(estimateLines(row[3], columnWidthPt([6, 16, 12, 16, 10, 16, 24], 3), WORST_CHAR_PT) <= CARD_ROW_LINE_LIMIT, `piece ${i + 1} fits a page`);
+  });
+  assert.deepEqual(rows[0].slice(4), ['ВКЛ', '10 sccm', '0–10 мин']);
+  assert.equal(joinChunkCells(rows.map(r => r[3])), name, 'parts.join("") === original, CRs included');
+
+  const pages = await pdfPages((await exportTechDoc(doc, 'technologicalCard', 'pdf')).buffer);
+  const withPieces = pages.filter(t => /2 Адгезионный подслой Линия gas-1 \[\d+\/\d+\]/.test(t));
+  assert.ok(withPieces.length >= 2, 'pieces are on more than one page');
+  for (const t of withPieces) assert.ok(t.includes('№ этапа Этап Линия Газ'), 'column header repeated on the page');
+  const all = pages.join(' ');
+  assert.equal((all.match(/2 Адгезионный подслой Линия gas-1 \[\d+\/\d+\]/g) ?? []).length, rows.length, 'every piece carries step and line');
+  for (let i = 0; i <= 84; i++) assert.ok(all.includes(String(i).padStart(2, '0')), `value ${i} is in the PDF`);
+  assert.ok(!/[\u0000\r]/.test(all));
+});
+
+test('mixed CRLF / CR / LF values: split exactly, every piece fits, the original comes back unchanged', () => {
+  const pieces = Array.from({ length: 200 }, (_, i) => `v${i}`);
+  const seps = ['\r\n', '\r', '\n', '\r\n\r\n', '\n\r'];
+  const mixed = pieces.map((p, i) => p + seps[i % seps.length]).join('');
+  const W2 = columnWidthPt([6, 16, 12, 16, 10, 16, 24], 3);
+  for (const text of [mixed, pieces.join('\r'), pieces.join('\r\n'), pieces.join('\n')]) {
+    const parts = chunkText(text, W2, WORST_CHAR_PT, 24);
+    assert.equal(parts.join(''), text);
+    assert.ok(parts.length >= 2);
+    for (const part of parts) assert.ok(estimateLines(part, W2, WORST_CHAR_PT) <= 24);
+    const rows = splitTallRows([['2', 'Этап', 'Линия', text]], [6, 16, 12, 16], [0, 1, 2]);
+    assert.equal(joinChunkCells(rows.map(r => r[3])), text);
+  }
+});
