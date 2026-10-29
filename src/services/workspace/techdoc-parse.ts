@@ -1,338 +1,214 @@
-/** Rebuilds a `TechnicalProcessDocument` from arbitrary, untrusted JSON - every field is read
- *  by NAME and type/length/array-size checked here; nothing is ever spread wholesale into our
- *  own objects, so a malformed or hostile payload can neither smuggle extra properties nor
- *  blow up memory/CPU with unbounded arrays or strings. Numeric soundness (NaN/Infinity/sign)
- *  is left to `validateDocument`, which every caller already runs afterward.
+/** Rebuilds a `TechnicalProcessDocument` from arbitrary, untrusted JSON - every field is read by NAME and type/length/array-size
+ *  checked here; nothing is ever spread wholesale into our own objects, so a malformed or hostile payload can neither smuggle extra
+ *  properties nor blow up memory/CPU with unbounded arrays or strings. Numeric soundness (NaN/Infinity/sign) is left to
+ *  `validateDocument`, which every caller already runs afterward.
  *
- *  Deliberately NOT server-only: this is shared by two very different untrusted-input paths -
- *  the DOCX/PDF export API route (an HTTP request body, see techdoc-export.ts, server-side)
- *  AND TechDoc Assistant's own browser-local persistence (tryRestoreDocument in
- *  techdoc-assistant.ts, client-side, restoring from this browser's own localStorage). F07: a
- *  corrupted/partial localStorage snapshot previously only got the
- *  shallow, value-only checks in `validateDocument` (which assumes the document is already
- *  correctly SHAPED and only range-checks numbers) - a structurally wrong snapshot (wrong
- *  field types, `steps` not an array, etc.) that never hit one of those specific numeric
- *  checks could still be accepted as "restored", then crash later when a view/export tried to
- *  read it. Reusing this already-thorough, already-tested structural parser for BOTH paths
- *  closes that gap without a second, independently-written (and possibly inconsistent)
- *  validator. */
+ *  Deliberately NOT server-only: it is shared by two untrusted-input paths - the DOCX/PDF export API route (an HTTP request body,
+ *  server-side) AND TechDoc Assistant's own browser-local persistence (restoreDocumentDetailed, client-side).
+ *
+ *  Documents of schemas 1-3 are read by techdoc-legacy.ts and converted to the current schema by techdoc-migrate.ts. */
 
+import type { TechnicalProcessDocument, ProcessStep, CoatingLayer } from './techdoc-assistant';
+import { parseV3Document } from './techdoc-legacy';
+import { migrateV3Document, type MigrationReport } from './techdoc-migrate';
 import {
-  STEP_TYPES,
-  type TechnicalProcessDocument, type GeneralInfo, type InitialData, type ProcessStep, type GasUsage,
-  type SourceSet, type MagnetronSource, type ArcSource, type GasLine, type QualityCheck, type SafetySection, type Traceability,
-} from './techdoc-assistant';
-import {
-  TECHDOC_SCHEMA_VERSION, DEFAULT_PRESSURE_UNIT, isPressureUnit, migrateMbarToPa, UnsupportedSchemaVersionError, SOURCE_KINDS, ASSIGNMENT_MODES,
-  type StepSourceAssignment, type StepGasAssignment, type SourceKind, type AssignmentMode,
+  TECHDOC_SCHEMA_VERSION, UnsupportedSchemaVersionError, STEP_TYPES, STEP_TYPE_SPECS, STEP_FIELD_META, LAYER_FIELDS, SOURCE_KINDS, ASSIGNMENT_MODES, COATING_MODES, SOURCE_KIND_FIELDS,
+  createEmptyLegacy, nextId,
+  type StepSource, type StepGas, type StepType, type StepFieldKey, type SourceKind, type AssignmentMode, type CoatingMode,
+  type LegacyData, type LegacyField, type LegacyValue, type LegacyStep, type LegacyStepFields, type LegacyEquipment,
 } from './techdoc-schema';
+import {
+  MAX_SHORT_TEXT, MAX_LONG_TEXT, MAX_STEPS, MAX_QUALITY_CHECKS, MAX_SMALL_ARRAY,
+  asObject, asArray, asRequiredString, asOptionalString, asOptionalNumber, asBoolean, asStringArray,
+  parseGeneralInfo, parseInitialData, parseQualityCheck, parseSafety, parseTraceability, parsePressureUnit, withUniqueIds,
+} from './techdoc-parse-utils';
 
-const MAX_SHORT_TEXT = 300;
-const MAX_LONG_TEXT = 5000;
-const MAX_STEPS = 200;
-const MAX_QUALITY_CHECKS = 200;
-const MAX_SMALL_ARRAY = 50;
+const MAX_LAYERS = 100;
+/** One legacy VALUE may hold this many nodes (a step can carry dozens of sources); the whole legacy block is bounded separately. */
+const MAX_LEGACY_NODES = 5000;
+const MAX_LEGACY_TOTAL_NODES = 200_000;
+const MAX_LEGACY_DEPTH = 8;
 
-function asObject(value: unknown, label: string): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label}: ожидается объект.`);
-  return value as Record<string, unknown>;
-}
-function asArray(value: unknown, label: string, maxItems: number): unknown[] {
-  if (value === undefined || value === null) return [];
-  if (!Array.isArray(value)) throw new Error(`${label}: ожидается массив.`);
-  if (value.length > maxItems) throw new Error(`${label}: слишком много элементов (максимум ${maxItems}).`);
-  return value;
-}
-function asRequiredString(value: unknown, label: string, maxLen = MAX_SHORT_TEXT): string {
-  if (typeof value !== 'string') throw new Error(`${label}: обязательное строковое поле.`);
-  if (value.length > maxLen) throw new Error(`${label}: текст слишком длинный (максимум ${maxLen} символов).`);
-  return value;
-}
-function asOptionalString(value: unknown, label: string, maxLen = MAX_SHORT_TEXT): string | undefined {
-  if (value === undefined || value === null || value === '') return undefined;
-  return asRequiredString(value, label, maxLen);
-}
-function asOptionalNumber(value: unknown, label: string): number | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== 'number') throw new Error(`${label}: ожидается число.`);
-  return value;
-}
-function asBoolean(value: unknown, label: string, fallback: boolean): boolean {
-  if (value === undefined || value === null) return fallback;
-  if (typeof value !== 'boolean') throw new Error(`${label}: ожидается логическое значение.`);
-  return value;
-}
-function asStringArray(value: unknown, label: string, maxItems = MAX_SMALL_ARRAY, maxLen = MAX_SHORT_TEXT): string[] {
-  return asArray(value, label, maxItems).map((v, i) => asRequiredString(v, `${label}[${i}]`, maxLen));
-}
-function asStepType(value: unknown, label: string): ProcessStep['type'] {
-  if (typeof value !== 'string' || !STEP_TYPES.includes(value as ProcessStep['type'])) throw new Error(`${label}: недопустимый тип этапа.`);
-  return value as ProcessStep['type'];
+function asStepType(value: unknown, label: string): StepType {
+  if (typeof value !== 'string' || !(STEP_TYPES as readonly string[]).includes(value)) throw new Error(`${label}: недопустимый тип этапа.`);
+  return value as StepType;
 }
 
-function parseGeneralInfo(raw: unknown): GeneralInfo {
-  const o = asObject(raw ?? {}, 'Общие сведения');
-  return {
-    processName: asRequiredString(o.processName, 'Название процесса', MAX_SHORT_TEXT),
-    purpose: asOptionalString(o.purpose, 'Назначение', MAX_LONG_TEXT),
-    equipment: asOptionalString(o.equipment, 'Оборудование'),
-    installationModel: asOptionalString(o.installationModel, 'Установка/модель'),
-    substrateMaterial: asOptionalString(o.substrateMaterial, 'Материал подложки'),
-    productType: asOptionalString(o.productType, 'Тип изделия'),
-    coatingMaterial: asOptionalString(o.coatingMaterial, 'Материал покрытия/обработки'),
-    responsible: asOptionalString(o.responsible, 'Ответственный/подразделение'),
-    documentVersion: asOptionalString(o.documentVersion, 'Версия документа'),
-    date: asOptionalString(o.date, 'Дата'),
-  };
-}
-
-function parseInitialData(raw: unknown): InitialData {
-  const o = asObject(raw ?? {}, 'Исходные данные');
-  return {
-    partSizeMm: asOptionalNumber(o.partSizeMm, 'Размер изделия'),
-    quantity: asOptionalNumber(o.quantity, 'Количество'),
-    initialSurfaceCondition: asOptionalString(o.initialSurfaceCondition, 'Исходное состояние поверхности', MAX_LONG_TEXT),
-    cleanlinessRequirement: asOptionalString(o.cleanlinessRequirement, 'Требования к чистоте', MAX_LONG_TEXT),
-    coatingRequirement: asOptionalString(o.coatingRequirement, 'Требования к покрытию/обработке', MAX_LONG_TEXT),
-    requiredThicknessUm: asOptionalNumber(o.requiredThicknessUm, 'Требуемая толщина'),
-    allowedTemperatureC: asOptionalNumber(o.allowedTemperatureC, 'Допустимая температура'),
-    additionalRequirements: asOptionalString(o.additionalRequirements, 'Дополнительные требования', MAX_LONG_TEXT),
-  };
-}
-
-function parseGasUsage(raw: unknown, label: string): GasUsage[] {
-  return asArray(raw, label, MAX_SMALL_ARRAY).map((entry, i) => {
-    const o = asObject(entry, `${label}[${i}]`);
-    return { gas: asRequiredString(o.gas ?? '', `${label}[${i}].gas`), flowSccm: asOptionalNumber(o.flowSccm, `${label}[${i}].flowSccm`) };
-  });
-}
-
-function parseStepPressure(o: Record<string, unknown>, label: string, legacyPressure: boolean): number | undefined {
-  const pa = asOptionalNumber(o.pressurePa, `${label}: давление`);
-  if (pa !== undefined) return pa;
-  if (!legacyPressure) return undefined;
-  const mbar = asOptionalNumber(o.pressureMbar, `${label}: давление`);
-  return mbar === undefined ? undefined : migrateMbarToPa(mbar);
-}
-
-/** `legacyPressure`: the document is schema 1, whose step pressure was stored in mbar as
- *  `pressureMbar`. It is converted to the canonical pascal exactly here, once - the parsed
- *  document is always the current schema, so a later save/restore never converts it again. A step
- *  that already carries `pressurePa` keeps it untouched (never overwritten by a conversion), and
- *  in a current-schema document a stray `pressureMbar` is ignored, never converted. */
-function parseSourceAssignment(raw: unknown, label: string, index: number): StepSourceAssignment {
-  const where = `${label}: назначение источника[${index}]`;
+function parseStepSource(raw: unknown, where: string): StepSource {
   const o = asObject(raw, where);
   if (typeof o.kind !== 'string' || !(SOURCE_KINDS as readonly string[]).includes(o.kind)) throw new Error(`${where}: недопустимый тип источника.`);
   const kind = o.kind as SourceKind;
-  const sourceId = asRequiredString(o.sourceId, `${where}: sourceId`);
-  if (sourceId.trim() === '') throw new Error(`${where}: не указан источник.`);
   const mode = o.mode === undefined || o.mode === null ? 'parallel' : o.mode;
   if (typeof mode !== 'string' || !(ASSIGNMENT_MODES as readonly string[]).includes(mode)) throw new Error(`${where}: недопустимый режим работы.`);
-  return {
-    sourceId, kind, mode: mode as AssignmentMode,
-    enabled: asBoolean(o.enabled, `${where}: включён`, true),
-    // Only the value that belongs to the kind is read: a magnetron has no arc current and vice versa.
-    powerW: kind === 'magnetron' ? asOptionalNumber(o.powerW, `${where}: мощность`) : undefined,
-    currentA: kind === 'arc' ? asOptionalNumber(o.currentA, `${where}: ток дуги`) : undefined,
+  const fields = new Set<string>(SOURCE_KIND_FIELDS[kind]);
+  const num = (key: string, label: string) => fields.has(key) ? asOptionalNumber(o[key], `${where}: ${label}`) : undefined;
+  const source: StepSource = {
+    // A missing id stays empty here and is filled AFTER every explicit id of the list is reserved.
+    id: asRequiredString(o.id ?? '', `${where}: id`),
+    kind, enabled: asBoolean(o.enabled, `${where}: включён`, true), mode: mode as AssignmentMode,
+    // Only the values that belong to the kind are read.
+    material: fields.has('material') ? asOptionalString(o.material, `${where}: материал`) : undefined,
+    operatingMode: fields.has('operatingMode') ? asOptionalString(o.operatingMode, `${where}: режим питания`) : undefined,
+    filtered: fields.has('filtered') ? asBoolean(o.filtered, `${where}: фильтрация`, false) : undefined,
+    powerW: num('powerW', 'мощность'), currentA: num('currentA', 'ток'), voltageV: num('voltageV', 'напряжение'), biasV: num('biasV', 'смещение'),
     startMin: asOptionalNumber(o.startMin, `${where}: начало`),
     durationMin: asOptionalNumber(o.durationMin, `${where}: длительность`),
   };
+  return Object.fromEntries(Object.entries(source).filter(([, v]) => v !== undefined)) as unknown as StepSource;
 }
 
-function parseGasAssignment(raw: unknown, label: string, index: number): StepGasAssignment {
-  const where = `${label}: назначение газовой линии[${index}]`;
+function parseStepGas(raw: unknown, where: string): StepGas {
   const o = asObject(raw, where);
-  const lineId = asRequiredString(o.lineId, `${where}: lineId`);
-  if (lineId.trim() === '') throw new Error(`${where}: не указана линия.`);
-  return {
-    lineId,
+  const gas: StepGas = {
+    id: asRequiredString(o.id ?? '', `${where}: id`),
     enabled: asBoolean(o.enabled, `${where}: включена`, true),
+    gas: asRequiredString(o.gas ?? '', `${where}: газ`),
     flowSccm: asOptionalNumber(o.flowSccm, `${where}: расход`),
     startMin: asOptionalNumber(o.startMin, `${where}: начало`),
     durationMin: asOptionalNumber(o.durationMin, `${where}: длительность`),
   };
+  return Object.fromEntries(Object.entries(gas).filter(([, v]) => v !== undefined)) as unknown as StepGas;
 }
 
-function parseStep(raw: unknown, index: number, legacyPressure: boolean, hasAssignments: boolean): ProcessStep {
+/** Gives every id-less item a fresh id after all explicit ids are reserved (so no explicit id is ever taken by another item). */
+function fillIds<T extends { id: string }>(items: T[], prefix: string): T[] {
+  const taken: { id: string }[] = items.filter(i => i.id.trim() !== '').map(i => ({ id: i.id }));
+  return items.map(item => {
+    if (item.id.trim() !== '') return item;
+    const id = nextId(prefix, taken);
+    taken.push({ id });
+    return { ...item, id };
+  });
+}
+
+function parseSources(raw: unknown, label: string): StepSource[] {
+  return fillIds(asArray(raw, `${label}: источники`, MAX_SMALL_ARRAY).map((s, i) => parseStepSource(s, `${label}: источник[${i}]`)), 'source');
+}
+function parseGases(raw: unknown, label: string): StepGas[] {
+  return fillIds(asArray(raw, `${label}: газовые линии`, MAX_SMALL_ARRAY).map((g, i) => parseStepGas(g, `${label}: газовая линия[${i}]`)), 'gas');
+}
+
+/** Reads the fields in `keys` from `o` by their kind (number / text / non-negative-integer count), leaving the others unset. */
+function readFields(o: Record<string, unknown>, keys: readonly StepFieldKey[], label: string): Partial<Record<StepFieldKey, number | string>> {
+  const out: Partial<Record<StepFieldKey, number | string>> = {};
+  for (const key of keys) {
+    const meta = STEP_FIELD_META[key];
+    const value = meta.kind === 'text' ? asOptionalString(o[key], `${label}: ${meta.label.toLowerCase()}`, MAX_SHORT_TEXT) : asOptionalNumber(o[key], `${label}: ${meta.label.toLowerCase()}`);
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+function parseLayer(raw: unknown, label: string, index: number): CoatingLayer {
+  const where = `${label}, слой ${index + 1}`;
+  const o = asObject(raw, where);
+  return {
+    id: asRequiredString(o.id ?? '', `${where}: id`),
+    ...(readFields(o, LAYER_FIELDS, where) as Partial<CoatingLayer>),
+    sources: parseSources(o.sources, where),
+    gases: parseGases(o.gases, where),
+    calculatedFields: asStringArray(o.calculatedFields, `${where}: вычисленные поля`, 20, 100).filter(f => (LAYER_FIELDS as readonly string[]).includes(f)),
+  };
+}
+
+function parseStep(raw: unknown, index: number): ProcessStep {
   const o = asObject(raw, `Этап[${index}]`);
   const label = `Этап №${index + 1}`;
+  const type = asStepType(o.type, `${label}: тип`);
+  const spec = STEP_TYPE_SPECS[type];
+  const mode = o.coatingMode === undefined || o.coatingMode === null ? 'multi' : o.coatingMode;
+  if (typeof mode !== 'string' || !(COATING_MODES as readonly string[]).includes(mode)) throw new Error(`${label}: недопустимый режим покрытия.`);
+  const layers = spec.layers ? fillIds(asArray(o.layers, `${label}: слои`, MAX_LAYERS).map((l, i) => parseLayer(l, label, i)), 'layer') : [];
   return {
+    id: asRequiredString(o.id ?? '', `${label}: id`),
     order: asOptionalNumber(o.order, `${label}: номер`) ?? index + 1,
     name: asRequiredString(o.name, `${label}: название`),
-    type: asStepType(o.type, `${label}: тип`),
+    type,
     enabled: asBoolean(o.enabled, `${label}: включён`, true),
     description: asOptionalString(o.description, `${label}: описание`, MAX_LONG_TEXT),
-    durationMin: asOptionalNumber(o.durationMin, `${label}: длительность`),
-    temperatureC: asOptionalNumber(o.temperatureC, `${label}: температура`),
-    pressurePa: parseStepPressure(o, label, legacyPressure),
-    gasUsage: parseGasUsage(o.gasUsage, `${label}: газы`),
-    // Schema < 3 documents have no assignments: both lists start empty, nothing is inferred from
-    // the free-text `sourceConfiguration` / `gasUsage`, which stay exactly as they were.
-    sourceAssignments: hasAssignments ? asArray(o.sourceAssignments, `${label}: источники этапа`, MAX_SMALL_ARRAY).map((a, i) => parseSourceAssignment(a, label, i)) : [],
-    gasAssignments: hasAssignments ? asArray(o.gasAssignments, `${label}: газовые линии этапа`, MAX_SMALL_ARRAY).map((a, i) => parseGasAssignment(a, label, i)) : [],
-    sourceConfiguration: asOptionalString(o.sourceConfiguration, `${label}: источник`),
-    powerW: asOptionalNumber(o.powerW, `${label}: мощность`),
-    currentA: asOptionalNumber(o.currentA, `${label}: ток`),
-    substrateBiasV: asOptionalNumber(o.substrateBiasV, `${label}: bias`),
-    rotationRpm: asOptionalNumber(o.rotationRpm, `${label}: вращение`),
-    distanceMm: asOptionalNumber(o.distanceMm, `${label}: расстояние`),
-    notes: asOptionalString(o.notes, `${label}: примечание`, MAX_LONG_TEXT),
-    acceptanceCriteria: asOptionalString(o.acceptanceCriteria, `${label}: критерий приёмки`, MAX_LONG_TEXT),
+    // Only the fields the card type has are read: whatever else a payload carries is dropped, never smuggled in.
+    ...(readFields(o, spec.fields, label) as Partial<ProcessStep>),
+    sources: spec.sources ? parseSources(o.sources, label) : [],
+    gases: spec.gases ? parseGases(o.gases, label) : [],
+    coatingMode: mode as CoatingMode,
+    layers,
     origin: o.origin === 'preset' ? 'preset' : 'user',
     calculatedFields: asStringArray(o.calculatedFields, `${label}: вычисленные поля`, 20, 100),
   };
 }
 
-function parseMagnetron(raw: unknown, index: number): MagnetronSource {
-  const o = asObject(raw, `Магнетрон[${index}]`);
-  return {
-    // A missing id stays empty: it is assigned later by ensureUniqueSourceIds, AFTER every explicit id
-    // in the list is reserved. An index-based fallback here would take an id (e.g. "magnetron-0")
-    // that a later record explicitly owns, and the owner would be the one renamed.
-    id: asRequiredString(o.id ?? '', `Магнетрон[${index}]: id`),
-    enabled: asBoolean(o.enabled, `Магнетрон[${index}]: включён`, true),
-    material: asOptionalString(o.material, `Магнетрон[${index}]: материал`),
-    powerW: asOptionalNumber(o.powerW, `Магнетрон[${index}]: мощность`),
-    mode: asOptionalString(o.mode, `Магнетрон[${index}]: режим`),
-  };
+// ---------- legacy block (bounded, structure-free JSON values) ----------
+
+function parseLegacyValue(value: unknown, label: string, budget: { nodes: number }, depth = 0): LegacyValue {
+  if (++budget.nodes > MAX_LEGACY_NODES) throw new Error(`${label}: слишком много вложенных данных.`);
+  if (depth > MAX_LEGACY_DEPTH) throw new Error(`${label}: слишком глубокая вложенность.`);
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') { if (value.length > MAX_LONG_TEXT) throw new Error(`${label}: текст слишком длинный.`); return value; }
+  if (Array.isArray(value)) return value.map(v => parseLegacyValue(v, label, budget, depth + 1));
+  if (typeof value === 'object') return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, parseLegacyValue(v, label, budget, depth + 1)]));
+  throw new Error(`${label}: недопустимое значение.`);
 }
 
-function parseArcSource(raw: unknown, index: number): ArcSource {
-  const o = asObject(raw, `Arc-источник[${index}]`);
-  return {
-    id: asRequiredString(o.id ?? '', `Arc-источник[${index}]: id`),
-    enabled: asBoolean(o.enabled, `Arc-источник[${index}]: включён`, true),
-    cathodeMaterial: asOptionalString(o.cathodeMaterial, `Arc-источник[${index}]: материал катода`),
-    arcCurrentA: asOptionalNumber(o.arcCurrentA, `Arc-источник[${index}]: ток дуги`),
-    filtered: asBoolean(o.filtered, `Arc-источник[${index}]: фильтрованный`, false),
-  };
-}
-
-function parseSourceSet(raw: unknown): SourceSet {
-  const o = asObject(raw ?? {}, 'Источники');
-  const icpRfRaw = asObject(o.icpRf ?? {}, 'ICP/RF');
-  const ionSourceRaw = asObject(o.ionSource ?? {}, 'Ion source');
-  return {
-    magnetrons: asArray(o.magnetrons, 'Магнетроны', MAX_SMALL_ARRAY).map(parseMagnetron),
-    arcSources: asArray(o.arcSources, 'Arc-источники', MAX_SMALL_ARRAY).map(parseArcSource),
-    icpRf: {
-      enabled: asBoolean(icpRfRaw.enabled, 'ICP/RF: включён', false),
-      powerW: asOptionalNumber(icpRfRaw.powerW, 'ICP/RF: мощность'),
-      biasV: asOptionalNumber(icpRfRaw.biasV, 'ICP/RF: bias'),
-    },
-    ionSource: {
-      enabled: asBoolean(ionSourceRaw.enabled, 'Ion source: включён', false),
-      voltageV: asOptionalNumber(ionSourceRaw.voltageV, 'Ion source: напряжение'),
-      currentA: asOptionalNumber(ionSourceRaw.currentA, 'Ion source: ток'),
-      powerW: asOptionalNumber(ionSourceRaw.powerW, 'Ion source: мощность'),
-    },
-  };
-}
-
-/** Gives every id-less gas line a fresh id, only after ALL explicit ids of the list are reserved
- *  ("gas-N", one past the highest number in use, never an id already taken). Lines that already
- *  have an id are returned untouched, so every existing reference to them keeps its meaning. */
-function fillMissingLineIds(lines: GasLine[]): GasLine[] {
-  const used = new Set(lines.filter(l => l.id.trim() !== '').map(l => l.id));
-  let max = 0;
-  for (const id of used) { const m = /^gas-(\d{1,9})$/.exec(id); if (m) max = Math.max(max, Number(m[1])); }
-  let next = max + 1;
-  return lines.map(line => {
-    if (line.id.trim() !== '') return line;
-    while (used.has(`gas-${next}`)) next += 1;
-    const id = `gas-${next}`;
-    used.add(id);
-    return { ...line, id };
+function parseLegacyFields(raw: unknown, label: string, total: { nodes: number }): LegacyField[] {
+  return asArray(raw, label, MAX_SMALL_ARRAY).map((f, i) => {
+    const o = asObject(f, `${label}[${i}]`);
+    const own = { nodes: 0 }; // every field has its own budget: many fields with big values must not exhaust a shared one
+    const value = parseLegacyValue(o.value ?? null, `${label}[${i}]`, own);
+    total.nodes += own.nodes;
+    if (total.nodes > MAX_LEGACY_TOTAL_NODES) throw new Error(`${label}: слишком много данных прежней версии.`);
+    return { key: asRequiredString(o.key, `${label}[${i}]: ключ`, 100), label: asRequiredString(o.label ?? o.key, `${label}[${i}]: название`), value };
   });
 }
 
-function parseGasLine(raw: unknown, index: number): GasLine {
-  const o = asObject(raw, `Газовая линия[${index}]`);
+function parseLegacyEquipment(raw: unknown): LegacyEquipment | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const o = asObject(raw, 'Прежний справочник');
+  const icp = asObject(o.icpRf ?? {}, 'Прежний ICP/RF');
+  const ion = asObject(o.ionSource ?? {}, 'Прежний ion source');
   return {
-    // A missing id stays empty here and is filled by fillMissingLineIds AFTER every explicit id is reserved.
-    // An index-based fallback would hand out an id (e.g. "gas-0") that a later line explicitly owns,
-    // and step assignments referencing that id would silently bind to the wrong gas.
-    id: asRequiredString(o.id ?? '', `Газовая линия[${index}]: id`),
-    gas: asRequiredString(o.gas ?? '', `Газовая линия[${index}]: газ`),
-    flow: asOptionalNumber(o.flow, `Газовая линия[${index}]: расход`),
-    unit: asRequiredString(o.unit ?? 'sccm', `Газовая линия[${index}]: единица`, 20),
-    enabled: asBoolean(o.enabled, `Газовая линия[${index}]: включена`, false),
+    magnetrons: asArray(o.magnetrons, 'Прежние магнетроны', MAX_SMALL_ARRAY).map((m, i) => {
+      const x = asObject(m, `Прежний магнетрон[${i}]`);
+      return { id: asRequiredString(x.id ?? '', `Прежний магнетрон[${i}]: id`), enabled: asBoolean(x.enabled, 'включён', true), material: asOptionalString(x.material, 'материал'), powerW: asOptionalNumber(x.powerW, 'мощность'), mode: asOptionalString(x.mode, 'режим') };
+    }),
+    arcSources: asArray(o.arcSources, 'Прежние дуговые источники', MAX_SMALL_ARRAY).map((a, i) => {
+      const x = asObject(a, `Прежний дуговой источник[${i}]`);
+      return { id: asRequiredString(x.id ?? '', `Прежний дуговой источник[${i}]: id`), enabled: asBoolean(x.enabled, 'включён', true), cathodeMaterial: asOptionalString(x.cathodeMaterial, 'материал катода'), arcCurrentA: asOptionalNumber(x.arcCurrentA, 'ток дуги'), filtered: asBoolean(x.filtered, 'фильтрованный', false) };
+    }),
+    icpRf: { enabled: asBoolean(icp.enabled, 'ICP/RF: включён', false), powerW: asOptionalNumber(icp.powerW, 'ICP/RF: мощность'), biasV: asOptionalNumber(icp.biasV, 'ICP/RF: смещение') },
+    ionSource: { enabled: asBoolean(ion.enabled, 'Ion source: включён', false), voltageV: asOptionalNumber(ion.voltageV, 'напряжение'), currentA: asOptionalNumber(ion.currentA, 'ток'), powerW: asOptionalNumber(ion.powerW, 'мощность') },
+    gasLines: asArray(o.gasLines, 'Прежние газовые линии', MAX_SMALL_ARRAY).map((l, i) => {
+      const x = asObject(l, `Прежняя газовая линия[${i}]`);
+      return { id: asRequiredString(x.id ?? '', `Прежняя газовая линия[${i}]: id`), gas: asRequiredString(x.gas ?? '', 'газ'), flow: asOptionalNumber(x.flow, 'расход'), unit: asRequiredString(x.unit ?? 'sccm', 'единица', 20), enabled: asBoolean(x.enabled, 'включена', false) };
+    }),
   };
 }
 
-const QUALITY_STATUSES = ['pass', 'fail', 'not_tested'] as const;
-
-function parseQualityCheck(raw: unknown, index: number): QualityCheck {
-  const o = asObject(raw, `Контроль качества[${index}]`);
-  const status = o.status;
-  return {
-    id: asRequiredString(o.id ?? `qc-${index}`, `Контроль качества[${index}]: id`),
-    parameter: asRequiredString(o.parameter, `Контроль качества[${index}]: параметр`),
-    method: asOptionalString(o.method, `Контроль качества[${index}]: метод`, MAX_LONG_TEXT),
-    criterion: asOptionalString(o.criterion, `Контроль качества[${index}]: критерий`, MAX_LONG_TEXT),
-    unit: asOptionalString(o.unit, `Контроль качества[${index}]: единица`),
-    result: asOptionalString(o.result, `Контроль качества[${index}]: результат`, MAX_LONG_TEXT),
-    status: typeof status === 'string' && (QUALITY_STATUSES as readonly string[]).includes(status) ? status as QualityCheck['status'] : undefined,
-  };
+function parseLegacy(raw: unknown): LegacyData {
+  if (raw === undefined || raw === null) return createEmptyLegacy();
+  const o = asObject(raw, 'Данные прежней версии');
+  const budget = { nodes: 0 };
+  const stepFields: LegacyStepFields[] = asArray(o.stepFields, 'Прежние поля этапов', MAX_STEPS).map((e, i) => {
+    const x = asObject(e, `Прежние поля этапа[${i}]`);
+    return { stepId: asRequiredString(x.stepId, `Прежние поля этапа[${i}]: stepId`), stepName: asRequiredString(x.stepName ?? '', `Прежние поля этапа[${i}]: название`), fields: parseLegacyFields(x.fields, `Прежние поля этапа[${i}]`, budget) };
+  });
+  const steps: LegacyStep[] = asArray(o.steps, 'Прежние этапы', MAX_STEPS).map((e, i) => {
+    const x = asObject(e, `Прежний этап[${i}]`);
+    return {
+      id: asRequiredString(x.id ?? `legacy-step-${i + 1}`, `Прежний этап[${i}]: id`), originalOrder: asOptionalNumber(x.originalOrder, `Прежний этап[${i}]: номер`) ?? i + 1,
+      name: asRequiredString(x.name ?? '', `Прежний этап[${i}]: название`), originalType: asRequiredString(x.originalType ?? '', `Прежний этап[${i}]: тип`, 100),
+      enabled: asBoolean(x.enabled, `Прежний этап[${i}]: включён`, true),
+      fields: parseLegacyFields(x.fields, `Прежний этап[${i}]`, budget),
+    };
+  });
+  const migratedFromSchema = asOptionalNumber(o.migratedFromSchema, 'Прежняя схема');
+  const equipment = parseLegacyEquipment(o.equipment);
+  return { ...(migratedFromSchema !== undefined ? { migratedFromSchema } : {}), stepFields, steps, ...(equipment ? { equipment } : {}) };
 }
 
-function parseSafety(raw: unknown): SafetySection {
-  const o = asObject(raw ?? {}, 'Безопасность');
-  return {
-    hazards: asStringArray(o.hazards, 'Опасности'),
-    ppe: asStringArray(o.ppe, 'СИЗ'),
-    interlocks: asStringArray(o.interlocks, 'Блокировки'),
-    gasSafety: asOptionalString(o.gasSafety, 'Газовая безопасность', MAX_LONG_TEXT),
-    vacuumSafety: asOptionalString(o.vacuumSafety, 'Вакуумная безопасность', MAX_LONG_TEXT),
-    highVoltage: asOptionalString(o.highVoltage, 'Высокое напряжение', MAX_LONG_TEXT),
-    hotSurfaces: asOptionalString(o.hotSurfaces, 'Горячие поверхности', MAX_LONG_TEXT),
-    notes: asOptionalString(o.notes, 'Примечания', MAX_LONG_TEXT),
-  };
-}
-
-function parseTraceability(raw: unknown): Traceability {
-  const o = asObject(raw ?? {}, 'Traceability');
-  const now = new Date().toISOString();
-  const version = asOptionalNumber(o.version, 'Traceability: версия') ?? 1;
-  return {
-    version,
-    createdAt: asOptionalString(o.createdAt, 'Traceability: создан') ?? now,
-    updatedAt: asOptionalString(o.updatedAt, 'Traceability: обновлён') ?? now,
-    source: asOptionalString(o.source, 'Traceability: источник', MAX_SHORT_TEXT) ?? 'blank',
-  };
-}
-
-/** Rebuilds a `TechnicalProcessDocument` from arbitrary, untrusted JSON. Every field is read by
- *  name and type/length/array-size checked - nothing is ever spread wholesale from the input,
- *  so unexpected extra keys are silently dropped rather than smuggled into the document, and
- *  no single field can be used to exhaust memory/CPU. */
-export function parseTechnicalProcessDocument(raw: unknown): TechnicalProcessDocument {
-  const o = asObject(raw, 'document');
-  const schemaVersion = parseSchemaVersion(o.schemaVersion);
-  const legacyPressure = schemaVersion < 2;
-  const hasAssignments = schemaVersion >= 3;
-  const stepsRaw = asArray(o.steps, 'Этапы процесса', MAX_STEPS);
-  const qualityChecksRaw = asArray(o.qualityChecks, 'Контроль качества', MAX_QUALITY_CHECKS);
-  const gasSystemRaw = asArray(o.gasSystem, 'Газовая система', MAX_SMALL_ARRAY);
-  return {
-    // Always the CURRENT schema: whatever was read here has been migrated in memory.
-    schemaVersion: TECHDOC_SCHEMA_VERSION,
-    pressureUnit: parsePressureUnit(o.pressureUnit),
-    general: parseGeneralInfo(o.general),
-    initialData: parseInitialData(o.initialData),
-    steps: stepsRaw.map((s, i) => parseStep(s, i, legacyPressure, hasAssignments)),
-    sources: parseSourceSet(o.sources),
-    gasSystem: fillMissingLineIds(gasSystemRaw.map((g, i) => parseGasLine(g, i))),
-    qualityChecks: qualityChecksRaw.map((q, i) => parseQualityCheck(q, i)),
-    safety: parseSafety(o.safety),
-    traceability: parseTraceability(o.traceability),
-  };
-}
-
-/** Absent -> 1 (documents saved before the field existed). A newer-than-known version is refused
- *  with UnsupportedSchemaVersionError BEFORE anything else is read: its structure is unknown, and
- *  guessing could corrupt it. Anything that is not a positive integer is a malformed document. */
+/** Absent -> 1 (documents saved before the field existed). A newer-than-known version is refused with UnsupportedSchemaVersionError
+ *  BEFORE anything else is read: its structure is unknown, and guessing could corrupt it. Anything that is not a positive integer is
+ *  a malformed document. */
 export function parseSchemaVersion(value: unknown): number {
   if (value === undefined || value === null) return 1;
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) throw new Error('Версия схемы документа: ожидается целое число не меньше 1.');
@@ -340,9 +216,44 @@ export function parseSchemaVersion(value: unknown): number {
   return value;
 }
 
-/** Display unit; absent (every pre-existing document) -> the default, pascals. */
-function parsePressureUnit(value: unknown) {
-  if (value === undefined || value === null) return DEFAULT_PRESSURE_UNIT;
-  if (!isPressureUnit(value)) throw new Error('Единица давления: допустимо Па или мбар.');
-  return value;
+export interface ParsedDocument { document: TechnicalProcessDocument; migration?: MigrationReport }
+
+/** Reads a document of ANY supported schema. An older one is converted (in memory) to the current schema and the report says how. */
+export function parseTechnicalProcessDocumentDetailed(raw: unknown): ParsedDocument {
+  const o = asObject(raw, 'document');
+  const schemaVersion = parseSchemaVersion(o.schemaVersion);
+  if (schemaVersion < TECHDOC_SCHEMA_VERSION) {
+    const { document, report } = migrateV3Document(parseV3Document(o, schemaVersion), schemaVersion);
+    const migrated = finishSteps(document);
+    // A migrated document must be able to come back after a save: it goes through the SAME current-schema parser a reload uses. If it could not
+    // (a limit nobody anticipated), it is refused with an explanation - never loaded in a state that cannot be saved and reopened.
+    try { parseCurrent(JSON.parse(JSON.stringify(migrated)) as Record<string, unknown>); } catch (error) {
+      throw new Error(`Документ после преобразования из схемы ${schemaVersion} не удалось бы открыть снова: ${error instanceof Error ? error.message : 'превышено ограничение'}. Исходные данные не изменены.`);
+    }
+    return { document: migrated, migration: report };
+  }
+  return { document: finishSteps(parseCurrent(o)) };
+}
+
+function parseCurrent(o: Record<string, unknown>): TechnicalProcessDocument {
+  return {
+    schemaVersion: TECHDOC_SCHEMA_VERSION,
+    pressureUnit: parsePressureUnit(o.pressureUnit),
+    general: parseGeneralInfo(o.general),
+    initialData: parseInitialData(o.initialData),
+    steps: asArray(o.steps, 'Этапы процесса', MAX_STEPS).map((s, i) => parseStep(s, i)),
+    qualityChecks: withUniqueIds(asArray(o.qualityChecks, 'Контроль качества', MAX_QUALITY_CHECKS).map((q, i) => parseQualityCheck(q, i)), 'qc'),
+    safety: parseSafety(o.safety),
+    legacy: parseLegacy(o.legacy),
+    traceability: parseTraceability(o.traceability),
+  };
+}
+
+/** Gives every id-less step a fresh id AFTER all explicit ids are reserved. */
+function finishSteps(doc: TechnicalProcessDocument): TechnicalProcessDocument {
+  return { ...doc, steps: fillIds(doc.steps, 'step') };
+}
+
+export function parseTechnicalProcessDocument(raw: unknown): TechnicalProcessDocument {
+  return parseTechnicalProcessDocumentDetailed(raw).document;
 }

@@ -1,0 +1,298 @@
+{
+ "general": {
+  "processName": "TiN на инструменте",
+  "equipment": "Установка А",
+  "purpose": "Износостойкое покрытие"
+ },
+ "initialData": {
+  "quantity": 40,
+  "requiredThicknessUm": 3
+ },
+ "sources": {
+  "magnetrons": [
+   {
+    "id": "magnetron-1",
+    "enabled": true,
+    "material": "Ti",
+    "powerW": 3000,
+    "mode": "DC"
+   },
+   {
+    "id": "magnetron-2",
+    "enabled": true,
+    "material": "Cr",
+    "powerW": 2500,
+    "mode": "HiPIMS"
+   },
+   {
+    "id": "magnetron-3",
+    "enabled": true,
+    "material": "Zr"
+   }
+  ],
+  "arcSources": [
+   {
+    "id": "arc-1",
+    "enabled": true,
+    "filtered": true,
+    "cathodeMaterial": "TiAl",
+    "arcCurrentA": 90
+   }
+  ],
+  "icpRf": {
+   "enabled": true,
+   "powerW": 600,
+   "biasV": -50
+  },
+  "ionSource": {
+   "enabled": true,
+   "voltageV": 1500,
+   "currentA": 0.2,
+   "powerW": 300
+  }
+ },
+ "gasSystem": [
+  {
+   "id": "gas-1",
+   "gas": "Ar",
+   "unit": "sccm",
+   "enabled": true,
+   "flow": 40
+  },
+  {
+   "id": "gas-2",
+   "gas": "N2",
+   "unit": "sccm",
+   "enabled": true
+  },
+  {
+   "id": "gas-3",
+   "gas": "C2H2",
+   "unit": "sccm",
+   "enabled": true
+  },
+  {
+   "id": "gas-4",
+   "gas": "O2",
+   "unit": "sccm",
+   "enabled": true
+  },
+  {
+   "id": "gas-5",
+   "gas": "",
+   "unit": "sccm",
+   "enabled": false
+  },
+  {
+   "id": "gas-9",
+   "gas": "He",
+   "flow": 12,
+   "unit": "slm",
+   "enabled": true
+  }
+ ],
+ "qualityChecks": [
+  {
+   "id": "qc-1793266205227-h79zh",
+   "parameter": "Адгезия",
+   "method": "Роквелл C",
+   "criterion": "HF1-HF2"
+  }
+ ],
+ "safety": {
+  "hazards": [],
+  "ppe": [],
+  "interlocks": []
+ },
+ "traceability": {
+  "version": 1,
+  "createdAt": "2026-10-29T09:30:05.227Z",
+  "updatedAt": "2026-10-29T09:30:05.227Z",
+  "source": "blank"
+ },
+ "steps": [
+  {
+   "name": "Загрузка",
+   "type": "loading",
+   "enabled": true,
+   "gasUsage": [],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 1,
+   "description": "Загрузка подложек",
+   "durationMin": 15,
+   "temperatureC": 25
+  },
+  {
+   "name": "Откачка",
+   "type": "pumpdown",
+   "enabled": true,
+   "gasUsage": [],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 2,
+   "durationMin": 30,
+   "rotationRpm": 4,
+   "acceptanceCriteria": "до 2e-3 Па",
+   "notes": "не менее 30 мин",
+   "pressureMbar": 0.00002
+  },
+  {
+   "name": "Нагрев",
+   "type": "heating",
+   "enabled": true,
+   "gasUsage": [
+    {
+     "gas": "Ar",
+     "flowSccm": 20
+    }
+   ],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 3,
+   "durationMin": 45,
+   "temperatureC": 350,
+   "powerW": 5000,
+   "rotationRpm": 3,
+   "pressureMbar": 0.005
+  },
+  {
+   "name": "Плазменная/ионная очистка",
+   "type": "plasma_ion_cleaning",
+   "enabled": true,
+   "gasUsage": [
+    {
+     "gas": "Ar",
+     "flowSccm": 60
+    }
+   ],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 4,
+   "durationMin": 20,
+   "temperatureC": 300,
+   "substrateBiasV": -800,
+   "rotationRpm": 4,
+   "distanceMm": 120,
+   "description": "Очистка ионами Ar",
+   "sourceConfiguration": "ионный источник",
+   "currentA": 0.2,
+   "pressureMbar": 0.012
+  },
+  {
+   "name": "Подготовка (спец.)",
+   "type": "surface_preparation",
+   "enabled": true,
+   "gasUsage": [],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 5,
+   "durationMin": 5,
+   "description": "Обезжиривание",
+   "notes": "ультразвук"
+  },
+  {
+   "name": "Адгезионный подслой",
+   "type": "adhesion_underlayer",
+   "enabled": true,
+   "gasUsage": [],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 6,
+   "durationMin": 10,
+   "temperatureC": 400,
+   "substrateBiasV": -100,
+   "rotationRpm": 4,
+   "distanceMm": 150,
+   "pressureMbar": 0.004
+  },
+  {
+   "name": "Основное покрытие TiN",
+   "type": "main_coating",
+   "enabled": true,
+   "gasUsage": [],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 7,
+   "durationMin": 60,
+   "temperatureC": 420,
+   "substrateBiasV": -80,
+   "pressureMbar": 0.006
+  },
+  {
+   "name": "Многослойное покрытие",
+   "type": "multilayer_coating",
+   "enabled": true,
+   "gasUsage": [],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 8,
+   "durationMin": 90,
+   "temperatureC": 430,
+   "substrateBiasV": -60,
+   "rotationRpm": 4,
+   "pressureMbar": 0.005
+  },
+  {
+   "name": "Травление",
+   "type": "etching",
+   "enabled": true,
+   "gasUsage": [],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 9,
+   "durationMin": 12,
+   "description": "Травление"
+  },
+  {
+   "name": "Охлаждение",
+   "type": "cooling",
+   "enabled": true,
+   "gasUsage": [
+    {
+     "gas": "N2",
+     "flowSccm": 200
+    }
+   ],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 10,
+   "durationMin": 40,
+   "temperatureC": 150,
+   "pressureMbar": 10
+  },
+  {
+   "name": "Выгрузка",
+   "type": "unloading",
+   "enabled": true,
+   "gasUsage": [],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 11,
+   "durationMin": 10,
+   "temperatureC": 60
+  },
+  {
+   "name": "Контроль толщины",
+   "type": "quality_control",
+   "enabled": true,
+   "gasUsage": [],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 12,
+   "description": "Калотест, 3 точки",
+   "acceptanceCriteria": "2.5–3.5 мкм",
+   "notes": "после остывания",
+   "durationMin": 20
+  },
+  {
+   "name": "Пользовательский этап",
+   "type": "custom",
+   "enabled": true,
+   "gasUsage": [],
+   "origin": "user",
+   "calculatedFields": [],
+   "order": 13
+  }
+ ]
+}

@@ -10,61 +10,226 @@
  *    2                                                    - step pressure stored as `pressurePa`,
  *                                                           plus a `pressureUnit` display setting
  *    3                                                    - each step additionally carries
- *                                                           `sourceAssignments` (magnetron / arc
- *                                                           sources used on that step) and
- *                                                           `gasAssignments` (gas lines used on
- *                                                           that step); older documents get both
- *                                                           as empty lists - nothing is guessed
+ *                                                           `sourceAssignments` / `gasAssignments`
+ *                                                           that REFER to a document-level equipment
+ *                                                           registry (`sources`, `gasSystem`)
+ *    4                                                    - no registry: every source and gas line is
+ *                                                           created and configured INSIDE the card of
+ *                                                           the step (or layer) that uses it; eight
+ *                                                           card types with their own fields; coating
+ *                                                           layers; everything the new structure has
+ *                                                           no place for is kept as `legacy` data
  *
  *  A document from a NEWER schema than this build knows is never parsed or converted: its
  *  structure is unknown, so guessing would risk silently corrupting it. */
-export const TECHDOC_SCHEMA_VERSION = 3;
+export const TECHDOC_SCHEMA_VERSION = 4;
 
-// ---------- per-step assignments of equipment (schema 3) ----------
+// ---------- sources and gas lines of a step / coating layer (schema 4) ----------
 
-export const SOURCE_KINDS = ['magnetron', 'arc'] as const;
+export const SOURCE_KINDS = ['magnetron', 'arc', 'icp_rf', 'ion'] as const;
 export type SourceKind = typeof SOURCE_KINDS[number];
-export const SOURCE_KIND_LABELS: Record<SourceKind, string> = { magnetron: 'Магнетрон', arc: 'Дуговой источник' };
+export const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
+  magnetron: 'Магнетрон', arc: 'Вакуумно-дуговой источник', icp_rf: 'ICP/RF-источник', ion: 'Ионный источник',
+};
+/** Prefix of the id a new source of each kind gets (unique within one step or layer). */
+export const SOURCE_ID_PREFIX: Record<SourceKind, string> = { magnetron: 'magnetron', arc: 'arc', icp_rf: 'icp', ion: 'ion' };
 
 export const ASSIGNMENT_MODES = ['parallel', 'sequential'] as const;
 export type AssignmentMode = typeof ASSIGNMENT_MODES[number];
 export const ASSIGNMENT_MODE_LABELS: Record<AssignmentMode, string> = { parallel: 'одновременно', sequential: 'последовательно' };
 
 /** What "sequential" means, stated once and used by validation, previews and exports alike: during
- *  its own interval NO other enabled source of the same step is running (touching at an
+ *  its own interval NO other enabled source of the same step (or layer) is running (touching at an
  *  endpoint is allowed). "Parallel" places no constraint on overlap. */
-export const SEQUENTIAL_MODE_MEANING = 'интервал работы источника не пересекается с интервалами других включённых источников этого этапа (касание границ допускается; длительность 0 мин означает, что работы нет, и пересечением не считается)';
+export const SEQUENTIAL_MODE_MEANING = 'интервал работы источника не пересекается с интервалами других включённых источников этого этапа или слоя (касание границ допускается; длительность 0 мин означает, что работы нет, и пересечением не считается)';
 
-/** The meaning of the flow unit used for gas on a step - the app never converts other units into it. */
+/** The meaning of the flow unit used for gas - the app never converts other units into it. */
 export const SCCM_MEANING = 'sccm - стандартные см³/мин; условия приведения (температура, давление) определяются оборудованием и приложением не пересчитываются';
 
-/** One equipment source USED on one step. The source itself (its material, nominal values, filtered
- *  flag) lives only in section D and is referenced by `sourceId` + `kind` (ids are unique per
- *  kind, so "magnetron-1" and "arc-1" are different sources): the assignment never carries its own
- *  copy of a material. `enabled` is ON/OFF on THIS step; OFF is a deliberate state, different from
- *  an ON source whose power/current/time are simply not filled in (`undefined`). Times are minutes
- *  from the start of the step. */
-export interface StepSourceAssignment {
-  sourceId: string;
+/** One source, created and configured inside the card (or coating layer) that uses it. Nothing is
+ *  registered anywhere else. Which values apply depends on `kind` (see SOURCE_KIND_FIELDS); a value
+ *  that does not apply to the kind is never stored. `enabled` is ON/OFF for this card - OFF is a
+ *  deliberate state, different from an ON source whose values are simply not filled in
+ *  (`undefined`). Times are minutes from the start of the step (or layer). */
+export interface StepSource {
+  id: string;
   kind: SourceKind;
   enabled: boolean;
-  /** Power of a magnetron on this step (never set for an arc source). */
+  /** Magnetron target / arc cathode material. */
+  material?: string;
+  /** Magnetron operating (power-supply) mode, free text (e.g. "DC", "HiPIMS"). Not the same thing as `mode`. */
+  operatingMode?: string;
+  /** Arc source: filtered (FCVA). */
+  filtered?: boolean;
   powerW?: number;
-  /** Arc current on this step (never set for a magnetron). */
   currentA?: number;
+  voltageV?: number;
+  /** ICP/RF bias. */
+  biasV?: number;
   startMin?: number;
   durationMin?: number;
+  /** Parallel (simultaneous) or sequential with the other sources of the same step / layer. */
   mode: AssignmentMode;
 }
 
-/** One gas line of section E used on one step. The gas itself comes from the line (single source of
- *  truth, like a source's material). `flowSccm` is always sccm. */
-export interface StepGasAssignment {
-  lineId: string;
+export type SourceFieldKey = 'material' | 'operatingMode' | 'filtered' | 'powerW' | 'currentA' | 'voltageV' | 'biasV';
+/** The values each kind of source carries - the single place that decides what is stored, edited,
+ *  validated and printed for a source. */
+export const SOURCE_KIND_FIELDS: Record<SourceKind, readonly SourceFieldKey[]> = {
+  magnetron: ['material', 'powerW', 'operatingMode'],
+  arc: ['material', 'currentA', 'filtered'],
+  icp_rf: ['powerW', 'biasV'],
+  ion: ['voltageV', 'currentA', 'powerW'],
+};
+
+/** One gas line of a card (or layer): the gas is typed right here, not picked from a registry.
+ *  `flowSccm` is always sccm. */
+export interface StepGas {
+  id: string;
   enabled: boolean;
+  gas: string;
   flowSccm?: number;
   startMin?: number;
   durationMin?: number;
+}
+
+// ---------- card types and their fields (schema 4) ----------
+
+export const STEP_TYPES = [
+  'loading', 'pumpdown', 'heating', 'plasma_ion_cleaning', 'adhesion_underlayer',
+  'multilayer_coating', 'cooling', 'unloading',
+] as const;
+export type StepType = typeof STEP_TYPES[number];
+
+export const STEP_TYPE_LABELS: Record<StepType, string> = {
+  loading: 'Загрузка',
+  pumpdown: 'Откачка',
+  heating: 'Нагрев',
+  plasma_ion_cleaning: 'Плазменная/ионная очистка',
+  adhesion_underlayer: 'Адгезионный подслой',
+  multilayer_coating: 'Многослойное покрытие',
+  cooling: 'Охлаждение',
+  unloading: 'Выгрузка',
+};
+
+/** Numeric/text fields a card can carry (the `ProcessStep` / `CoatingLayer` property names). */
+export const STEP_FIELD_KEYS = [
+  'durationMin', 'temperatureC', 'temperatureStartC', 'temperatureEndC', 'pressurePa', 'pressureStartPa', 'pressureEndPa',
+  'heaterPowerW', 'substrateBiasV', 'rotationRpm', 'distanceMm', 'substrateType', 'substrateCount', 'fixture', 'material', 'thicknessNm',
+] as const;
+export type StepFieldKey = typeof STEP_FIELD_KEYS[number];
+
+export interface StepFieldMeta {
+  label: string;
+  unit?: string;
+  /** 'text' fields are strings, 'count' is a non-negative integer, 'number' any finite number. */
+  kind: 'number' | 'text' | 'count';
+  /** Marked "(необязательно)" in the editor; nothing is ever required, optional only says it is not part of the core set. */
+  optional?: boolean;
+  /** A pressure in Pa (shown in the document's pressure unit). */
+  pressure?: boolean;
+  /** Physical rule: 'nonnegative' (default for numbers), 'temperature' (not below absolute zero), 'finite' (bias may be negative). */
+  rule?: 'nonnegative' | 'temperature' | 'finite';
+}
+
+export const STEP_FIELD_META: Record<StepFieldKey, StepFieldMeta> = {
+  durationMin: { label: 'Продолжительность', unit: 'мин', kind: 'number' },
+  temperatureC: { label: 'Температура', unit: '°C', kind: 'number', rule: 'temperature' },
+  temperatureStartC: { label: 'Начальная температура', unit: '°C', kind: 'number', rule: 'temperature' },
+  temperatureEndC: { label: 'Конечная температура', unit: '°C', kind: 'number', rule: 'temperature' },
+  pressurePa: { label: 'Давление', kind: 'number', pressure: true },
+  pressureStartPa: { label: 'Начальное давление', kind: 'number', pressure: true },
+  pressureEndPa: { label: 'Конечное давление', kind: 'number', pressure: true },
+  heaterPowerW: { label: 'Мощность нагревателей', unit: 'Вт', kind: 'number', optional: true },
+  substrateBiasV: { label: 'Напряжение смещения', unit: 'В', kind: 'number', rule: 'finite' },
+  rotationRpm: { label: 'Вращение', unit: 'об/мин', kind: 'number' },
+  distanceMm: { label: 'Расстояние до подложек', unit: 'мм', kind: 'number', optional: true },
+  substrateType: { label: 'Тип подложек', kind: 'text' },
+  substrateCount: { label: 'Количество подложек', unit: 'шт.', kind: 'count' },
+  fixture: { label: 'Оснастка / размещение', kind: 'text' },
+  material: { label: 'Материал', kind: 'text' },
+  thicknessNm: { label: 'Толщина', unit: 'нм', kind: 'number' },
+};
+
+export interface StepTypeSpec {
+  /** Fields of the card, in editor order. Rotation of a pump-down, heater power and distance are optional ones. */
+  fields: readonly StepFieldKey[];
+  /** Fields that are optional for THIS card type (a field optional elsewhere may be core here and vice versa). */
+  optional: readonly StepFieldKey[];
+  sources: boolean;
+  gases: boolean;
+  /** The card holds coating layers (each with its own fields, sources and gases) instead of its own. */
+  layers: boolean;
+  calculator: boolean;
+}
+
+export const STEP_TYPE_SPECS: Record<StepType, StepTypeSpec> = {
+  loading: { fields: ['durationMin', 'substrateType', 'substrateCount', 'fixture'], optional: [], sources: false, gases: false, layers: false, calculator: false },
+  pumpdown: { fields: ['pressureStartPa', 'pressureEndPa', 'durationMin', 'rotationRpm'], optional: ['rotationRpm'], sources: false, gases: false, layers: false, calculator: false },
+  heating: { fields: ['temperatureStartC', 'temperatureEndC', 'durationMin', 'pressureStartPa', 'pressureEndPa', 'rotationRpm', 'heaterPowerW'], optional: ['heaterPowerW'], sources: false, gases: false, layers: false, calculator: false },
+  plasma_ion_cleaning: { fields: ['durationMin', 'temperatureC', 'pressurePa', 'substrateBiasV', 'rotationRpm', 'distanceMm'], optional: ['distanceMm'], sources: true, gases: true, layers: false, calculator: false },
+  adhesion_underlayer: { fields: ['material', 'thicknessNm', 'durationMin', 'temperatureC', 'pressurePa', 'substrateBiasV', 'rotationRpm', 'distanceMm'], optional: ['distanceMm'], sources: true, gases: true, layers: false, calculator: true },
+  multilayer_coating: { fields: [], optional: [], sources: false, gases: false, layers: true, calculator: false },
+  cooling: { fields: ['durationMin', 'temperatureC', 'pressurePa'], optional: [], sources: false, gases: true, layers: false, calculator: false },
+  unloading: { fields: ['durationMin', 'temperatureC'], optional: [], sources: false, gases: false, layers: false, calculator: false },
+};
+
+/** Fields of ONE coating layer of a multilayer card. */
+export const LAYER_FIELDS: readonly StepFieldKey[] = ['material', 'thicknessNm', 'durationMin', 'temperatureC', 'pressurePa', 'substrateBiasV', 'rotationRpm', 'distanceMm'];
+export const LAYER_OPTIONAL_FIELDS: readonly StepFieldKey[] = ['distanceMm'];
+
+export const COATING_MODES = ['multi', 'single'] as const;
+export type CoatingMode = typeof COATING_MODES[number];
+export const COATING_MODE_LABELS: Record<CoatingMode, string> = { multi: 'многослойное (несколько слоёв)', single: 'однослойное (один слой)' };
+
+/** A new id `${prefix}-N` one past the highest number in use among `existing`, re-checked against the whole set so it can
+ *  never equal an existing id whatever the list holds (restored data, hand-edited ids, huge or non-numeric suffixes). */
+export function nextId(prefix: string, existing: readonly { id: string }[]): string {
+  const used = new Set(existing.map(item => item.id));
+  const pattern = new RegExp(`^${prefix}-(\\d{1,9})$`);
+  let max = 0;
+  for (const id of used) {
+    const match = pattern.exec(id);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  let n = max + 1;
+  while (used.has(`${prefix}-${n}`)) n += 1;
+  return `${prefix}-${n}`;
+}
+
+// ---------- legacy data (everything schema 1-3 carried that schema 4 has no place for) ----------
+
+export type LegacyValue = string | number | boolean | null | LegacyValue[] | { [key: string]: LegacyValue };
+
+/** One old field of a step that has no home in the new card (for example the old acceptance criterion). */
+export interface LegacyField { key: string; label: string; value: LegacyValue }
+export interface LegacyStepFields { stepId: string; stepName: string; fields: LegacyField[] }
+/** A whole old step that has no card type in schema 4 (e.g. "Травление"): kept, not part of the process. */
+export interface LegacyStep { id: string; originalOrder: number; name: string; originalType: string; /** The step was switched off in the old document; kept so a restored card is still off. */ enabled: boolean; fields: LegacyField[] }
+
+export interface LegacyMagnetron { id: string; enabled: boolean; material?: string; powerW?: number; mode?: string }
+export interface LegacyArc { id: string; enabled: boolean; cathodeMaterial?: string; arcCurrentA?: number; filtered: boolean }
+export interface LegacyGasLine { id: string; gas: string; flow?: number; unit: string; enabled: boolean }
+/** The complete old equipment registry (sections "Источники" and "Газовая система" of schema 1-3), copied as it was. */
+export interface LegacyEquipment {
+  magnetrons: LegacyMagnetron[];
+  arcSources: LegacyArc[];
+  icpRf: { enabled: boolean; powerW?: number; biasV?: number };
+  ionSource: { enabled: boolean; voltageV?: number; currentA?: number; powerW?: number };
+  gasLines: LegacyGasLine[];
+}
+
+export interface LegacyData {
+  /** Schema the document was migrated from; absent for a document created in schema 4. */
+  migratedFromSchema?: number;
+  stepFields: LegacyStepFields[];
+  steps: LegacyStep[];
+  equipment?: LegacyEquipment;
+}
+
+export function createEmptyLegacy(): LegacyData { return { stepFields: [], steps: [] }; }
+export function hasLegacyData(legacy: LegacyData): boolean {
+  return legacy.stepFields.some(s => s.fields.length > 0) || legacy.steps.length > 0 || legacy.equipment !== undefined;
 }
 
 export const PRESSURE_UNITS = ['pa', 'mbar'] as const;

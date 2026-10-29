@@ -7,7 +7,7 @@ import {
   exportTechDoc, parseTechnicalProcessDocument, parseDocumentType, parseExportFormat,
 } from '../src/services/workspace/techdoc-export';
 import {
-  createDocumentFromPreset, updateStep, createQualityCheck, toggleStepEnabled, addMagnetron, updateMagnetron, updateGasLine,
+  createDocumentFromPreset, updateStep, createQualityCheck, toggleStepEnabled, addSource, updateSource, addGas, updateGas,
   buildTechnologicalCard, buildRouteCard, buildBriefRecipe, calculateStepDurationFromDeposition,
   type TechnicalProcessDocument,
 } from '../src/services/workspace/techdoc-assistant';
@@ -16,10 +16,13 @@ import { POST as exportPOST } from '../src/app/api/workspace/techdoc/export/rout
 function sampleDoc(): TechnicalProcessDocument {
   let doc = createDocumentFromPreset('magnetron-pvd');
   doc = { ...doc, general: { ...doc.general, processName: 'AlTiN_PVD', equipment: 'Установка X', purpose: 'Износостойкое покрытие', documentVersion: 'v1' } };
-  doc = { ...doc, steps: updateStep(doc.steps, 6, {
-    temperatureC: 350, pressurePa: 0.5, durationMin: 60,
-    gasUsage: [{ gas: 'Ar', flowSccm: 40 }], powerW: 3000, substrateBiasV: -80, notes: 'примечание к этапу',
+  doc = { ...doc, steps: updateStep(doc.steps, 5, {
+    temperatureC: 350, pressurePa: 0.5, durationMin: 60, substrateBiasV: -80, description: 'описание этапа',
   }) };
+  doc = { ...doc, steps: addSource(doc.steps, { order: 5 }, 'magnetron') };
+  doc = { ...doc, steps: updateSource(doc.steps, { order: 5 }, 'magnetron-1', { material: 'Ti', powerW: 3000, startMin: 0, durationMin: 60 }) };
+  doc = { ...doc, steps: addGas(doc.steps, { order: 5 }) };
+  doc = { ...doc, steps: updateGas(doc.steps, { order: 5 }, 'gas-1', { gas: 'Ar', flowSccm: 40 }) };
   doc = { ...doc, qualityChecks: [{ ...createQualityCheck('Толщина покрытия'), method: 'Калотест', criterion: '>= 2 мкм', result: '2.3 мкм', status: 'pass' }] };
   doc = { ...doc, safety: { ...doc.safety, hazards: ['Высокое напряжение'], ppe: ['Очки'], interlocks: [] } };
   return doc;
@@ -65,7 +68,7 @@ test('recipe view model excludes disabled steps entirely, and only shows real, e
   const viewModel = buildDocumentViewModel(doc, 'recipe');
   const text = viewModel.sections[0].paragraphs.join('\n');
   assert.ok(!text.includes('Загрузка'));
-  assert.ok(text.includes('Основное покрытие'));
+  assert.ok(text.includes('Адгезионный подслой'));
   assert.ok(text.includes('T: 350'));
 });
 
@@ -89,18 +92,13 @@ test('blank optional fields render as "не задано" (prose) or "—" (tabl
   assert.ok(!allCells.includes('undefined'));
 });
 
-test('instruction completeness (Codex regression): document-level sources (magnetrons/arc/ICP/ion) and the gas system actually appear in the exported instruction, not just per-step free text', () => {
-  let doc = sampleDoc();
-  doc = { ...doc, sources: addMagnetron(doc.sources) };
-  doc = { ...doc, sources: updateMagnetron(doc.sources, doc.sources.magnetrons[0].id, { material: 'Ti', powerW: 3000, mode: 'DC' }) };
-  doc = { ...doc, sources: { ...doc.sources, icpRf: { enabled: true, powerW: 500, biasV: -80 } } };
-  doc = { ...doc, gasSystem: updateGasLine(doc.gasSystem, doc.gasSystem[0].id, { gas: 'Ar', flow: 40, enabled: true }) };
-  const vm = buildDocumentViewModel(doc, 'instruction');
+test('instruction completeness: the sources and gas lines of a card (material, power, gas, flow) appear in the exported instruction', () => {
+  const vm = buildDocumentViewModel(sampleDoc(), 'instruction');
   const allText = vm.sections.map(s => s.paragraphs.join(' ')).join('\n');
-  assert.ok(allText.includes('Ti'), 'magnetron material must appear in the exported instruction');
-  assert.ok(allText.includes('3000'), 'magnetron power must appear in the exported instruction');
-  assert.ok(allText.includes('-80'), 'ICP/RF bias must appear in the exported instruction');
-  assert.ok(allText.includes('Ar'), 'configured gas must appear in the exported instruction');
+  assert.ok(allText.includes('мишень: Ti'), 'magnetron material must appear in the exported instruction');
+  assert.ok(allText.includes('3000 Вт'), 'magnetron power must appear in the exported instruction');
+  assert.ok(allText.includes('газ: Ar') && allText.includes('40 sccm'), 'configured gas and its flow must appear');
+  assert.ok(allText.includes('Описание: описание этапа'));
 });
 
 // ---------- quality checks ----------
@@ -136,11 +134,11 @@ test('traceability is carried into every document type, with the numbered headin
 test('F06 (MEDIUM): the exported calculatedFieldsNote reflects a manual edit clearing a calculated field\'s provenance - UI and export read the same underlying calculatedFields data', () => {
   let doc = createDocumentFromPreset('magnetron-pvd');
   doc = { ...doc, general: { ...doc.general, processName: 'F06 provenance test' } };
-  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 6, 1000, 'nm', 10, 'nm_per_min') };
+  doc = { ...doc, steps: calculateStepDurationFromDeposition(doc.steps, 5, 1000, 'nm', 10, 'nm_per_min') };
   const beforeEdit = buildDocumentViewModel(doc, 'instruction');
   assert.ok(beforeEdit.traceability.calculatedFieldsNote.includes('durationMin'));
 
-  doc = { ...doc, steps: updateStep(doc.steps, 6, { durationMin: 250 }) };
+  doc = { ...doc, steps: updateStep(doc.steps, 5, { durationMin: 250 }) };
   const afterEdit = buildDocumentViewModel(doc, 'instruction');
   assert.equal(afterEdit.traceability.calculatedFieldsNote, 'Полей, вычисленных системой, нет.');
 });
@@ -151,11 +149,11 @@ test('preview/export consistency: the technological-card and route-card view mod
   const doc = sampleDoc();
   const previewTechCard = buildTechnologicalCard(doc);
   const exportTechCard = buildDocumentViewModel(doc, 'technologicalCard').tables[0].rows;
-  assert.deepEqual(exportTechCard, previewTechCard.map(r => [String(r.number), r.operation, r.duration, r.temperature, r.pressure, r.gases, r.sourcePower, r.bias, r.control, r.note]));
+  assert.deepEqual(exportTechCard, previewTechCard.map(r => [String(r.number), r.operation, r.duration, r.temperature, r.pressure, r.gases, r.sources, r.bias, r.params, r.description]));
 
   const previewRouteCard = buildRouteCard(doc);
   const exportRouteCard = buildDocumentViewModel(doc, 'routeCard').tables[0].rows;
-  assert.deepEqual(exportRouteCard, previewRouteCard.map(r => [String(r.number), r.stage, r.equipment, r.input, r.operation, r.output, r.control, r.note]));
+  assert.deepEqual(exportRouteCard, previewRouteCard.map(r => [String(r.number), r.stage, r.equipment, r.input, r.operation, r.output]));
 });
 
 test('preview/export consistency: the recipe view model is built from the exact same lines the on-screen preview renders', () => {

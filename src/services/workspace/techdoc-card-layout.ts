@@ -26,12 +26,20 @@ export const WORST_CHAR_PT = 7.2;
 export const CARD_CELL_LINE_BUDGET = 16;
 export const CARD_ROW_LINE_LIMIT = 25;
 
-/** Relative column widths of the card and of the two detail tables. */
-export const CARD_COLUMN_WEIGHTS = [3, 10, 5, 7, 9, 20, 27, 5, 8, 6] as const;
+/** Relative column widths of the card, of its coating-layer table and of the two detail tables (each with a variant that has a
+ *  "Слой" column after the step name). Card columns: № | Операция | Время | Темп. | Давление | Газы | Источники | Bias |
+ *  Прочие параметры | Описание. */
+export const CARD_COLUMN_WEIGHTS = [3, 11, 5, 6, 8, 17, 26, 5, 10, 9] as const;
 export const CARD_GAS_COLUMN = 5;
 export const CARD_SOURCE_COLUMN = 6;
-export const SOURCE_DETAIL_WEIGHTS = [5, 13, 15, 15, 8, 15, 14, 15] as const;
+/** № эт. | Этап | Слой | Материал | Толщина | Время | Темп. | Давл. | Bias | Вращ. / расст. | Источники | Газы */
+export const LAYER_TABLE_WEIGHTS = [4, 12, 4, 8, 7, 6, 6, 6, 5, 8, 17, 17] as const;
+export const LAYER_SOURCE_COLUMN = 10;
+export const LAYER_GAS_COLUMN = 11;
+export const SOURCE_DETAIL_WEIGHTS = [5, 9, 13, 14, 10, 20, 14, 15] as const;
 export const GAS_DETAIL_WEIGHTS = [6, 16, 12, 16, 10, 16, 24] as const;
+export const SOURCE_DETAIL_LAYER_WEIGHTS = [5, 9, 4, 12, 14, 10, 19, 13, 14] as const;
+export const GAS_DETAIL_LAYER_WEIGHTS = [6, 16, 4, 12, 16, 10, 16, 24] as const;
 
 export function columnWidthPt(weights: readonly number[], index: number): number {
   const total = weights.reduce((sum, w) => sum + w, 0);
