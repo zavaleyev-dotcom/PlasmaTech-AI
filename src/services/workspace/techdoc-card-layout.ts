@@ -19,6 +19,8 @@
 
 /** Usable width of a landscape A4 PDF page (841.9 pt minus the renderer's 56 pt side margins). */
 export const PDF_LANDSCAPE_CONTENT_WIDTH_PT = 729.9;
+/** Usable width of a portrait A4 PDF page (595.3 pt minus the renderer's 56 pt side margins) - for tables of portrait documents. */
+export const PDF_PORTRAIT_CONTENT_WIDTH_PT = 483.3;
 /** The renderer lays text out 6 pt narrower than its column (3 pt padding on each side). */
 export const CELL_PADDING_PT = 6;
 export const TYPICAL_CHAR_PT = 6.4;
@@ -41,9 +43,9 @@ export const GAS_DETAIL_WEIGHTS = [6, 16, 12, 16, 10, 16, 24] as const;
 export const SOURCE_DETAIL_LAYER_WEIGHTS = [5, 9, 4, 12, 14, 10, 19, 13, 14] as const;
 export const GAS_DETAIL_LAYER_WEIGHTS = [6, 16, 4, 12, 16, 10, 16, 24] as const;
 
-export function columnWidthPt(weights: readonly number[], index: number): number {
+export function columnWidthPt(weights: readonly number[], index: number, totalWidthPt: number = PDF_LANDSCAPE_CONTENT_WIDTH_PT): number {
   const total = weights.reduce((sum, w) => sum + w, 0);
-  return Math.max(1, PDF_LANDSCAPE_CONTENT_WIDTH_PT * weights[index] / total - CELL_PADDING_PT);
+  return Math.max(1, totalWidthPt * weights[index] / total - CELL_PADDING_PT);
 }
 
 /** Number of text lines `text` needs in a column `widthPt` wide, simulating word wrap at `charPt` per
@@ -127,13 +129,13 @@ export const CONTINUATION_CELL = '(см. выше)';
  *  each over-long cell is cut into pieces marked "[k/n]", and the other cells of a continuation row say
  *  "(см. выше)" - never a copy of a value, never an empty cell that could read as "no value". Rows that
  *  are not too tall are returned untouched. */
-export function splitTallRows(rows: string[][], weights: readonly number[], identityColumns: readonly number[]): string[][] {
+export function splitTallRows(rows: string[][], weights: readonly number[], identityColumns: readonly number[], totalWidthPt: number = PDF_LANDSCAPE_CONTENT_WIDTH_PT): string[][] {
   const out: string[][] = [];
   for (const row of rows) {
-    const lines = row.map((cell, i) => estimateLines(cell, columnWidthPt(weights, i), WORST_CHAR_PT));
+    const lines = row.map((cell, i) => estimateLines(cell, columnWidthPt(weights, i, totalWidthPt), WORST_CHAR_PT));
     const tall = lines.map((n, i) => (n > CARD_ROW_LINE_LIMIT ? i : -1)).filter(i => i >= 0);
     if (tall.length === 0) { out.push(row); continue; }
-    const chunks = new Map(tall.map(i => [i, chunkText(row[i], columnWidthPt(weights, i), WORST_CHAR_PT, CARD_ROW_LINE_LIMIT - 1)]));
+    const chunks = new Map(tall.map(i => [i, chunkText(row[i], columnWidthPt(weights, i, totalWidthPt), WORST_CHAR_PT, CARD_ROW_LINE_LIMIT - 1)]));
     const count = Math.max(...[...chunks.values()].map(c => c.length));
     for (let r = 0; r < count; r++) {
       out.push(row.map((cell, i) => {

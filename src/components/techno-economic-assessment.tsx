@@ -6,6 +6,7 @@ import {
   type AssessmentInput, type AssessmentResult, type Currency, type EconomicEffectMode, type OpexPeriod,
 } from '@/services/workspace/techno-economic-assessment';
 import { consumePendingEquipmentHandoff, type EquipmentTeaHandoffRecord } from '@/services/workspace/equipment-tea-handoff';
+import { SCENARIO_KEYS, SCENARIO_LABELS, reportRequestBody, CURRENCY_NAMES, type ScenarioKey, type ReportVariant, type TeaReportRequest } from '@/services/workspace/techno-economic-report';
 
 // ---------- raw (string) form state - converted to numbers only at calculation time ----------
 
@@ -39,9 +40,8 @@ function defaultForm(): FormState {
 // shape as Variant A/B above; the user must explicitly set each scenario's own numbers, nothing
 // is auto-derived or invented between scenarios. ----------
 
-export const SCENARIO_KEYS = ['base', 'conservative', 'optimistic'] as const;
-export type ScenarioKey = typeof SCENARIO_KEYS[number];
-export const SCENARIO_LABELS: Record<ScenarioKey, string> = { base: 'Базовый', conservative: 'Консервативный', optimistic: 'Оптимистичный' };
+export { SCENARIO_KEYS, SCENARIO_LABELS };
+export type { ScenarioKey };
 
 export function defaultScenarioForms(): Record<ScenarioKey, FormState> {
   return { base: defaultForm(), conservative: defaultForm(), optimistic: defaultForm() };
@@ -198,6 +198,68 @@ function EconomicEffectSection({ mode, onModeChange, currentUnitCost, newUnitCos
   </fieldset>;
 }
 
+/** Everything the report is built from, fixed at the moment the calculation ran: the inputs, the CURRENCY of the entered amounts and the configuration from
+ *  Equipment Selector that was shown then. Changing the currency selector, editing a field or dismissing the configuration card afterwards changes none of it, so a
+ *  report can never re-label old amounts or carry another configuration. A new calculation makes a new snapshot. */
+type ReportSnapshot = TeaReportRequest;
+
+type ReportFormat = 'docx' | 'pdf';
+type DownloadState = 'ready' | 'generating' | 'completed' | 'error';
+
+function filenameFromContentDisposition(value: string | null, fallback: string): string {
+  if (!value) return fallback;
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(value);
+  if (star) { try { return decodeURIComponent(star[1]); } catch { /* fall through */ } }
+  const plain = /filename="([^"]+)"/i.exec(value);
+  return plain ? plain[1] : fallback;
+}
+
+/** "Скачать DOCX" / "Скачать PDF": the report of the last calculation, no re-entry. The file is built on the server from the same inputs by the same engine. */
+function ReportDownload({ snapshot, displayCurrency }: { snapshot: ReportSnapshot; displayCurrency: Currency }) {
+  const [state, setState] = useState<DownloadState>('ready');
+  const [message, setMessage] = useState('');
+
+  async function download(format: ReportFormat) {
+    setState('generating');
+    setMessage('');
+    try {
+      const response = await fetch('/api/workspace/techno-economic/export', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reportRequestBody(snapshot, format)),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.error ?? 'Не удалось сформировать отчёт.');
+      }
+      const blob = await response.blob();
+      const filename = filenameFromContentDisposition(response.headers.get('Content-Disposition'), `TEA-report.${format}`);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url; link.download = filename;
+      document.body.appendChild(link); link.click(); link.remove();
+      URL.revokeObjectURL(url);
+      setState('completed');
+      setMessage(`Отчёт сформирован: ${filename}`);
+    } catch (err) {
+      setState('error');
+      setMessage(err instanceof Error ? err.message : 'Не удалось сформировать отчёт.');
+    }
+  }
+
+  return <div className="content-card mt-4">
+    <h3>Отчёт</h3>
+    <p className="muted small">Отчёт формируется по последнему выполненному расчёту (все заполненные данные, результаты, варианты и сценарии) — повторно вводить ничего не нужно. DOCX и PDF содержат одно и то же.</p>
+    <p className="muted small" data-testid="report-basis">Валюта отчёта: {CURRENCY_NAMES[snapshot.currency]} (валюта расчёта). Конфигурация Equipment Selector: {snapshot.handoff ? `«${snapshot.handoff.configurationName}»` : 'не передавалась'}.</p>
+    {displayCurrency !== snapshot.currency && <p role="status" className="small">Сейчас на экране выбрана другая валюта ({displayCurrency}). Это только отображение: суммы расчёта введены в {snapshot.currency}, и в отчёт они попадут в {snapshot.currency}. Чтобы получить отчёт в другой валюте, введите суммы в этой валюте и рассчитайте заново.</p>}
+    <div className="flex flex-wrap gap-2 mt-2">
+      <button type="button" className="button secondary" disabled={state === 'generating'} onClick={() => download('docx')}>Скачать DOCX</button>
+      <button type="button" className="button secondary" disabled={state === 'generating'} onClick={() => download('pdf')}>Скачать PDF</button>
+    </div>
+    {state === 'generating' && <p role="status" className="mt-2">Формирование…</p>}
+    {state === 'completed' && <p role="status" className="mt-2">{message}</p>}
+    {state === 'error' && <p role="alert" className="mt-2">{message}</p>}
+  </div>;
+}
+
 function ResultCards({ result, currency }: { result: AssessmentResult; currency: Currency }) {
   const money = (v: number) => formatCurrency(v, currency);
   return <div className="content-grid">
@@ -239,6 +301,7 @@ export function TechnoEconomicAssessment() {
   const [scenariosEnabled, setScenariosEnabled] = useState(false);
   const [scenarioForms, setScenarioForms] = useState<Record<ScenarioKey, FormState>>(defaultScenarioForms());
   const [scenarioResults, setScenarioResults] = useState<Record<ScenarioKey, AssessmentResult | null>>({ base: null, conservative: null, optimistic: null });
+  const [reportSnapshot, setReportSnapshot] = useState<ReportSnapshot | null>(null);
 
   function updateScenarioForm(key: ScenarioKey, patch: Partial<FormState>) {
     setScenarioForms(prev => ({ ...prev, [key]: { ...prev[key], ...patch } }));
@@ -260,16 +323,22 @@ export function TechnoEconomicAssessment() {
 
   function calculate(e: React.FormEvent) {
     e.preventDefault();
-    setError(''); setResultA(null); setResultB(null);
+    setError(''); setResultA(null); setResultB(null); setReportSnapshot(null);
     setScenarioResults({ base: null, conservative: null, optimistic: null });
     try {
-      setResultA(runAssessment(toAssessmentInput(formA)));
-      if (compareB) setResultB(runAssessment(toAssessmentInput(formB)));
+      const inputA = toAssessmentInput(formA);
+      const variant = (form: FormState, input: AssessmentInput): ReportVariant => ({ ...(form.title.trim() !== '' ? { title: form.title } : {}), input });
+      const snapshot: ReportSnapshot = { currency, variantA: variant(formA, inputA), ...(importedHandoff ? { handoff: importedHandoff.handoff } : {}) };
+      setResultA(runAssessment(inputA));
+      if (compareB) { const inputB = toAssessmentInput(formB); setResultB(runAssessment(inputB)); snapshot.variantB = variant(formB, inputB); }
       if (scenariosEnabled) {
         const next = { base: null, conservative: null, optimistic: null } as Record<ScenarioKey, AssessmentResult | null>;
-        for (const key of SCENARIO_KEYS) next[key] = runAssessment(toAssessmentInput(scenarioForms[key]));
+        const inputs = {} as Record<ScenarioKey, ReportVariant>;
+        for (const key of SCENARIO_KEYS) { const input = toAssessmentInput(scenarioForms[key]); next[key] = runAssessment(input); inputs[key] = variant(scenarioForms[key], input); }
         setScenarioResults(next);
+        snapshot.scenarios = inputs;
       }
+      setReportSnapshot(snapshot);
     } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось выполнить расчёт.'); }
   }
 
@@ -366,6 +435,7 @@ export function TechnoEconomicAssessment() {
       <h2>E. Результаты{compareB ? ' - Вариант A' : ''}{formA.title ? `: ${formA.title}` : ''}</h2>
       <ResultCards result={resultA} currency={currency} />
       <FormulasDisclosure result={resultA} />
+      {reportSnapshot && <ReportDownload snapshot={reportSnapshot} displayCurrency={currency} />}
     </section>}
 
     {resultB && <section className="mt-6" aria-live="polite">

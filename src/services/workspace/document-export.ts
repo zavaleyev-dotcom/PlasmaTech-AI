@@ -37,7 +37,11 @@ export function sanitizeFilenameSegment(value: string, fallback: string): string
 export interface ExportSection { heading: string; paragraphs: string[]; blocks?: Exclude<MdBlock, { kind: 'title-label' }>[] }
 /** `columnWeights` (optional): relative widths, one per column - for tables whose columns differ a lot in
  *  how much text they hold. Absent, or of the wrong length, means equal widths (the previous behaviour). */
-export interface ExportTable { heading: string; columns: string[]; rows: string[][]; columnWeights?: number[] }
+export interface ExportTable {
+  heading: string; columns: string[]; rows: string[][]; columnWeights?: number[];
+  /** Optional: when the table continues on a further PDF page, its title ("... (продолжение)") is printed above the repeated column header. Absent, nothing changes. */
+  repeatHeading?: boolean;
+}
 
 function columnShares(table: ExportTable): number[] {
   const weights = table.columnWeights;
@@ -63,6 +67,18 @@ export interface GenericDocumentViewModel {
    *  `traceability`, under `traceabilityHeading`, on a new page after the content - so service
    *  information is never mixed into the body of the document. */
   metadataPlacement?: 'top' | 'appendix';
+  /** Optional: the body in ONE explicit order, sections and tables interleaved (a section, the table that belongs to it, the next section...).
+   *  Absent, the renderers print every section and then every table - exactly as before, for every existing caller. */
+  body?: BodyItem[];
+}
+
+export type BodyItem = { kind: 'section'; section: ExportSection } | { kind: 'table'; table: ExportTable };
+
+function bodyItems(viewModel: GenericDocumentViewModel): BodyItem[] {
+  return viewModel.body ?? [
+    ...viewModel.sections.map(section => ({ kind: 'section', section }) as BodyItem),
+    ...viewModel.tables.map(table => ({ kind: 'table', table }) as BodyItem),
+  ];
 }
 
 /** F11: real, applied formatting-profile parameters - when omitted, every existing caller
@@ -213,15 +229,17 @@ export async function renderGenericDocx(viewModel: GenericDocumentViewModel, opt
   if (!appendix) children.push(...viewModel.metadata.map(item => metadataParagraph(item, bodySize)));
   if (options.pageBreakAfterMetadata) children.push(new Paragraph({ children: [new PageBreak()] }));
 
-  for (const section of viewModel.sections) {
-    if (section.heading) children.push(new Paragraph({ children: [new TextRun({ text: section.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
-    if (section.blocks) children.push(...docxBlocks(section.blocks, bodySize, headingSize, lineSpacing));
-    else children.push(...section.paragraphs.map(p => textParagraph(p, { size: bodySize, lineSpacing })));
-  }
-
-  for (const table of viewModel.tables) {
-    children.push(new Paragraph({ children: [new TextRun({ text: table.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
-    children.push(docxTable(table));
+  for (const item of bodyItems(viewModel)) {
+    if (item.kind === 'section') {
+      const section = item.section;
+      if (section.heading) children.push(new Paragraph({ children: [new TextRun({ text: section.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
+      if (section.blocks) children.push(...docxBlocks(section.blocks, bodySize, headingSize, lineSpacing));
+      else children.push(...section.paragraphs.map(p => textParagraph(p, { size: bodySize, lineSpacing })));
+    } else {
+      const table = item.table;
+      children.push(new Paragraph({ children: [new TextRun({ text: table.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
+      children.push(docxTable(table));
+    }
   }
 
   children.push(new Paragraph({ children: [new TextRun({ text: viewModel.traceabilityHeading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, pageBreakBefore: appendix, spacing: { before: 300, after: 100 } }));
@@ -308,31 +326,33 @@ export async function renderGenericPdf(viewModel: GenericDocumentViewModel, opti
       }
       if (options.pageBreakAfterMetadata) doc.addPage();
 
-      for (const section of viewModel.sections) {
-        if (section.heading) {
-          ensureSpace(doc, 40, margins);
-          doc.font('Bold').fontSize(headingSize).text(pdfText(section.heading), { width: contentWidth });
-          doc.moveDown(0.3);
-        }
-        doc.font('Body').fontSize(bodySize);
-        if (section.blocks) {
-          pdfBlocks(doc, section.blocks, { contentWidth, margins, bodySize, headingSize, lineGap });
-        } else {
-          for (const paragraph of section.paragraphs) {
-            ensureSpace(doc, 14, margins);
-            doc.text(pdfText(paragraph), { width: contentWidth, align: 'left', lineGap });
-            doc.moveDown(0.2);
+      for (const item of bodyItems(viewModel)) {
+        if (item.kind === 'section') {
+          const section = item.section;
+          if (section.heading) {
+            ensureSpace(doc, 40, margins);
+            doc.font('Bold').fontSize(headingSize).text(pdfText(section.heading), { width: contentWidth });
+            doc.moveDown(0.3);
           }
+          doc.font('Body').fontSize(bodySize);
+          if (section.blocks) {
+            pdfBlocks(doc, section.blocks, { contentWidth, margins, bodySize, headingSize, lineGap });
+          } else {
+            for (const paragraph of section.paragraphs) {
+              ensureSpace(doc, 14, margins);
+              doc.text(pdfText(paragraph), { width: contentWidth, align: 'left', lineGap });
+              doc.moveDown(0.2);
+            }
+          }
+          doc.moveDown(0.4);
+        } else {
+          const table = item.table;
+          ensureSpace(doc, headingSize + 18 + tableLeadHeight(doc, table, contentWidth), margins);
+          doc.font('Bold').fontSize(headingSize).text(pdfText(table.heading), { width: contentWidth });
+          doc.moveDown(0.3);
+          drawTable(doc, table, contentWidth, margins);
+          doc.moveDown(0.4);
         }
-        doc.moveDown(0.4);
-      }
-
-      for (const table of viewModel.tables) {
-        ensureSpace(doc, 40, margins);
-        doc.font('Bold').fontSize(headingSize).text(pdfText(table.heading), { width: contentWidth });
-        doc.moveDown(0.3);
-        drawTable(doc, table, contentWidth, margins);
-        doc.moveDown(0.4);
       }
 
       if (appendix) doc.addPage(); else ensureSpace(doc, 60, margins);
@@ -460,6 +480,19 @@ function ensureSpace(doc: PDFKit.PDFDocument, minHeight: number, margins: PdfMar
   if (doc.y + minHeight > doc.page.height - margins.bottom) doc.addPage();
 }
 
+/** Height the header row and the FIRST body row of a table need together - a table (and the heading above it) is never started where those two do not fit,
+ *  so a header is never left alone at the bottom of a page with its first row (or its own wrapped text) on the next one. */
+function tableLeadHeight(doc: PDFKit.PDFDocument, table: ExportTable, contentWidth: number): number {
+  const shares = columnShares(table);
+  const widths = shares.map(share => contentWidth * share);
+  doc.font('Bold').fontSize(8);
+  const header = Math.max(...table.columns.map((col, i) => doc.heightOfString(pdfText(col), { width: widths[i] - 6 }))) + 8;
+  doc.font('Body').fontSize(8);
+  const first = table.rows[0] ?? table.columns.map(() => DASH);
+  const firstRow = Math.max(...first.map((cell, i) => doc.heightOfString(pdfText(cell || DASH), { width: widths[i] - 6 }))) + 8;
+  return header + firstRow;
+}
+
 function drawTable(doc: PDFKit.PDFDocument, table: ExportTable, contentWidth: number, margins: PdfMargins): void {
   const shares = columnShares(table);
   const widths = shares.map(share => contentWidth * share);
@@ -485,6 +518,10 @@ function drawTable(doc: PDFKit.PDFDocument, table: ExportTable, contentWidth: nu
     const rowHeight = Math.max(...row.map((cell, i) => doc.heightOfString(pdfText(cell || DASH), { width: widths[i] - 6 }))) + 8;
     if (doc.y + rowHeight > doc.page.height - margins.bottom) {
       doc.addPage();
+      if (table.repeatHeading) {
+        doc.font('Bold').fontSize(9).fillColor('#000000').text(pdfText(`${table.heading} (продолжение)`), margins.left, doc.y, { width: contentWidth });
+        doc.moveDown(0.3);
+      }
       drawHeader();
       doc.font('Body').fontSize(8);
     }
