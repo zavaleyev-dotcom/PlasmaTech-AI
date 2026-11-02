@@ -11,4 +11,5 @@ export * from './freeze';
 export * from './dimensions';
 export * from './units';
 export * from './quantity';
+export * from './uncertainty';
 export * from './constants';

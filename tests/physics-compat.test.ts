@@ -53,3 +53,11 @@ test('the core has no hidden global state and no I/O: no process, fs, Date, Math
     assert.ok(!/\b(process\.|Math\.random|Date\.now|new Date|fetch\(|setTimeout|localStorage|require\()/.test(code), relative(root, file));
   }
 });
+
+test('README documents every error code of the core (and mentions nothing that does not exist as implemented)', () => {
+  const readme = readFileSync(join(root, 'src/physics/README.md'), 'utf8');
+  const codes = [...readFileSync(join(root, 'src/physics/errors.ts'), 'utf8').matchAll(/^\s*'([a-z_]+)',/gm)].map(m => m[1]);
+  assert.ok(codes.length >= 15);
+  for (const code of codes) assert.ok(readme.includes(`\`${code}\``), `README does not mention '${code}'`);
+  for (const topic of ['независим', 'коррел', 'линеариз', 'overflow', 'underflow', 'монте-карло', 'парсер', 'расширенн']) assert.ok(readme.toLowerCase().includes(topic), topic);
+});

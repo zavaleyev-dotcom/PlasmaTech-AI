@@ -7,6 +7,7 @@
 
 import {
   type Dimension, dimEquals, formatDimension, LENGTH, MASS, TIME, CURRENT, TEMPERATURE, AMOUNT, LUMINOUS_INTENSITY, VOLTAGE, POWER, ENERGY, MAGNETIC_INDUCTION, PRESSURE, DIMENSIONLESS,
+  AREA, VOLUME, VELOCITY, VOLUME_FLOW, CURRENT_DENSITY, POWER_DENSITY, NUMBER_DENSITY, MASS_DENSITY, FREQUENCY, ELECTRIC_CHARGE,
 } from './dimensions';
 import { type Rational, rational, rationalFromDecimalText, rationalFromNumber, rationalToNumber, add, sub, mul, div, ZERO, isZero, sign } from './exact';
 import { PhysicsError } from './errors';
@@ -25,6 +26,9 @@ export interface QuantityKindSpec {
   readonly nonNegative: boolean;
   /** What a value below the limit means, for the message. */
   readonly limitRu?: string;
+  /** `false` for kinds that share their SI dimension with another kind (temperature difference, gauge pressure): a product/quotient/power never produces them
+   *  (see kindOfDimension), they are reached only through the explicit functions. */
+  readonly derivable?: boolean;
 }
 
 export const QUANTITY_KINDS = deepFreeze({
@@ -42,8 +46,19 @@ export const QUANTITY_KINDS = deepFreeze({
   luminousIntensity: { dimension: LUMINOUS_INTENSITY, siUnit: 'cd', nameRu: 'сила света', nonNegative: true, limitRu: 'сила света не может быть отрицательной' },
   dimensionless: { dimension: DIMENSIONLESS, siUnit: 'one', nameRu: 'безразмерная величина', nonNegative: false },
   // Same SI dimension as `temperature` / `pressure`, DIFFERENT physical kind: the registry never converts between them implicitly.
-  temperatureDifference: { dimension: TEMPERATURE, siUnit: 'K_delta', nameRu: 'разность (интервал) температур', nonNegative: false },
-  gaugePressure: { dimension: PRESSURE, siUnit: 'Pa_g', nameRu: 'избыточное (манометрическое) давление', nonNegative: false },
+  temperatureDifference: { dimension: TEMPERATURE, siUnit: 'K_delta', nameRu: 'разность (интервал) температур', nonNegative: false, derivable: false },
+  gaugePressure: { dimension: PRESSURE, siUnit: 'Pa_g', nameRu: 'избыточное (манометрическое) давление', nonNegative: false, derivable: false },
+  // derived kinds (M1.2): each has its own unit table; products and quotients of quantities land on them through kindOfDimension
+  area: { dimension: AREA, siUnit: 'm2', nameRu: 'площадь', nonNegative: true, limitRu: 'площадь не может быть отрицательной' },
+  volume: { dimension: VOLUME, siUnit: 'm3', nameRu: 'объём', nonNegative: true, limitRu: 'объём не может быть отрицательным' },
+  velocity: { dimension: VELOCITY, siUnit: 'm_s', nameRu: 'скорость (в т. ч. скорость осаждения/травления)', nonNegative: false },
+  volumeFlow: { dimension: VOLUME_FLOW, siUnit: 'm3_s', nameRu: 'объёмный расход', nonNegative: false },
+  currentDensity: { dimension: CURRENT_DENSITY, siUnit: 'A_m2', nameRu: 'плотность тока', nonNegative: false },
+  powerDensity: { dimension: POWER_DENSITY, siUnit: 'W_m2', nameRu: 'плотность мощности', nonNegative: false },
+  numberDensity: { dimension: NUMBER_DENSITY, siUnit: 'per_m3', nameRu: 'концентрация (число частиц в единице объёма)', nonNegative: true, limitRu: 'концентрация не может быть отрицательной' },
+  massDensity: { dimension: MASS_DENSITY, siUnit: 'kg_m3', nameRu: 'плотность (массовая)', nonNegative: true, limitRu: 'плотность не может быть отрицательной' },
+  frequency: { dimension: FREQUENCY, siUnit: 'Hz', nameRu: 'частота', nonNegative: true, limitRu: 'частота не может быть отрицательной' },
+  electricCharge: { dimension: ELECTRIC_CHARGE, siUnit: 'C', nameRu: 'электрический заряд', nonNegative: false },
 } as const satisfies Record<string, QuantityKindSpec>);
 
 export type QuantityKind = keyof typeof QUANTITY_KINDS;
@@ -147,6 +162,55 @@ export const UNITS = deepFreeze({
   // temperature DIFFERENCE (interval): no affine offset - an interval of 10 °C is an interval of 10 K. Not convertible to/from the absolute scales.
   K_delta: unit('temperatureDifference', 'K (разн.)', 'кельвин (разность температур)', decimal('1'), 'Интервал температур; 1 K_delta = 1 degC_delta точно (шаг градуса Цельсия равен кельвину).'),
   degC_delta: unit('temperatureDifference', '°C (разн.)', 'градус Цельсия (разность температур)', decimal('1'), 'Интервал температур; смещения нет.'),
+  // area, volume
+  m2: unit('area', 'м²', 'квадратный метр', decimal('1'), SI),
+  cm2: unit('area', 'см²', 'квадратный сантиметр', decimal('1e-4'), 'Точно: 1 см² = 1e-4 м².'),
+  mm2: unit('area', 'мм²', 'квадратный миллиметр', decimal('1e-6'), 'Точно: 1 мм² = 1e-6 м².'),
+  m3: unit('volume', 'м³', 'кубический метр', decimal('1'), SI),
+  L: unit('volume', 'л', 'литр', decimal('1e-3'), 'Точно: 1 л = 1 дм³ = 1e-3 м³ (допустима к применению с СИ).'),
+  mL: unit('volume', 'мл', 'миллилитр', decimal('1e-6'), 'Точно: 1 мл = 1 см³ = 1e-6 м³.'),
+  cm3: unit('volume', 'см³', 'кубический сантиметр', decimal('1e-6'), 'Точно: 1 см³ = 1e-6 м³.'),
+  mm3: unit('volume', 'мм³', 'кубический миллиметр', decimal('1e-9'), 'Точно: 1 мм³ = 1e-9 м³.'),
+  // velocity (deposition / etch rates)
+  m_s: unit('velocity', 'м/с', 'метр в секунду', decimal('1'), SI),
+  cm_s: unit('velocity', 'см/с', 'сантиметр в секунду', decimal('1e-2'), 'Точно: 1 см/с = 1e-2 м/с.'),
+  mm_s: unit('velocity', 'мм/с', 'миллиметр в секунду', decimal('1e-3'), 'Точно: 1 мм/с = 1e-3 м/с.'),
+  um_s: unit('velocity', 'мкм/с', 'микрометр в секунду', decimal('1e-6'), 'Точно: 1 мкм/с = 1e-6 м/с.'),
+  nm_s: unit('velocity', 'нм/с', 'нанометр в секунду', decimal('1e-9'), 'Точно: 1 нм/с = 1e-9 м/с.'),
+  angstrom_s: unit('velocity', 'Å/с', 'ангстрем в секунду', decimal('1e-10'), 'Точно: 1 Å/с = 1e-10 м/с.'),
+  nm_min: unit('velocity', 'нм/мин', 'нанометр в минуту', fraction(1, 60000000000), 'Точно: 1 нм/мин = 1e-9/60 м/с.'),
+  um_min: unit('velocity', 'мкм/мин', 'микрометр в минуту', fraction(1, 60000000), 'Точно: 1 мкм/мин = 1e-6/60 м/с.'),
+  um_h: unit('velocity', 'мкм/ч', 'микрометр в час', fraction(1, 3600000000), 'Точно: 1 мкм/ч = 1e-6/3600 м/с.'),
+  km_h: unit('velocity', 'км/ч', 'километр в час', fraction(5, 18), 'Точно: 1 км/ч = 1000/3600 = 5/18 м/с.'),
+  // volumetric flow (NOT sccm/slm: they depend on a reference state and are a separate, later decision)
+  m3_s: unit('volumeFlow', 'м³/с', 'кубический метр в секунду', decimal('1'), SI),
+  L_s: unit('volumeFlow', 'л/с', 'литр в секунду', decimal('1e-3'), 'Точно: 1 л/с = 1e-3 м³/с.'),
+  L_min: unit('volumeFlow', 'л/мин', 'литр в минуту', fraction(1, 60000), 'Точно: 1 л/мин = 1e-3/60 м³/с.'),
+  cm3_s: unit('volumeFlow', 'см³/с', 'кубический сантиметр в секунду', decimal('1e-6'), 'Точно: 1 см³/с = 1e-6 м³/с.'),
+  cm3_min: unit('volumeFlow', 'см³/мин', 'кубический сантиметр в минуту', fraction(1, 60000000), 'Точно: 1 см³/мин = 1e-6/60 м³/с.'),
+  m3_h: unit('volumeFlow', 'м³/ч', 'кубический метр в час', fraction(1, 3600), 'Точно: 1 м³/ч = 1/3600 м³/с.'),
+  // current density, power density
+  A_m2: unit('currentDensity', 'А/м²', 'ампер на квадратный метр', decimal('1'), SI),
+  mA_cm2: unit('currentDensity', 'мА/см²', 'миллиампер на квадратный сантиметр', decimal('10'), 'Точно: 1 мА/см² = 1e-3 А / 1e-4 м² = 10 А/м².'),
+  uA_cm2: unit('currentDensity', 'мкА/см²', 'микроампер на квадратный сантиметр', decimal('1e-2'), 'Точно: 1 мкА/см² = 1e-2 А/м².'),
+  A_cm2: unit('currentDensity', 'А/см²', 'ампер на квадратный сантиметр', decimal('1e4'), 'Точно: 1 А/см² = 1e4 А/м².'),
+  W_m2: unit('powerDensity', 'Вт/м²', 'ватт на квадратный метр', decimal('1'), SI),
+  kW_m2: unit('powerDensity', 'кВт/м²', 'киловатт на квадратный метр', decimal('1e3'), SI),
+  mW_cm2: unit('powerDensity', 'мВт/см²', 'милливатт на квадратный сантиметр', decimal('10'), 'Точно: 1 мВт/см² = 1e-3 Вт / 1e-4 м² = 10 Вт/м².'),
+  W_cm2: unit('powerDensity', 'Вт/см²', 'ватт на квадратный сантиметр', decimal('1e4'), 'Точно: 1 Вт/см² = 1e4 Вт/м².'),
+  // number density, mass density, frequency, charge
+  per_m3: unit('numberDensity', 'м⁻³', 'на кубический метр', decimal('1'), SI),
+  per_cm3: unit('numberDensity', 'см⁻³', 'на кубический сантиметр', decimal('1e6'), 'Точно: 1 см⁻³ = 1e6 м⁻³.'),
+  kg_m3: unit('massDensity', 'кг/м³', 'килограмм на кубический метр', decimal('1'), SI),
+  g_cm3: unit('massDensity', 'г/см³', 'грамм на кубический сантиметр', decimal('1e3'), 'Точно: 1 г/см³ = 1e-3 кг / 1e-6 м³ = 1000 кг/м³.'),
+  Hz: unit('frequency', 'Гц', 'герц', decimal('1'), SI),
+  kHz: unit('frequency', 'кГц', 'килогерц', decimal('1e3'), SI),
+  MHz: unit('frequency', 'МГц', 'мегагерц', decimal('1e6'), SI),
+  GHz: unit('frequency', 'ГГц', 'гигагерц', decimal('1e9'), SI),
+  C: unit('electricCharge', 'Кл', 'кулон', decimal('1'), SI),
+  mC: unit('electricCharge', 'мКл', 'милликулон', decimal('1e-3'), SI),
+  uC: unit('electricCharge', 'мкКл', 'микрокулон', decimal('1e-6'), SI),
+  Ah: unit('electricCharge', 'А·ч', 'ампер-час', decimal('3600'), 'Точно: 1 А·ч = 3600 Кл.'),
   // amount of substance and luminous intensity (the two remaining SI base dimensions)
   mol: unit('amount', 'моль', 'моль', decimal('1'), SI),
   mmol: unit('amount', 'ммоль', 'миллимоль', decimal('1e-3'), SI),
@@ -177,6 +241,15 @@ export function assertUnitsCompatible(a: UnitId, b: UnitId): void {
   const da = dimensionOfUnit(a);
   const db = dimensionOfUnit(b);
   if (!dimEquals(da, db)) throw new PhysicsError('dimension_mismatch', `Нельзя преобразовать ${UNITS[a].symbol} (${formatDimension(da)}) в ${UNITS[b].symbol} (${formatDimension(db)}): размерности различаются.`);
+}
+
+/** The ONE registered kind with this SI dimension - how a product, quotient or power of quantities finds its kind (V * A -> power). Kinds that share a dimension with
+ *  another kind (`derivable: false`: temperature difference, gauge pressure) are never the answer. Throws `unsupported_dimension` when no kind matches
+ *  (e.g. V / A: a resistance is not registered yet) - never a guess. */
+export function kindOfDimension(dim: Dimension): QuantityKind {
+  const matches = QUANTITY_KIND_IDS.filter(k => (QUANTITY_KINDS[k] as QuantityKindSpec).derivable !== false && dimEquals(QUANTITY_KINDS[k].dimension, dim));
+  if (matches.length !== 1) throw new PhysicsError('unsupported_dimension', `Размерности ${formatDimension(dim)} не соответствует ни одна зарегистрированная величина (найдено: ${matches.length}).`);
+  return matches[0];
 }
 
 /** Convertible = the same KIND, which is stricter than the same dimension: an absolute temperature and a temperature difference, or an absolute and a gauge pressure,

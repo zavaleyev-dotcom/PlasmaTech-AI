@@ -13,6 +13,10 @@ export const PHYSICS_ERROR_CODES = Object.freeze([
   'unknown_constant',   // an identifier that is not in the constant registry
   'invalid_decimal',    // a text that is not a strict decimal number
   'kind_mismatch',      // same SI dimension but a different physical KIND: absolute temperature vs temperature difference, absolute vs gauge pressure
+  'unsupported_dimension', // a product/quotient/power whose dimension matches no registered kind
+  'invalid_uncertainty',   // a negative or non-finite standard uncertainty, or an invalid coverage factor
+  'correlated_inputs',     // the SAME Measured object passed as two inputs of a formula that assumes independent inputs (x + x, x / x...)
+  'degenerate_linearization', // first-order propagation gives a formal 0 where the output is NOT exactly known (y = x^2 at x = 0 with u(x) > 0)
   'missing_reference',  // a gauge <-> absolute pressure conversion without an explicitly given reference pressure
 ] as const);
 export type PhysicsErrorCode = typeof PHYSICS_ERROR_CODES[number];

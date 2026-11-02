@@ -112,3 +112,38 @@ test('integers and dyadic fractions against Number(bigint)', () => {
     assert.equal(rationalToNumber(rational(n)), Number(n), n.toString());
   }
 });
+
+// ---------- exact square root (used for the root of the sum of squares of uncertainty contributions) ----------
+
+test('rationalSqrtToNumber: perfect squares, powers of ten far outside the range of their squares, and edge cases', () => {
+  const { rationalSqrtToNumber } = exact;
+  assert.equal(rationalSqrtToNumber(rational(B(0))), 0);
+  assert.equal(rationalSqrtToNumber(rational(B(4))), 2);
+  assert.equal(rationalSqrtToNumber(rational(B(1), B(4))), 0.5);
+  assert.equal(rationalSqrtToNumber(rationalFromDecimalText('1e-400')), 1e-200);   // the square is far below the double range
+  assert.equal(rationalSqrtToNumber(rationalFromDecimalText('1e400')), 1e200);     // the square is far above it
+  assert.equal(rationalSqrtToNumber(rationalFromDecimalText('1e-404')), 1e-202);
+  assert.equal(rationalSqrtToNumber(rationalFromDecimalText('1e-640')), 1e-320);   // subnormal result
+  assert.equal(rationalSqrtToNumber(rationalFromDecimalText('1e-650')), 0);        // below half the smallest subnormal
+  assert.equal(rationalSqrtToNumber(rationalFromDecimalText('1e700')), Infinity);
+  assert.equal(rationalSqrtToNumber(rational(B(2))), Math.SQRT2);
+  assert.throws(() => rationalSqrtToNumber(rational(B(-1))), RangeError);
+});
+
+test('rationalSqrtToNumber against the correctly rounded Math.sqrt on exact (dyadic) inputs and against exact squares', () => {
+  const { rationalSqrtToNumber } = exact;
+  let seed = 424242;
+  const next = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0);
+  for (let i = 0; i < 4000; i += 1) {
+    const n = B(1 + ((next() * 2097152 + (next() >>> 11)) % 9007199254740991));
+    const k = next() % 64;
+    const expected = Math.sqrt(Number(n) / 2 ** k);   // n < 2^53 and a power of two: the input is exactly representable, Math.sqrt is correctly rounded
+    assert.equal(rationalSqrtToNumber(rational(n, pow2(k))), expected, `${n}/2^${k}`);
+  }
+  for (let i = 0; i < 500; i += 1) {
+    let x = BigInt(1);
+    for (let b = 1; b < 60 + (next() % 200); b += 1) x = (x << BigInt(1)) | BigInt(next() & 1);
+    assert.equal(rationalSqrtToNumber(rational(x * x)), Number(x), x.toString());
+    assert.equal(rationalSqrtToNumber(rational(x * x, B(9))), rationalToNumber(rational(x, B(3))), `${x}/3`);
+  }
+});

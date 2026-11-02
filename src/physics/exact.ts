@@ -113,3 +113,35 @@ export function rationalToExactDecimal(value: Rational): string | null {
   const text = places === 0 ? digits : `${digits.slice(0, digits.length - places)}.${digits.slice(digits.length - places)}`;
   return (value.n < BigInt(0) ? '-' : '') + text;
 }
+
+function isqrt(n: bigint): bigint {
+  if (n < BigInt(2)) return n;
+  let x = BigInt(1) << BigInt((bitLength(n) + 1) >> 1); // >= sqrt(n)
+  for (;;) {
+    const y = (x + n / x) >> BigInt(1);
+    if (y >= x) return x;
+    x = y;
+  }
+}
+
+/** The double nearest to sqrt(value) (ties to even), computed EXACTLY - no intermediate rounding, no overflow of squares, no underflow of tiny terms. May return 0 or
+ *  Infinity for a result outside the double range (callers check, as for rationalToNumber).
+ *
+ *  Proof sketch: floor(sqrt(a/b)) = isqrt(floor(a/b)) exactly. With a/b = value * 4^s, m = floor(sqrt(value) * 2^s) has at least ~120 bits, so the double rounding
+ *  (to 53 bits, boundaries are INTEGER multiples of m's unit) cannot see the fractional part of sqrt(value) * 2^s except through "is it zero": the value is
+ *  therefore represented as (m + 1/2) / 2^s when inexact (strictly between m and m + 1, on the same side of every rounding boundary as the true root) and as m / 2^s
+ *  when m * m * b === a (an exact square). */
+export function rationalSqrtToNumber(value: Rational): number {
+  if (value.n < BigInt(0)) throw new RangeError('rationalSqrtToNumber: negative argument');
+  if (value.n === BigInt(0)) return 0;
+  let s = Math.ceil((122 - (bitLength(value.n) - bitLength(value.d))) / 2);
+  for (;;) {
+    const a = s >= 0 ? value.n << BigInt(2 * s) : value.n;
+    const b = s >= 0 ? value.d : value.d << BigInt(-2 * s);
+    const m = isqrt(a / b);
+    if (bitLength(m) < 60) { s += 32; continue; }
+    const exactSquare = m * m * b === a;
+    const num = exactSquare ? m * BigInt(2) : m * BigInt(2) + BigInt(1); // value of sqrt * 2^s, doubled
+    return s >= 0 ? rationalToNumber(rational(num, BigInt(1) << BigInt(s + 1))) : rationalToNumber(rational(num << BigInt(-s), BigInt(2)));
+  }
+}
