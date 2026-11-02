@@ -36,10 +36,11 @@ test('the physics core is dependency-free: it imports only its own modules', () 
   }
 });
 
-test('no existing module imports the physics core (M1.1 is isolated from calculators, TechDoc, TEA, Equipment Selector, src/calculators)', () => {
+test('no existing module imports the physics core (isolated from calculators, TechDoc, TEA, Equipment Selector, src/calculators; src/materials is the one declared consumer)', () => {
   const sources = [
-    ...walk(join(root, 'src')).filter(f => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(f) && !f.includes('/src/physics/')),
-    ...walk(join(root, 'tests')).filter(f => /\.(ts|tsx)$/.test(f) && !/\/physics-[^/]+\.test\.ts$/.test(f)),
+    // src/materials is the one declared consumer of the physics core (M1.3), together with its own tests and fixtures
+    ...walk(join(root, 'src')).filter(f => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(f) && !f.includes('/src/physics/') && !f.includes('/src/materials/')),
+    ...walk(join(root, 'tests')).filter(f => /\.(ts|tsx)$/.test(f) && !/\/(physics|materials)-[^/]+\.(test\.)?ts$/.test(f)),
   ];
   assert.ok(sources.length > 20, 'the scan must actually find the existing sources');
   for (const file of sources) {
