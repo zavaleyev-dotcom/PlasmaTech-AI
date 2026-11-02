@@ -78,7 +78,7 @@ test('quotient: power density, exact value, GUM uncertainty; zero divisor refuse
   assert.equal(rate.unit, 'm_s');
   near(rate.value, 300e-9 / 120);
   assert.throws(() => divideMeasured(measured(1, 0, 'W'), measured(0, 0, 'm2')), code('out_of_range'));
-  assert.throws(() => divideMeasured(measured(1, 0, 'V'), measured(1, 0, 'A')), code('unsupported_dimension')); // resistance: not registered
+  assert.throws(() => divideMeasured(measured(1, 0, 'J'), measured(1, 0, 'm')), code('unsupported_dimension')); // force: not registered
   const dimensionless = divideMeasured(measured(6, 0.3, 'm'), measured(2, 0, 'm'));
   assert.deepEqual(dimensionless, { value: 3, standardUncertainty: 0.15, unit: 'one' });
 });

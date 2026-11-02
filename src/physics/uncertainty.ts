@@ -17,8 +17,11 @@
  *     known exactly (x^2 at x = 0 with u(x) > 0; a product of two zeros that are both uncertain) - the function throws `degenerate_linearization` instead of returning 0;
  *     it does NOT add a second-order correction and does not forbid zero inputs whose output is exactly known (u(x) = 0);
  *   - a unit conversion rescales u by the unit's factor only; the offset of an affine scale (°C) does not enter an uncertainty, which is an interval;
- *   - a product/quotient/power finds the kind of its result by SI dimension (kindOfDimension) and is refused if there is none; absolute temperature cannot be
- *     added (use temperatureDifferenceMeasured), and a temperature difference or a gauge pressure cannot be multiplied (their kind would be lost) - only scaled.
+ *   - a product/quotient/power finds the kind of its result by SI dimension (kindOfDimension) only when exactly ONE kind has that dimension (a dimension is not a
+ *     meaning: K, Pa and A/m are shared by several kinds) and is refused otherwise; scaling by a dimensionless quantity, the power 1 and a ratio of two quantities of
+ *     the same kind keep their meaning explicitly; absolute temperature cannot be added (use temperatureDifferenceMeasured); a SEMANTIC kind (temperature difference,
+ *     gauge pressure, H, M, elastic modulus) is never an operand of a product/quotient/power otherwise - it can only be scaled (so alpha * dT and C * dT are not executable
+ *     through `Measured` yet, although the algebra of dimensions supports them).
  *  Everything is pure and deterministic. */
 
 import { dimDiv, dimMul, dimPow, type Dimension } from './dimensions';
@@ -113,10 +116,34 @@ function build(kind: QuantityKind, exactValue: Rational, u: number, label: strin
   return measured(value, requireNoOverflow(u, label), siUnit);
 }
 
-const NOT_SCALABLE_BY_PRODUCT: readonly QuantityKind[] = ['temperatureDifference', 'gaugePressure'];
+const isDimensionlessKind = (kind: QuantityKind): boolean => kind === 'dimensionless';
 
+/** A SEMANTIC kind (temperature difference, gauge pressure, H, M, elastic modulus) cannot be an operand of a product, quotient or power: the result would be given a
+ *  kind by its dimension alone, and a dimension is not a meaning. */
 function requireProductKind(s: SiForm, what: string): void {
-  if (NOT_SCALABLE_BY_PRODUCT.includes(s.kind)) throw new PhysicsError('kind_mismatch', `${what}: «${QUANTITY_KINDS[s.kind].nameRu}» нельзя умножать, делить и возводить в степень — потеряется смысл величины; используйте scaleMeasured.`);
+  if ((QUANTITY_KINDS[s.kind] as { derivable?: boolean }).derivable === false) {
+    throw new PhysicsError('kind_mismatch', `${what}: «${QUANTITY_KINDS[s.kind].nameRu}» нельзя умножать, делить и возводить в степень — смысл величины определяется не размерностью, а родом; допустимы только масштабирование (scaleMeasured), умножение и деление на безразмерную величину, степени 0 и 1 и отношение величин одного рода.`);
+  }
+}
+
+/** The kind of a product. Multiplying by a DIMENSIONLESS quantity keeps the kind of the other factor (also a semantic one: 2 GPa_mod x (1 +- 0.05) is a modulus);
+ *  otherwise both factors must be non-semantic and the kind is the only one with the product dimension (ambiguous or unregistered -> `unsupported_dimension`). */
+function productKind(x: SiForm, y: SiForm): QuantityKind {
+  if (isDimensionlessKind(x.kind)) return y.kind;
+  if (isDimensionlessKind(y.kind)) return x.kind;
+  requireProductKind(x, 'Множитель 1');
+  requireProductKind(y, 'Множитель 2');
+  return kindOfDimension(dimMul(x.dimension, y.dimension));
+}
+
+/** The kind of a quotient: divided by a dimensionless quantity - the kind of the numerator; two quantities of the SAME kind - dimensionless (a ratio of two moduli,
+ *  of two temperature differences); otherwise as for a product. */
+function quotientKind(x: SiForm, y: SiForm): QuantityKind {
+  if (isDimensionlessKind(y.kind)) return x.kind;
+  if (x.kind === y.kind) return 'dimensionless';
+  requireProductKind(x, 'Делимое');
+  requireProductKind(y, 'Делитель');
+  return kindOfDimension(dimDiv(x.dimension, y.dimension));
 }
 
 /** a + b, in the SI unit of the kind; the kinds must be equal. Absolute temperatures cannot be added (physically meaningless): use temperatureDifferenceMeasured. */
@@ -162,11 +189,9 @@ export function multiplyMeasured<A extends QuantityKind, B extends QuantityKind>
   requireDistinct(a, b, 'Произведение');
   const x = inSi(a, 'Множитель 1');
   const y = inSi(b, 'Множитель 2');
-  requireProductKind(x, 'Множитель 1');
-  requireProductKind(y, 'Множитель 2');
   // both factors are exactly 0 and both uncertain: y = a b still varies (by u(a) u(b)), but both first-order sensitivities (|b|, |a|) are 0
   if (isZero(x.value) && isZero(y.value) && sign(x.u) > 0 && sign(y.u) > 0) throw new PhysicsError('degenerate_linearization', 'Произведение двух нулевых неопределённых величин: коэффициенты чувствительности первого порядка равны 0, а неопределённость результата не равна 0 — линейное приближение неприменимо.');
-  const kind = kindOfDimension(dimMul(x.dimension, y.dimension));
+  const kind = productKind(x, y);
   return build(kind, mul(x.value, y.value), combine('Произведение', mul(abs(y.value), x.u), mul(abs(x.value), y.u)), 'Произведение');
 }
 
@@ -175,10 +200,8 @@ export function divideMeasured<A extends QuantityKind, B extends QuantityKind>(a
   requireDistinct(a, b, 'Частное');
   const x = inSi(a, 'Делимое');
   const y = inSi(b, 'Делитель');
-  requireProductKind(x, 'Делимое');
-  requireProductKind(y, 'Делитель');
   if (isZero(y.value)) throw new PhysicsError('out_of_range', 'Делитель равен нулю.');
-  const kind = kindOfDimension(dimDiv(x.dimension, y.dimension));
+  const kind = quotientKind(x, y);
   const by = abs(y.value);
   return build(kind, div(x.value, y.value), combine('Частное', div(x.u, by), div(mul(abs(x.value), y.u), mul(by, by))), 'Частное');
 }
@@ -188,13 +211,14 @@ const MAX_POWER = 16;
 /** m^n for an integer n (|n| <= 16): the dimension is raised too (length^2 -> area), u(m^n) = |n| |m|^(n-1) u(m), exact (for n < 0: |n| u / |m|^(|n|+1)). */
 export function powerMeasured<K extends QuantityKind>(m: Measured<K>, n: number): Measured {
   const x = inSi(m, 'Основание');
-  requireProductKind(x, 'Основание');
   if (!Number.isInteger(n) || Math.abs(n) > MAX_POWER) throw new PhysicsError('out_of_range', `Показатель степени должен быть целым числом, |n| ≤ ${MAX_POWER}.`);
   if (n < 0 && isZero(x.value)) throw new PhysicsError('out_of_range', 'Нуль нельзя возводить в отрицательную степень.');
-  if (n === 0) return build(kindOfDimension(dimPow(x.dimension, n)), ONE, 0, 'Степень'); // a constant function: exactly known whatever x is
+  if (n === 0) return build('dimensionless', ONE, 0, 'Степень'); // a constant function: exactly known whatever x is (and of any kind)
   // y = x^n, |n| >= 2, at x = 0: the sensitivity n x^(n-1) is 0 (a stationary point) but y varies with an uncertain x. (n < 0 at 0 was refused above, n = 1 has sensitivity 1.)
   if (Math.abs(n) >= 2 && isZero(x.value) && sign(x.u) > 0) throw new PhysicsError('degenerate_linearization', `Степень ${n} в точке 0 при ненулевой неопределённости: коэффициент чувствительности первого порядка равен 0 (стационарная точка), а неопределённость результата не равна 0 — линейное приближение неприменимо.`);
-  const kind = kindOfDimension(dimPow(x.dimension, n));
+  // the power 1 is the identity and keeps the kind (also a semantic one); any other power must not change a meaning by dimension alone
+  if (n !== 1) requireProductKind(x, 'Основание');
+  const kind = n === 1 ? x.kind : kindOfDimension(dimPow(x.dimension, n));
   const k = Math.abs(n);
   const magnitude = (e: number): Rational => { let r: Rational = ONE; for (let i = 0; i < e; i += 1) r = mul(r, abs(x.value)); return r; };
   let value: Rational = ONE;

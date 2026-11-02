@@ -76,3 +76,13 @@ export const POWER_DENSITY = dimDiv(POWER, AREA);
 export const NUMBER_DENSITY = dimPow(LENGTH, -3);
 export const MASS_DENSITY = dimDiv(MASS, VOLUME);
 export const FREQUENCY = dimPow(TIME, -1);
+// property dimensions (M1.3.0), all derived from the base dimensions
+export const THERMAL_CONDUCTIVITY = dimDiv(POWER, dimMul(LENGTH, TEMPERATURE));       // W/(m K)
+export const SPECIFIC_HEAT = dimDiv(ENERGY, dimMul(MASS, TEMPERATURE));               // J/(kg K)
+export const THERMAL_EXPANSION = dimPow(TEMPERATURE, -1);                              // 1/K
+export const RESISTANCE = dimDiv(VOLTAGE, CURRENT);                                    // V/A = ohm
+export const RESISTIVITY = dimMul(RESISTANCE, LENGTH);                                 // ohm m
+export const CONDUCTIVITY = dimDiv(dimPow(RESISTANCE, -1), LENGTH);                    // S/m
+export const MOLAR_MASS = dimDiv(MASS, AMOUNT);                                        // kg/mol
+export const FIELD_STRENGTH = dimDiv(CURRENT, LENGTH);                                 // A/m
+export const THERMAL_DIFFUSIVITY = dimDiv(AREA, TIME);                                 // m^2/s

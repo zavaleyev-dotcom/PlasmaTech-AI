@@ -8,6 +8,7 @@
 import {
   type Dimension, dimEquals, formatDimension, LENGTH, MASS, TIME, CURRENT, TEMPERATURE, AMOUNT, LUMINOUS_INTENSITY, VOLTAGE, POWER, ENERGY, MAGNETIC_INDUCTION, PRESSURE, DIMENSIONLESS,
   AREA, VOLUME, VELOCITY, VOLUME_FLOW, CURRENT_DENSITY, POWER_DENSITY, NUMBER_DENSITY, MASS_DENSITY, FREQUENCY, ELECTRIC_CHARGE,
+  THERMAL_CONDUCTIVITY, SPECIFIC_HEAT, THERMAL_EXPANSION, RESISTANCE, RESISTIVITY, CONDUCTIVITY, MOLAR_MASS, FIELD_STRENGTH, THERMAL_DIFFUSIVITY,
 } from './dimensions';
 import { type Rational, rational, rationalFromDecimalText, rationalFromNumber, rationalToNumber, add, sub, mul, div, ZERO, isZero, sign } from './exact';
 import { PhysicsError } from './errors';
@@ -26,8 +27,9 @@ export interface QuantityKindSpec {
   readonly nonNegative: boolean;
   /** What a value below the limit means, for the message. */
   readonly limitRu?: string;
-  /** `false` for kinds that share their SI dimension with another kind (temperature difference, gauge pressure): a product/quotient/power never produces them
-   *  (see kindOfDimension), they are reached only through the explicit functions. */
+  /** `false` marks a SEMANTIC kind: one whose meaning is not fixed by its dimension (temperature difference, gauge pressure, magnetic field strength H,
+   *  magnetization M, elastic modulus). It never takes part in a product, quotient or power as an operand - except where the operation provably keeps its meaning
+   *  (scaling by a dimensionless quantity, the power 1 and 0, a ratio of two quantities of the SAME kind): see uncertainty.ts. */
   readonly derivable?: boolean;
 }
 
@@ -59,6 +61,18 @@ export const QUANTITY_KINDS = deepFreeze({
   massDensity: { dimension: MASS_DENSITY, siUnit: 'kg_m3', nameRu: 'плотность (массовая)', nonNegative: true, limitRu: 'плотность не может быть отрицательной' },
   frequency: { dimension: FREQUENCY, siUnit: 'Hz', nameRu: 'частота', nonNegative: true, limitRu: 'частота не может быть отрицательной' },
   electricCharge: { dimension: ELECTRIC_CHARGE, siUnit: 'C', nameRu: 'электрический заряд', nonNegative: false },
+  // property kinds (M1.3.0). A kind that shares its SI dimension with another kind is semantic (derivable: false) where its meaning must not be guessed.
+  thermalConductivity: { dimension: THERMAL_CONDUCTIVITY, siUnit: 'W_mK', nameRu: 'теплопроводность', nonNegative: true, limitRu: 'теплопроводность не может быть отрицательной' },
+  specificHeatCapacity: { dimension: SPECIFIC_HEAT, siUnit: 'J_kgK', nameRu: 'удельная теплоёмкость', nonNegative: true, limitRu: 'удельная теплоёмкость не может быть отрицательной' },
+  linearExpansionCoefficient: { dimension: THERMAL_EXPANSION, siUnit: 'per_K', nameRu: 'коэффициент линейного теплового расширения', nonNegative: false },
+  resistance: { dimension: RESISTANCE, siUnit: 'Ohm', nameRu: 'электрическое сопротивление', nonNegative: false },
+  resistivity: { dimension: RESISTIVITY, siUnit: 'Ohm_m', nameRu: 'удельное электрическое сопротивление', nonNegative: true, limitRu: 'удельное сопротивление не может быть отрицательным' },
+  electricalConductivity: { dimension: CONDUCTIVITY, siUnit: 'S_m', nameRu: 'удельная электрическая проводимость', nonNegative: true, limitRu: 'проводимость не может быть отрицательной' },
+  molarMass: { dimension: MOLAR_MASS, siUnit: 'kg_mol', nameRu: 'молярная масса', nonNegative: true, limitRu: 'молярная масса не может быть отрицательной' },
+  magneticFieldStrength: { dimension: FIELD_STRENGTH, siUnit: 'A_m_H', nameRu: 'напряжённость магнитного поля', nonNegative: false, derivable: false },
+  magnetization: { dimension: FIELD_STRENGTH, siUnit: 'A_m_M', nameRu: 'намагниченность', nonNegative: false, derivable: false },
+  elasticModulus: { dimension: PRESSURE, siUnit: 'Pa_mod', nameRu: 'модуль упругости', nonNegative: true, limitRu: 'модуль упругости не может быть отрицательным', derivable: false },
+  thermalDiffusivity: { dimension: THERMAL_DIFFUSIVITY, siUnit: 'm2_s', nameRu: 'коэффициент температуропроводности', nonNegative: true, limitRu: 'температуропроводность не может быть отрицательной' },
 } as const satisfies Record<string, QuantityKindSpec>);
 
 export type QuantityKind = keyof typeof QUANTITY_KINDS;
@@ -211,6 +225,45 @@ export const UNITS = deepFreeze({
   mC: unit('electricCharge', 'мКл', 'милликулон', decimal('1e-3'), SI),
   uC: unit('electricCharge', 'мкКл', 'микрокулон', decimal('1e-6'), SI),
   Ah: unit('electricCharge', 'А·ч', 'ампер-час', decimal('3600'), 'Точно: 1 А·ч = 3600 Кл.'),
+  // thermal conductivity, specific heat, thermal expansion
+  W_mK: unit('thermalConductivity', 'Вт/(м·К)', 'ватт на метр-кельвин', decimal('1'), SI),
+  mW_mK: unit('thermalConductivity', 'мВт/(м·К)', 'милливатт на метр-кельвин', decimal('1e-3'), SI),
+  W_cmK: unit('thermalConductivity', 'Вт/(см·К)', 'ватт на сантиметр-кельвин', decimal('100'), 'Точно: 1 Вт/(см·К) = 1 Вт / (1e-2 м · К) = 100 Вт/(м·К).'),
+  J_kgK: unit('specificHeatCapacity', 'Дж/(кг·К)', 'джоуль на килограмм-кельвин', decimal('1'), SI),
+  kJ_kgK: unit('specificHeatCapacity', 'кДж/(кг·К)', 'килоджоуль на килограмм-кельвин', decimal('1e3'), SI),
+  J_gK: unit('specificHeatCapacity', 'Дж/(г·К)', 'джоуль на грамм-кельвин', decimal('1e3'), 'Точно: 1 Дж/(г·К) = 1 Дж / (1e-3 кг · К) = 1000 Дж/(кг·К).'),
+  per_K: unit('linearExpansionCoefficient', 'К⁻¹', 'на кельвин', decimal('1'), 'Единица СИ. Значение относится к интервалу температур: определение (касательное или среднее от опорной температуры) задаётся условиями свойства, не единицей.'),
+  per_degC: unit('linearExpansionCoefficient', '°C⁻¹', 'на градус Цельсия', decimal('1'), 'Точно: 1 °C⁻¹ = 1 К⁻¹ (шаг градуса равен кельвину; это обратная величина ИНТЕРВАЛА температур, смещение 273,15 не применяется).'),
+  ppm_K: unit('linearExpansionCoefficient', '10⁻⁶ К⁻¹', 'миллионная доля на кельвин', decimal('1e-6'), 'Точно: 1e-6 К⁻¹.'),
+  // electrical resistance, resistivity, conductivity
+  Ohm: unit('resistance', 'Ом', 'ом', decimal('1'), 'Единица СИ: 1 Ом = 1 В/А.'),
+  mOhm: unit('resistance', 'мОм', 'миллиом', decimal('1e-3'), SI),
+  kOhm: unit('resistance', 'кОм', 'килоом', decimal('1e3'), SI),
+  MOhm: unit('resistance', 'МОм', 'мегаом', decimal('1e6'), SI),
+  Ohm_m: unit('resistivity', 'Ом·м', 'ом-метр', decimal('1'), 'Единица СИ: 1 Ом·м = 1 В·м/А.'),
+  Ohm_cm: unit('resistivity', 'Ом·см', 'ом-сантиметр', decimal('1e-2'), 'Точно: 1 Ом·см = 1 Ом · 1e-2 м = 1e-2 Ом·м.'),
+  uOhm_cm: unit('resistivity', 'мкОм·см', 'микроом-сантиметр', decimal('1e-8'), 'Точно: 1 мкОм·см = 1e-6 Ом · 1e-2 м = 1e-8 Ом·м.'),
+  nOhm_m: unit('resistivity', 'нОм·м', 'наноом-метр', decimal('1e-9'), 'Точно: 1 нОм·м = 1e-9 Ом·м.'),
+  S_m: unit('electricalConductivity', 'См/м', 'сименс на метр', decimal('1'), 'Единица СИ: 1 См/м = 1/(Ом·м).'),
+  S_cm: unit('electricalConductivity', 'См/см', 'сименс на сантиметр', decimal('100'), 'Точно: 1 См/см = 1 См / 1e-2 м = 100 См/м.'),
+  MS_m: unit('electricalConductivity', 'МСм/м', 'мегасименс на метр', decimal('1e6'), SI),
+  // molar mass
+  kg_mol: unit('molarMass', 'кг/моль', 'килограмм на моль', decimal('1'), SI),
+  g_mol: unit('molarMass', 'г/моль', 'грамм на моль', decimal('1e-3'), 'Точно: 1 г/моль = 1e-3 кг/моль.'),
+  // magnetic field strength H and magnetization M (same SI dimension A/m, different quantities)
+  A_m_H: unit('magneticFieldStrength', 'А/м', 'ампер на метр (напряжённость поля)', decimal('1'), SI),
+  kA_m_H: unit('magneticFieldStrength', 'кА/м', 'килоампер на метр (напряжённость поля)', decimal('1e3'), SI),
+  A_m_M: unit('magnetization', 'А/м', 'ампер на метр (намагниченность)', decimal('1'), SI),
+  kA_m_M: unit('magnetization', 'кА/м', 'килоампер на метр (намагниченность)', decimal('1e3'), SI),
+  emu_cm3: unit('magnetization', 'эме/см³', 'электромагнитная единица на кубический сантиметр', decimal('1e3'), 'Точно: 1 эме = 1 абампер·см² = 10 А · 1e-4 м² = 1e-3 А·м²; 1 эме/см³ = 1e-3 А·м² / 1e-6 м³ = 1000 А/м. (Эрстед не включён: 1 Э = 1000/(4π) А/м — иррациональный коэффициент.)'),
+  // elastic modulus (same SI dimension as pressure, a different quantity)
+  Pa_mod: unit('elasticModulus', 'Па (модуль)', 'паскаль (модуль упругости)', decimal('1'), SI),
+  MPa_mod: unit('elasticModulus', 'МПа (модуль)', 'мегапаскаль (модуль упругости)', decimal('1e6'), SI),
+  GPa_mod: unit('elasticModulus', 'ГПа (модуль)', 'гигапаскаль (модуль упругости)', decimal('1e9'), 'Точно: 1 ГПа = 1e9 Па.'),
+  // thermal diffusivity
+  m2_s: unit('thermalDiffusivity', 'м²/с', 'квадратный метр в секунду', decimal('1'), SI),
+  cm2_s: unit('thermalDiffusivity', 'см²/с', 'квадратный сантиметр в секунду', decimal('1e-4'), 'Точно: 1 см²/с = 1e-4 м²/с.'),
+  mm2_s: unit('thermalDiffusivity', 'мм²/с', 'квадратный миллиметр в секунду', decimal('1e-6'), 'Точно: 1 мм²/с = 1e-6 м²/с.'),
   // amount of substance and luminous intensity (the two remaining SI base dimensions)
   mol: unit('amount', 'моль', 'моль', decimal('1'), SI),
   mmol: unit('amount', 'ммоль', 'миллимоль', decimal('1e-3'), SI),
@@ -243,12 +296,14 @@ export function assertUnitsCompatible(a: UnitId, b: UnitId): void {
   if (!dimEquals(da, db)) throw new PhysicsError('dimension_mismatch', `Нельзя преобразовать ${UNITS[a].symbol} (${formatDimension(da)}) в ${UNITS[b].symbol} (${formatDimension(db)}): размерности различаются.`);
 }
 
-/** The ONE registered kind with this SI dimension - how a product, quotient or power of quantities finds its kind (V * A -> power). Kinds that share a dimension with
- *  another kind (`derivable: false`: temperature difference, gauge pressure) are never the answer. Throws `unsupported_dimension` when no kind matches
- *  (e.g. V / A: a resistance is not registered yet) - never a guess. */
+/** The registered kind that is the ONLY one with this SI dimension - how a product, quotient or power of quantities finds its kind (V * A -> power). A dimension
+ *  is not a meaning: when two or more kinds share it (K: absolute temperature / temperature difference; Pa: absolute pressure / gauge pressure / elastic modulus;
+ *  A/m: H / M) the answer is ambiguous and NOTHING is guessed - `unsupported_dimension`, as for a dimension with no kind (J / m: a force is not registered). */
 export function kindOfDimension(dim: Dimension): QuantityKind {
-  const matches = QUANTITY_KIND_IDS.filter(k => (QUANTITY_KINDS[k] as QuantityKindSpec).derivable !== false && dimEquals(QUANTITY_KINDS[k].dimension, dim));
-  if (matches.length !== 1) throw new PhysicsError('unsupported_dimension', `Размерности ${formatDimension(dim)} не соответствует ни одна зарегистрированная величина (найдено: ${matches.length}).`);
+  const matches = QUANTITY_KIND_IDS.filter(k => dimEquals(QUANTITY_KINDS[k].dimension, dim));
+  if (matches.length !== 1) throw new PhysicsError('unsupported_dimension', matches.length === 0
+    ? `Размерности ${formatDimension(dim)} не соответствует ни одна зарегистрированная величина.`
+    : `Размерности ${formatDimension(dim)} соответствуют несколько величин (${matches.map(k => QUANTITY_KINDS[k].nameRu).join('; ')}): род результата по размерности не определяется.`);
   return matches[0];
 }
 

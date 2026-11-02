@@ -49,19 +49,25 @@ test('kindOfDimension: products and quotients find their kind; ambiguity and unk
   assert.equal(kindOfDimension(dimPow(LENGTH, 3)), 'volume');
   assert.equal(kindOfDimension(dimDiv(LENGTH, TIME)), 'velocity');
   assert.equal(kindOfDimension(dimPow(TIME, -1)), 'frequency');
-  assert.equal(kindOfDimension(dimDiv(ENERGY, dimPow(LENGTH, 3))), 'pressure'); // J/m3 is a pressure by dimension
-  assert.equal(kindOfDimension(TEMPERATURE), 'temperature');                      // NOT temperatureDifference
-  assert.equal(kindOfDimension(PRESSURE), 'pressure');                            // NOT gaugePressure
+  // a dimension shared by several kinds is AMBIGUOUS and is refused, never resolved to the 'primary' kind (J/m3 is not a pressure; K is not necessarily an absolute temperature)
+  assert.throws(() => kindOfDimension(dimDiv(ENERGY, dimPow(LENGTH, 3))), code('unsupported_dimension'));
+  assert.throws(() => kindOfDimension(TEMPERATURE), code('unsupported_dimension'));
+  assert.throws(() => kindOfDimension(PRESSURE), code('unsupported_dimension'));
   assert.equal(kindOfDimension(dimDiv(MASS, dimPow(LENGTH, 3))), 'massDensity');
-  assert.throws(() => kindOfDimension(dimDiv(VOLTAGE, CURRENT)), code('unsupported_dimension')); // resistance is not registered
+  assert.throws(() => kindOfDimension(dimDiv(ENERGY, LENGTH)), code('unsupported_dimension')); // force is not registered
   assert.throws(() => kindOfDimension(dimMul(VELOCITY, FREQUENCY)), code('unsupported_dimension'));
 });
 
-test('every derivable kind is the unique answer for its own dimension; the two shared-dimension kinds are not derivable', () => {
+test('kindOfDimension answers exactly for the dimensions that belong to ONE kind; semantic kinds always share their dimension', () => {
   for (const kind of QUANTITY_KIND_IDS) {
     const spec = QUANTITY_KINDS[kind] as { dimension: readonly number[]; derivable?: boolean };
-    if (spec.derivable === false) { assert.ok(kind === 'temperatureDifference' || kind === 'gaugePressure'); continue; }
-    assert.equal(kindOfDimension(spec.dimension as never), kind, kind);
+    const sharing = QUANTITY_KIND_IDS.filter(k => QUANTITY_KINDS[k].dimension.join() === spec.dimension.join());
+    if (sharing.length === 1) assert.equal(kindOfDimension(spec.dimension as never), kind, kind);
+    else assert.throws(() => kindOfDimension(spec.dimension as never), code('unsupported_dimension'), kind);
+    if (spec.derivable === false) assert.ok(sharing.length > 1, `${kind} is marked semantic but its dimension is unique`);
     assert.ok(unitsOfKind(kind).length >= 1);
   }
+  // the kinds that share a dimension are exactly: K (temperature, temperatureDifference), Pa (pressure, gaugePressure, elasticModulus), A/m (H, M)
+  const shared = QUANTITY_KIND_IDS.filter(kind => QUANTITY_KIND_IDS.filter(k => QUANTITY_KINDS[k].dimension.join() === QUANTITY_KINDS[kind].dimension.join()).length > 1).sort();
+  assert.deepEqual(shared, ['elasticModulus', 'gaugePressure', 'magneticFieldStrength', 'magnetization', 'pressure', 'temperature', 'temperatureDifference']);
 });
