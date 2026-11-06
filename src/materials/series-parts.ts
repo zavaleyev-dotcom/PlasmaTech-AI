@@ -18,13 +18,13 @@ export const exactTemperature = (q: unknown): Rational => {
 };
 
 /** A place in the source: at least one of page, table, figure, equation, section, each a non-empty string. */
-export function checkLocator(locator: unknown, path: string, c: Collector): boolean {
-  if (!isRecord(locator)) { c.error('invalid_observation', path, `${path}: ожидался объект с местом в источнике.`); return false; }
+export function checkLocator(locator: unknown, path: string, c: Collector, code: 'invalid_observation' | 'invalid_equation' | 'invalid_segment' | 'invalid_coefficient_check' = 'invalid_observation'): boolean {
+  if (!isRecord(locator)) { c.error(code, path, `${path}: ожидался объект с местом в источнике.`); return false; }
   const before = c.errorCount;
-  checkKeys(locator, LOCATOR_KEYS, path, c, 'invalid_observation');
+  checkKeys(locator, LOCATOR_KEYS, path, c, code);
   const present = LOCATOR_KEYS.filter(k => locator[k] !== undefined);
-  if (present.length === 0 && Object.keys(locator).length === 0) c.error('invalid_observation', path, `${path}: пустое указание места — задайте страницу, таблицу, рисунок, уравнение или раздел.`);
-  for (const k of present) if (!isNonEmptyString(locator[k])) c.error('invalid_observation', `${path}.${k}`, `${path}.${k}: ожидалась непустая строка.`);
+  if (present.length === 0 && Object.keys(locator).length === 0) c.error(code, path, `${path}: пустое указание места — задайте страницу, таблицу, рисунок, уравнение или раздел.`);
+  for (const k of present) if (!isNonEmptyString(locator[k])) c.error(code, `${path}.${k}`, `${path}.${k}: ожидалась непустая строка.`);
   return c.errorCount === before;
 }
 
@@ -41,7 +41,7 @@ function collectCorrelationProvenance(p: unknown, path: string, c: Collector): v
 /** The correlation statement: `unknown` (nothing is assumed), `independent` (only with its own provenance) or `declared` (a description or a matrix, with provenance).
  *  A matrix is checked STRUCTURALLY, exactly and without any tolerance (size, ids, symmetry, unit diagonal, |r| <= 1); that it is positive semi-definite is NOT checked and
  *  never claimed - an information note says so. Nothing is propagated. `observationIds`: the ids the matrix may refer to. */
-export function collectCorrelation(statement: unknown, observationIds: ReadonlySet<string>, path: string, c: Collector): void {
+export function collectCorrelation(statement: unknown, observationIds: ReadonlySet<string>, path: string, c: Collector, noun = 'наблюдения этой серии'): void {
   if (!isRecord(statement)) { c.error('invalid_correlation', path, `${path}: утверждение о корреляции обязательно; если ничего не известно, запишите { kind: 'unknown' } (независимость не предполагается).`); return; }
   if (statement.kind === 'unknown') { checkKeys(statement, ['kind'], path, c, 'invalid_correlation'); return; }
   if (statement.kind === 'independent') {
@@ -63,9 +63,9 @@ export function collectCorrelation(statement: unknown, observationIds: ReadonlyS
   const p = `${path}.info`;
   checkKeys(info, ['form', 'ids', 'matrix'], p, c, 'invalid_correlation');
   const { ids, matrix } = info;
-  if (!Array.isArray(ids) || ids.length < 2 || ids.length > MAX_CORRELATION_SIZE || !ids.every(isNonEmptyString)) { c.error('invalid_correlation', `${p}.ids`, `${p}.ids: ожидался список из 2…${MAX_CORRELATION_SIZE} идентификаторов наблюдений.`); return; }
+  if (!Array.isArray(ids) || ids.length < 2 || ids.length > MAX_CORRELATION_SIZE || !ids.every(isNonEmptyString)) { c.error('invalid_correlation', `${p}.ids`, `${p}.ids: ожидался список из 2…${MAX_CORRELATION_SIZE} идентификаторов (${noun}).`); return; }
   if (new Set(ids).size !== ids.length) c.error('invalid_correlation', `${p}.ids`, `${p}.ids: идентификаторы не должны повторяться.`);
-  for (const id of ids) if (!observationIds.has(id)) c.error('invalid_correlation', `${p}.ids`, `${p}.ids: «${String(id)}» — не идентификатор наблюдения этой серии.`);
+  for (const id of ids) if (!observationIds.has(id)) c.error('invalid_correlation', `${p}.ids`, `${p}.ids: «${String(id)}» — не идентификатор ${noun}.`);
   if (!Array.isArray(matrix) || matrix.length !== ids.length || !matrix.every(row => Array.isArray(row) && row.length === ids.length)) { c.error('invalid_correlation', `${p}.matrix`, `${p}.matrix: ожидалась квадратная матрица ${ids.length}×${ids.length}.`); return; }
   let numeric = true;
   for (const row of matrix as unknown[][]) for (const x of row) if (typeof x !== 'number' || !Number.isFinite(x)) numeric = false;

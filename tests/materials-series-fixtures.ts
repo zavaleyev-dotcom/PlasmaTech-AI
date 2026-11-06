@@ -35,7 +35,7 @@ export const alphaSeries = (conditions: Record<string, unknown>, kelvin: number[
 });
 
 // ---------- tables (M1.3.4 step 2) ----------
-import type { TabulatedSeries, TableRow } from '../src/materials';
+import type { AnalyticSeries, EquationSegment, TabulatedSeries, TableRow } from '../src/materials';
 
 /** A synthetic row: an observation that carries its own provenance (used in `per_row` tables). */
 export const row = (id: string, kelvin: number, value: number, extra: Partial<TableRow> = {}): TableRow => ({ ...obs(id, kelvin, value), provenance: syntheticProvenance(), ...extra });
@@ -54,4 +54,20 @@ export const singleTable = (over: Partial<TabulatedSeries> = {}): TabulatedSerie
 export const perRowTable = (over: Partial<TabulatedSeries> = {}): TabulatedSeries => singleTable({
   tableProvenance: { mode: 'per_row', compilation: tableSource },
   rows: [row('r1', 300, 1), row('r2', 400, 2), row('r3', 500, 3)], ...over,
+});
+
+// ---------- analytic series (M1.3.4 step 3): the coefficients are SYNTHETIC placeholders, not a fit of anything ----------
+
+export const term = (exponent: number, value = 1, extra: Record<string, unknown> = {}) => ({ exponent, coefficient: { type: 'scalar' as const, value, unit: 'W_mK' as const }, uncertainty: { kind: 'unknown' as const }, ...extra });
+
+/** A synthetic segment over [min, max) kelvin with x = (T - T0) / s, T0 = 300 K, s = 100 K_delta. */
+export const segment = (id: string, min: number, max: number, over: Partial<EquationSegment> = {}, equation: Record<string, unknown> = {}): EquationSegment => ({
+  id, domain: { min: q(min, 'K'), max: q(max, 'K'), minInclusive: true, maxInclusive: false },
+  equation: { form: 'power_sum', variable: { reference: q(300, 'K'), scale: q(100, 'K_delta') }, terms: [term(0, 1), term(1, 0.5)], ...equation } as never, ...over,
+});
+
+export const analytic = (over: Partial<AnalyticSeries> = {}): AnalyticSeries => ({
+  id: 'fixture:analytic-k-bulk', kind: 'analytic', variant: BULK, property: 'thermal_conductivity', commonConditions: {}, uncertaintyScope: 'unspecified',
+  applicability: { events: [], stability: { kind: 'not_stated' } }, version: 1, updatedAt: '2000-01-01', provenance: syntheticProvenance(),
+  segments: [segment('s1', 300, 600)], coefficientCheck: { status: 'not_checked' }, coefficientCorrelation: { kind: 'unknown' }, ...over,
 });

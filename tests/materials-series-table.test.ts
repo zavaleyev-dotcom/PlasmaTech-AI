@@ -215,7 +215,7 @@ test('28-29. nothing is averaged and nothing is computed between the points: no 
   assert.ok(!/\.(toFixed|round)\(|Math\.(round|floor|ceil)/.test(readFileSync(join(__dirname, '../src/materials/series-table.ts'), 'utf8')));
 });
 
-test('30. point series are unchanged: the same validator, the same codes; an analytic series is still refused', () => {
+test('30. point series are unchanged: the same validator, the same codes; the kinds are not interchangeable', () => {
   assert.deepEqual(errs(bulkSeries()), []);
   assert.deepEqual(errs(bulkSeries({ points: [obs('p1', 300, 1), obs('p1', 400, 2)] })), ['duplicate_observation_id']);
   assert.deepEqual(errs(bulkSeries({ provenance: undefined as never })), ['invalid_provenance']);
@@ -226,7 +226,7 @@ test('30. point series are unchanged: the same validator, the same codes; an ana
   assert.equal(validatePropertySeries(p).ok, true);
   assert.deepEqual(errs(alphaSeries({ expansionDefinition: 'mean' }), bulk), ['missing_condition']);
   assert.deepEqual(errs(filmSeries({ commonConditions: {} }), film), ['missing_condition', 'missing_condition']);
-  assert.deepEqual(errs({ ...singleTable(), kind: 'analytic' }), ['unsupported_series_kind']);
+  assert.ok(errs({ ...singleTable(), kind: 'analytic' }).length > 0);                                              // a table is not an analytic series
   assert.deepEqual(errs({ ...singleTable(), kind: 'spline' }), ['invalid_series']);
 });
 

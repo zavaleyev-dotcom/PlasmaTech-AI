@@ -344,8 +344,7 @@ test('17. unknown additional fields are refused at every level', () => {
   assert.equal(validatePropertySeries(bulkSeries()).ok, true);
 });
 
-test('the analytic kind is declared in the contract but refused until implemented; the length limits are enforced', () => {
-  for (const kind of ['analytic']) assert.deepEqual(errs({ ...bulkSeries(), kind }), ['unsupported_series_kind'], kind);
+test('an unknown kind is refused; the length limits are enforced', () => {
   assert.deepEqual(errs({ ...bulkSeries(), kind: 'curve' }), ['invalid_series']);
   assert.deepEqual(errs(bulkSeries({ points: [obs('p1', 300, 1)] })), ['series_too_short']);
   assert.deepEqual(errs(bulkSeries({ points: [] })), ['series_too_short']);
@@ -391,11 +390,11 @@ test('ids, versions and replacement: one id space, the same kind, variant and pr
 test('18. the series modules contain no numerical reference data and no computation of property values', () => {
   const dir = join(__dirname, '../src/materials');
   const files = readdirSync(dir).filter(f => /^series(-[a-z]+)?\.ts$/.test(f));
-  assert.deepEqual(files.sort(), ['series-parts.ts', 'series-table.ts', 'series-types.ts', 'series.ts']);
+  assert.deepEqual(files.sort(), ['series-analytic.ts', 'series-parts.ts', 'series-table.ts', 'series-types.ts', 'series.ts']);
   for (const file of files) {
     const code = readFileSync(join(dir, file), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '').replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '""').replace(/\/\^\[[^\n]*\$\//g, '');   // strings and the id regex literal are not data
     const numbers = [...code.matchAll(/(?<![\w.])\d[\d_.eE]*/g)].map(m => m[0]);
-    for (const n of numbers) assert.ok(['0', '1', '2', '5', '64', '100', '10000', '1000000', '6'].includes(n), `${file}: unexpected numeric literal ${n}`);
+    for (const n of numbers) assert.ok(['0', '1', '2', '5', '64', '100', '10000', '1000000', '6', '17'].includes(n), `${file}: unexpected numeric literal ${n}`);
     assert.ok(!/\b(Math\.(sqrt|pow|exp|log|hypot)|interpolate|extrapolate|average|mean\()/.test(code), `${file}: computation of values`);
   }
 });

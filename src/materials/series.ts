@@ -15,8 +15,9 @@ import { getPropertyDefinition } from './property-definitions';
 import { collectUncertainty } from './property-uncertainty';
 import { collectProvenance } from './provenance';
 import { checkLocator, collectApplicability, collectCorrelation, exactTemperature, OBSERVATION_ID, type ParsedApplicability } from './series-parts';
+import { collectCoefficientCheck, collectFit, collectSegments, domainMeets, domainReaches, within, type ParsedSegment } from './series-analytic';
 import { collectInterpolation, collectTableProvenance } from './series-table';
-import { MAX_OBSERVATIONS, REPLICATE_RELATIONS, SERIES_KINDS, UNCERTAINTY_SCOPES, type PointSeries, type TabulatedSeries } from './series-types';
+import { MAX_OBSERVATIONS, REPLICATE_RELATIONS, SERIES_KINDS, UNCERTAINTY_SCOPES, type AnalyticSeries, type PointSeries, type TabulatedSeries } from './series-types';
 import { collectVariant } from './variant';
 import type { MaterialKind, MaterialPhase } from './types';
 import type { PropertyDefinition } from './property-types';
@@ -25,6 +26,8 @@ type Rational = exact.Rational;
 const MAX_VERSION = 1000000;
 const POINT_KEYS = ['id', 'kind', 'variant', 'property', 'commonConditions', 'uncertaintyScope', 'applicability', 'version', 'updatedAt', 'supersedes', 'provenance', 'points', 'correlation'] as const;
 const TABLE_KEYS = ['id', 'kind', 'variant', 'property', 'commonConditions', 'uncertaintyScope', 'applicability', 'version', 'updatedAt', 'supersedes', 'tableProvenance', 'rows', 'correlation', 'interpolation'] as const;
+const ANALYTIC_KEYS = ['id', 'kind', 'variant', 'property', 'commonConditions', 'uncertaintyScope', 'applicability', 'version', 'updatedAt', 'supersedes', 'provenance', 'segments', 'coefficientCheck', 'coefficientCorrelation', 'fit'] as const;
+const ANALYTIC_SCOPES = ['fit_coefficients', 'fit_residual', 'unspecified'] as const;
 const OBSERVATION_KEYS = ['id', 'temperature', 'value', 'uncertainty', 'replicate', 'run', 'locator'] as const;
 const FILM_FORMS: readonly string[] = ['thin_film', 'coating_layer'];
 
@@ -42,11 +45,11 @@ function variantContext(variant: unknown, kind: MaterialKind | null, path: strin
 
 const idsText = (ids: readonly string[]): string => (ids.length <= 5 ? ids.join(', ') : `${ids.slice(0, 5).join(', ')} … всего ${ids.length}`);
 
-/** The one validator of a series of observations. A point series stores `points` (one provenance for the whole series); a tabulated series stores `rows` (a table-level
- *  provenance mode plus an interpolation statement). Observations, units, conditions, uncertainties, correlation, applicability and versions are checked by the SAME code. */
-function collectObservationSeries(series: Record<string, unknown>, variant: Record<string, unknown> | undefined, path: string, c: Collector, table: boolean): void {
-  const rowsKey = table ? 'rows' : 'points';
-  checkKeys(series, table ? TABLE_KEYS : POINT_KEYS, path, c, 'invalid_series');
+const isFilm = (variant: Record<string, unknown> | undefined): boolean => variant !== undefined && isRecord(variant.form) && FILM_FORMS.includes(String(variant.form.kind));
+
+/** The part every series has: the allowed keys, the series id, the variant reference and the property (which must depend on temperature in this model). */
+function collectHeader(series: Record<string, unknown>, variant: Record<string, unknown> | undefined, keys: readonly string[], path: string, c: Collector): PropertyDefinition | undefined {
+  checkKeys(series, keys, path, c, 'invalid_series');
   if (!isMaterialId(series.id)) c.error('invalid_id', `${path}.id`, `${path}.id: идентификатор серии — <ref|user|fixture>:<слаг>.`);
   if (!isMaterialId(series.variant)) c.error('invalid_id', `${path}.variant`, `${path}.variant: серия ссылается на вариант материала по идентификатору.`);
   if (variant && typeof series.variant === 'string' && variant.id !== series.variant) c.error('missing_reference', `${path}.variant`, `${path}.variant: переданный вариант («${String(variant.id)}») — не тот, на который ссылается серия («${series.variant}»).`);
@@ -56,6 +59,56 @@ function collectObservationSeries(series: Record<string, unknown>, variant: Reco
   else if (!definition.allowedConditions.includes('temperature') && !definition.allowedConditions.includes('temperatureRange')) {
     c.error('series_property_unsupported', `${path}.property`, `${path}.property: свойство «${definition.nameRu}» не зависит от температуры в этой модели — серия по температуре для него не определена.`);
   }
+  return definition;
+}
+
+/** The common conditions (everything except the temperature, which is the axis). The M1.3.2 conditions validator runs for EVERY item (an observation, or a bound of a
+ *  segment: `temperature` is the temperature condition of that item); the findings are grouped, not repeated. */
+function collectCommonConditions(cond: unknown, definition: PropertyDefinition | undefined, variant: Record<string, unknown> | undefined, items: readonly { id: string; temperature: unknown }[], labels: readonly [string, string], path: string, c: Collector): void {
+  if (!isRecord(cond)) { c.error('invalid_condition', `${path}.commonConditions`, `${path}.commonConditions: ожидался объект условий (без температуры: температура — ось серии).`); return; }
+  for (const key of ['temperature', 'temperatureRange'] as const) if (cond[key] !== undefined) c.error('invalid_condition', `${path}.commonConditions.${key}`, `${path}.commonConditions.${key}: температура задаётся осью (наблюдениями), а не общими условиями.`);
+  if (!definition || items.length === 0) return;
+  const found = new Map<string, { issue: ValidationIssue; ids: string[] }>();
+  const { temperature: _t, temperatureRange: _r, ...common } = cond;
+  void _t; void _r;
+  for (const item of items) {
+    const local = new Collector();
+    collectConditions(definition, { ...common, temperature: item.temperature }, variant, `${path}.commonConditions`, local);
+    for (const issue of local.report().issues) {
+      if (issue.code === 'condition_outside_phase_range') continue;             // the phase range is judged below, with the declared phase context
+      const key = `${issue.severity}|${issue.code}|${issue.message}`;
+      const entry = found.get(key) ?? { issue, ids: [] };
+      entry.ids.push(item.id);
+      found.set(key, entry);
+    }
+  }
+  for (const { issue, ids } of found.values()) {
+    const where = ids.length === items.length ? labels[0] : `${labels[1]}: ${idsText([...new Set(ids)])}`;
+    const message = `${issue.message} (${where})`;
+    if (issue.severity === 'error') c.error(issue.code, issue.path, message);
+    else if (issue.severity === 'warning') c.warning(issue.code, issue.path, message);
+    else c.info(issue.code, issue.path, message);
+  }
+}
+
+/** Version, date, replacement and the namespace rule for the statuses of the values. */
+function collectFooter(series: Record<string, unknown>, statuses: readonly (string | null)[], path: string, c: Collector): void {
+  if (typeof series.version !== 'number' || !Number.isInteger(series.version) || series.version < 1 || series.version > MAX_VERSION) c.error('invalid_version', `${path}.version`, `${path}.version: версия серии — целое число от 1.`);
+  if (!isIsoDate(series.updatedAt)) c.error('invalid_version', `${path}.updatedAt`, `${path}.updatedAt: дата актуализации — ГГГГ-ММ-ДД.`);
+  if (series.supersedes !== undefined) {
+    if (!isMaterialId(series.supersedes)) c.error('supersedes_invalid', `${path}.supersedes`, `${path}.supersedes: идентификатор заменяемой серии некорректен.`);
+    else if (series.supersedes === series.id) c.error('supersedes_invalid', `${path}.supersedes`, `${path}.supersedes: серия не может заменять саму себя.`);
+  }
+  const ns = parseMaterialId(series.id)?.namespace;
+  if (ns === 'user' && statuses.some(x => x !== null && x !== 'user_input')) c.error('namespace_mismatch', `${path}.id`, `${path}.id: серия пользователя (user:) должна иметь статус user_input.`);
+  if (ns === 'ref' && statuses.includes('user_input')) c.error('namespace_mismatch', `${path}.id`, `${path}.id: справочная серия (ref:) не может иметь статус user_input — данные пользователя хранятся отдельно (user:).`);
+}
+
+/** The one validator of a series of observations. A point series stores `points` (one provenance for the whole series); a tabulated series stores `rows` (a table-level
+ *  provenance mode plus an interpolation statement). Observations, units, conditions, uncertainties, correlation, applicability and versions are checked by the SAME code. */
+function collectObservationSeries(series: Record<string, unknown>, variant: Record<string, unknown> | undefined, path: string, c: Collector, table: boolean): void {
+  const rowsKey = table ? 'rows' : 'points';
+  const definition = collectHeader(series, variant, table ? TABLE_KEYS : POINT_KEYS, path, c);
 
   // ---- observations ----
   const obsPath = `${path}.${rowsKey}`;
@@ -136,37 +189,7 @@ function collectObservationSeries(series: Record<string, unknown>, variant: Reco
   }
 
   // ---- common conditions: the temperature is the axis, everything else is common to ALL the observations ----
-  const cond = series.commonConditions;
-  const filmVariant = variant !== undefined && isRecord(variant.form) && FILM_FORMS.includes(String(variant.form.kind));
-  if (!isRecord(cond)) c.error('invalid_condition', `${path}.commonConditions`, `${path}.commonConditions: ожидался объект условий (без температуры: температура — ось серии).`);
-  else {
-    for (const key of ['temperature', 'temperatureRange'] as const) if (cond[key] !== undefined) c.error('invalid_condition', `${path}.commonConditions.${key}`, `${path}.commonConditions.${key}: температура задаётся осью (наблюдениями), а не общими условиями.`);
-    if (definition && valid.length > 0) {
-      // the M1.3.2 conditions validator runs for EVERY observation (the observation's temperature is the temperature condition); the findings are grouped, not repeated
-      const found = new Map<string, { issue: ValidationIssue; ids: string[] }>();
-      for (const o of valid) {
-        const local = new Collector();
-        const { temperature: _t, temperatureRange: _r, ...common } = cond as Record<string, unknown>;
-        void _t; void _r;
-        const obs = (points as unknown[])[o.index] as Record<string, unknown>;
-        collectConditions(definition, { ...common, temperature: obs.temperature }, variant, `${path}.commonConditions`, local);
-        for (const issue of local.report().issues) {
-          if (issue.code === 'condition_outside_phase_range') continue;             // the phase range is judged below, with the declared phase context
-          const key = `${issue.severity}|${issue.code}|${issue.message}`;
-          const entry = found.get(key) ?? { issue, ids: [] };
-          entry.ids.push(o.id);
-          found.set(key, entry);
-        }
-      }
-      for (const { issue, ids } of found.values()) {
-        const where = ids.length === valid.length ? 'все наблюдения' : `наблюдения: ${idsText(ids)}`;
-        const message = `${issue.message} (${where})`;
-        if (issue.severity === 'error') c.error(issue.code, issue.path, message);
-        else if (issue.severity === 'warning') c.warning(issue.code, issue.path, message);
-        else c.info(issue.code, issue.path, message);
-      }
-    }
-  }
+  collectCommonConditions(series.commonConditions, definition, variant, valid.map(o => ({ id: o.id, temperature: ((points as unknown[])[o.index] as Record<string, unknown>).temperature })), ['все наблюдения', 'наблюдения'], path, c);
 
   // ---- uncertainty scope, correlation, provenance, version ----
   if (!(UNCERTAINTY_SCOPES as readonly string[]).includes(series.uncertaintyScope as string)) c.error('invalid_series', `${path}.uncertaintyScope`, `${path}.uncertaintyScope: один из: ${UNCERTAINTY_SCOPES.join(', ')}.`);
@@ -178,18 +201,11 @@ function collectObservationSeries(series: Record<string, unknown>, variant: Reco
     const parsed = collectTableProvenance(series.tableProvenance, `${path}.tableProvenance`, c);
     statuses = parsed.single !== undefined ? [parsed.single] : rowStatuses;
   } else { status = collectProvenance(series.provenance, `${path}.provenance`, c); statuses = [status]; }
-  if (typeof series.version !== 'number' || !Number.isInteger(series.version) || series.version < 1 || series.version > MAX_VERSION) c.error('invalid_version', `${path}.version`, `${path}.version: версия серии — целое число от 1.`);
-  if (!isIsoDate(series.updatedAt)) c.error('invalid_version', `${path}.updatedAt`, `${path}.updatedAt: дата актуализации — ГГГГ-ММ-ДД.`);
-  if (series.supersedes !== undefined) {
-    if (!isMaterialId(series.supersedes)) c.error('supersedes_invalid', `${path}.supersedes`, `${path}.supersedes: идентификатор заменяемой серии некорректен.`);
-    else if (series.supersedes === series.id) c.error('supersedes_invalid', `${path}.supersedes`, `${path}.supersedes: серия не может заменять саму себя.`);
-  }
-  const ns = parseMaterialId(series.id)?.namespace;
-  if (ns === 'user' && statuses.some(x => x !== null && x !== 'user_input')) c.error('namespace_mismatch', `${path}.id`, `${path}.id: серия пользователя (user:) должна иметь статус user_input.`);
-  if (ns === 'ref' && statuses.includes('user_input')) c.error('namespace_mismatch', `${path}.id`, `${path}.id: справочная серия (ref:) не может иметь статус user_input — данные пользователя хранятся отдельно (user:).`);
+  collectFooter(series, statuses, path, c);
 
   // ---- applicability and its relation to the observed temperatures ----
   const app = collectApplicability(series.applicability, `${path}.applicability`, c);
+  const filmVariant = isFilm(variant);
   diagnose(series, app, valid, variant, filmVariant, path, c, rowsKey);
   if (table) collectInterpolation(series.interpolation, app.events, valid.map(v => v.t), `${path}.interpolation`, c);
 }
@@ -197,30 +213,33 @@ function collectObservationSeries(series: Record<string, unknown>, variant: Reco
 
 /** Diagnostics that relate the declared applicability to the observed temperatures and to the variant. Missing information is a warning or an information note, never a
  *  proof of stability; an observation outside a stated phase range is NOT rejected on that ground alone (its nature is unknown): it is a warning of possible incomparability. */
-function diagnose(series: Record<string, unknown>, app: ParsedApplicability, valid: { index: number; id: string; t: Rational }[], variant: Record<string, unknown> | undefined, film: boolean, path: string, c: Collector, rowsKey: string): void {
+function diagnose(series: Record<string, unknown>, app: ParsedApplicability, valid: { index: number; id: string; t: Rational }[], variant: Record<string, unknown> | undefined, film: boolean, path: string, c: Collector, rowsKey: string, spans?: readonly ParsedSegment[]): void {
+  const analytic = spans !== undefined;
   const ordered = [...valid].sort((a, b) => a.index - b.index);
   const lowest = valid.length > 0 ? valid.reduce((m, o) => (exact.compare(o.t, m) < 0 ? o.t : m), valid[0].t) : undefined;
   const highest = valid.length > 0 ? valid.reduce((m, o) => (exact.compare(o.t, m) > 0 ? o.t : m), valid[0].t) : undefined;
   const k = (r: Rational): number => exact.rationalToNumber(r);
 
-  // sweep direction against the stored (measurement) order
+  // sweep direction against the stored (measurement) order (an equation has no measurement order)
   let ups = 0; let downs = 0; let firstUp = ''; let firstDown = '';
   for (let i = 1; i < ordered.length; i += 1) {
     const cmp = exact.compare(ordered[i].t, ordered[i - 1].t);
     if (cmp > 0) { ups += 1; if (!firstUp) firstUp = `${ordered[i - 1].id} → ${ordered[i].id}`; }
     if (cmp < 0) { downs += 1; if (!firstDown) firstDown = `${ordered[i - 1].id} → ${ordered[i].id}`; }
   }
-  if (app.sweep === 'heating' && downs > 0) c.error('sweep_inconsistent', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: объявлен нагрев, но в порядке измерения температура убывает (${firstDown}); порядок наблюдений не пересортировывается.`);
-  if (app.sweep === 'cooling' && ups > 0) c.error('sweep_inconsistent', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: объявлено охлаждение, но в порядке измерения температура растёт (${firstUp}); порядок наблюдений не пересортировывается.`);
-  if (ups > 0 && downs > 0 && (app.sweep === null || app.sweep === 'unknown')) c.warning('sweep_not_described', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: порядок измерения содержит и нагрев, и охлаждение, а ход температуры не описан (укажите mixed или разметьте события) — наблюдения могут быть несопоставимы.`);
-  if (ups > 0 && downs > 0) c.warning('potential_incomparability', `${path}.${rowsKey}`, `${path}.${rowsKey}: наблюдения получены и при росте, и при убывании температуры — возможна несопоставимость (гистерезис, необратимые изменения); порядок сохранён как есть.`);
+  if (!analytic && app.sweep === 'heating' && downs > 0) c.error('sweep_inconsistent', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: объявлен нагрев, но в порядке измерения температура убывает (${firstDown}); порядок наблюдений не пересортировывается.`);
+  if (!analytic && app.sweep === 'cooling' && ups > 0) c.error('sweep_inconsistent', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: объявлено охлаждение, но в порядке измерения температура растёт (${firstUp}); порядок наблюдений не пересортировывается.`);
+  if (!analytic && ups > 0 && downs > 0 && (app.sweep === null || app.sweep === 'unknown')) c.warning('sweep_not_described', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: порядок измерения содержит и нагрев, и охлаждение, а ход температуры не описан (укажите mixed или разметьте события) — наблюдения могут быть несопоставимы.`);
+  if (!analytic && ups > 0 && downs > 0) c.warning('potential_incomparability', `${path}.${rowsKey}`, `${path}.${rowsKey}: наблюдения получены и при росте, и при убывании температуры — возможна несопоставимость (гистерезис, необратимые изменения); порядок сохранён как есть.`);
 
   // events against the observed range
   for (const e of app.events) {
     const from = e.at ?? e.from; const to = e.at ?? e.to;
     if (from === undefined || to === undefined || lowest === undefined || highest === undefined) continue;
-    const inside = exact.compare(to, lowest) >= 0 && exact.compare(from, highest) <= 0;
-    if (e.effect === 'range_ends_before' && exact.compare(highest, from) >= 0) c.error('event_contradicts_domain', `${path}.applicability.events`, `${path}.applicability.events: событие «${e.kind}» (≈ ${k(from)} K) объявлено пределом применимости, а наблюдения доходят до ${k(highest)} K — противоречие внутри самой серии.`);
+    // measured temperatures are points; the domain of an analytic series is a set of intervals whose open bounds do not belong to it
+    const inside = spans ? domainMeets(spans, from, to) : exact.compare(to, lowest) >= 0 && exact.compare(from, highest) <= 0;
+    const reached = spans ? domainReaches(spans, from) : exact.compare(highest, from) >= 0;
+    if (e.effect === 'range_ends_before' && reached) c.error('event_contradicts_domain', `${path}.applicability.events`, `${path}.applicability.events: событие «${e.kind}» (≈ ${k(from)} K) объявлено пределом применимости, а наблюдения доходят до ${k(highest)} K — противоречие внутри самой серии.`);
     if (inside && e.effect === 'discontinuity') c.info('interval_crosses_event', `${path}.applicability.events`, `${path}.applicability.events: область наблюдений пересекает событие «${e.kind}» с разрывом свойства; значения по обе стороны относятся к разным состояниям.`);
     if (inside && e.effect === 'irreversible_change') c.warning('irreversible_change_in_domain', `${path}.applicability.events`, `${path}.applicability.events: в области наблюдений происходит необратимое изменение («${e.kind}»); наблюдения до и после него несопоставимы.`);
     if (inside && e.effect === 'unknown') c.warning('event_effect_unknown', `${path}.applicability.events`, `${path}.applicability.events: событие «${e.kind}» в области наблюдений, его влияние на данные не указано.`);
@@ -234,7 +253,7 @@ function diagnose(series: Record<string, unknown>, app: ParsedApplicability, val
   }
   if (film) {
     if (series.applicability && isRecord(series.applicability) && series.applicability.thermalHistory === undefined) c.warning('thermal_history_not_stated', `${path}.applicability.thermalHistory`, `${path}.applicability.thermalHistory: история термообработки плёнки (как осаждена, отжиг, число циклов) не указана — значения могут зависеть от неё и от необратимых изменений.`);
-    if (app.sweep === null) c.warning('sweep_direction_not_stated', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: направление изменения температуры не указано (нагрев, охлаждение, смешанный ход).`);
+    if (!analytic && app.sweep === null) c.warning('sweep_direction_not_stated', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: направление изменения температуры не указано (нагрев, охлаждение, смешанный ход).`);
   }
 
   // the phase range of the variant: an observation outside it is a warning of possible incomparability, not a rejection
@@ -243,12 +262,51 @@ function diagnose(series: Record<string, unknown>, app: ParsedApplicability, val
     const range = stableRangeKelvin(phase);
     if (!phase.stableRange || range === null) c.info('phase_range_not_stated', `${path}.applicability.phaseContext`, `${path}.applicability.phaseContext: область стабильности фазы варианта не задана — соответствие наблюдений фазе не проверялось.`);
     else {
-      const outside = ordered.filter(o => k(o.t) < range.min || k(o.t) > range.max).map(o => o.id);
+      const outside = [...new Set(ordered.filter(o => k(o.t) < range.min || k(o.t) > range.max).map(o => o.id))];
       if (outside.length > 0) {
         const sourced = phase.source !== undefined ? 'заявление о фазе подтверждено источником' : 'заявление о фазе без источника';
         if (app.phaseContext === 'metastable_beyond_range') c.info('beyond_stable_range', `${path}.applicability.phaseContext`, `${path}.applicability.phaseContext: наблюдения (${idsText(outside)}) вне заявленной области стабильности фазы [${range.min}; ${range.max}] K; серия объявляет фазу метастабильной за её пределами.`);
         else c.warning('beyond_stable_range', `${path}.applicability.phaseContext`, `${path}.applicability.phaseContext: наблюдения (${idsText(outside)}) вне заявленной области стабильности фазы [${range.min}; ${range.max}] K (${sourced}); природа расхождения не указана, серия не отклоняется, но наблюдения могут быть несопоставимы со свойствами этой фазы.`);
       } else if (app.phaseContext === 'metastable_beyond_range') c.warning('beyond_stable_range', `${path}.applicability.phaseContext`, `${path}.applicability.phaseContext: объявлена метастабильность за пределами области стабильности, но все наблюдения внутри неё.`);
+    }
+  }
+}
+
+const exactTemperatureOrUndefined = (q: unknown): ReturnType<typeof exactTemperature> | undefined => (checkQuantity(q, 'temperature', 'q', new Collector()) === null ? undefined : exactTemperature(q));
+
+/** An analytic series: the equation segments of ONE property of one variant, stored and checked structurally (see `series-analytic.ts`). Nothing is evaluated. The header,
+ *  the common conditions, the provenance, the applicability and the version rules are the same code as for the series of observations. */
+function collectAnalyticSeries(series: Record<string, unknown>, variant: Record<string, unknown> | undefined, path: string, c: Collector): void {
+  const definition = collectHeader(series, variant, ANALYTIC_KEYS, path, c);
+  const parsed = collectSegments(series.segments, definition, `${path}.segments`, c);
+  collectCoefficientCheck(series.coefficientCheck, definition, parsed.spans, `${path}.coefficientCheck`, c);
+  collectCorrelation(series.coefficientCorrelation, parsed.coefficientIds, `${path}.coefficientCorrelation`, c, 'коэффициента этой серии (<сегмент>:<показатель>)');
+  // what the uncertainty statements are about: coefficients of the fit or its residual spread, never "per observation"
+  const scopeOk = (ANALYTIC_SCOPES as readonly string[]).includes(series.uncertaintyScope as string);
+  if (!scopeOk) c.error('invalid_series', `${path}.uncertaintyScope`, `${path}.uncertaintyScope: для аналитической зависимости допустимы: ${ANALYTIC_SCOPES.join(', ')}.`);
+  collectFit(series.fit, scopeOk ? series.uncertaintyScope : undefined, parsed.statesCoefficientUncertainty, `${path}.fit`, c);
+  const status = collectProvenance(series.provenance, `${path}.provenance`, c);
+  // The common conditions are checked once per segment. The reference temperature of a MEAN expansion coefficient must differ from the temperature, so it must not belong to
+  // the domain of any segment (bounds that are excluded do not belong to it): that is checked on the whole interval below, and the probe temperature given to the condition
+  // validator is a bound that cannot coincide with it.
+  const cond = series.commonConditions;
+  const reference = isRecord(cond) && cond.expansionDefinition === 'mean' ? exactTemperatureOrUndefined(cond.referenceTemperature) : undefined;
+  const items = parsed.spans.map(s => ({ id: s.id, temperature: reference !== undefined && exact.compare(reference, s.min) === 0 ? s.maxQuantity : s.minQuantity }));
+  collectCommonConditions(series.commonConditions, definition, variant, items, ['все сегменты', 'сегменты'], path, c);
+  if (reference !== undefined) for (const s of parsed.spans) if (within(reference, s)) c.error('invalid_condition', `${path}.commonConditions.referenceTemperature`, `${path}.commonConditions.referenceTemperature: опорная температура среднего коэффициента принадлежит области сегмента «${s.id}» — средний коэффициент усредняется по интервалу от опорной температуры, и в самой опорной точке он не определяется (предельное продолжение не вводится).`);
+  collectFooter(series, [status], path, c);
+  const app = collectApplicability(series.applicability, `${path}.applicability`, c);
+  const bounds = parsed.spans.flatMap((s, i) => [{ index: 2 * i, id: s.id, t: s.min }, { index: 2 * i + 1, id: s.id, t: s.max }]);
+  diagnose(series, app, bounds, variant, isFilm(variant), path, c, 'segments', parsed.spans);
+  // a single equation across a discontinuity, an irreversible change or an event of unknown effect is suspicious: say so and suggest a split (nothing is split here)
+  for (const e of app.events) {
+    if (e.effect === 'range_ends_before') continue;
+    const from = e.at ?? e.from; const to = e.at ?? e.to;
+    if (from === undefined || to === undefined) continue;
+    for (const s of parsed.spans) {
+      const lo = exact.compare(from, s.min); const hi = exact.compare(to, s.max);
+      const crosses = e.at !== undefined ? (lo > 0 && hi < 0) : (exact.compare(from, s.max) < 0 && exact.compare(to, s.min) > 0);
+      if (crosses) c.warning('segment_crosses_event', `${path}.segments`, `${path}.segments: область сегмента «${s.id}» содержит событие «${e.kind}» (${e.effect}) — одно уравнение через такое событие может быть несостоятельным; рассмотрите разбиение на сегменты (автоматически не выполняется).`);
     }
   }
 }
@@ -264,12 +322,12 @@ export function validatePropertySeries(series: unknown, variant?: unknown): Vali
 function collectSeries(series: unknown, variant: Record<string, unknown> | undefined, path: string, c: Collector): void {
   if (!isRecord(series)) { c.error('invalid_series', path, `${path}: ожидался объект серии.`); return; }
   if (!(SERIES_KINDS as readonly string[]).includes(series.kind as string)) { c.error('invalid_series', `${path}.kind`, `${path}.kind: вид серии — один из: ${SERIES_KINDS.join(', ')}.`); return; }
-  if (series.kind !== 'points' && series.kind !== 'table') { c.error('unsupported_series_kind', `${path}.kind`, `${path}.kind: вид «${String(series.kind)}» объявлен в контракте, но ещё не реализован; сейчас поддерживаются серии наблюдений (points) и таблицы (table).`); return; }
+  if (series.kind === 'analytic') { collectAnalyticSeries(series, variant, path, c); return; }
   collectObservationSeries(series, variant, path, c, series.kind === 'table');
 }
 
 /** A validated, deep-frozen copy. Throws MaterialsError with ALL the issues when the series is invalid. */
-export function createPropertySeries<T extends PointSeries | TabulatedSeries>(input: T, variant?: unknown): T {
+export function createPropertySeries<T extends PointSeries | TabulatedSeries | AnalyticSeries>(input: T, variant?: unknown): T {
   const report = validatePropertySeries(input, variant);
   const errors = report.issues.filter(i => i.severity === 'error');
   if (errors.length > 0) throw new MaterialsError('invalid_series', `Серия некорректна: ${errors.length} ошибок. Первая — ${errors[0].path}: ${errors[0].message}`, report.issues);
