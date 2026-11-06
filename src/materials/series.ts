@@ -15,7 +15,8 @@ import { getPropertyDefinition } from './property-definitions';
 import { collectUncertainty } from './property-uncertainty';
 import { collectProvenance } from './provenance';
 import { checkLocator, collectApplicability, collectCorrelation, exactTemperature, OBSERVATION_ID, type ParsedApplicability } from './series-parts';
-import { MAX_OBSERVATIONS, REPLICATE_RELATIONS, SERIES_KINDS, UNCERTAINTY_SCOPES, type PointSeries } from './series-types';
+import { collectInterpolation, collectTableProvenance } from './series-table';
+import { MAX_OBSERVATIONS, REPLICATE_RELATIONS, SERIES_KINDS, UNCERTAINTY_SCOPES, type PointSeries, type TabulatedSeries } from './series-types';
 import { collectVariant } from './variant';
 import type { MaterialKind, MaterialPhase } from './types';
 import type { PropertyDefinition } from './property-types';
@@ -23,6 +24,8 @@ import type { PropertyDefinition } from './property-types';
 type Rational = exact.Rational;
 const MAX_VERSION = 1000000;
 const POINT_KEYS = ['id', 'kind', 'variant', 'property', 'commonConditions', 'uncertaintyScope', 'applicability', 'version', 'updatedAt', 'supersedes', 'provenance', 'points', 'correlation'] as const;
+const TABLE_KEYS = ['id', 'kind', 'variant', 'property', 'commonConditions', 'uncertaintyScope', 'applicability', 'version', 'updatedAt', 'supersedes', 'tableProvenance', 'rows', 'correlation', 'interpolation'] as const;
+const OBSERVATION_KEYS = ['id', 'temperature', 'value', 'uncertainty', 'replicate', 'run', 'locator'] as const;
 const FILM_FORMS: readonly string[] = ['thin_film', 'coating_layer'];
 
 /** The variant a series is checked against must itself be a structurally valid MaterialVariant (the M1.3.1 validator decides): a damaged variant gives errors and no context,
@@ -39,8 +42,11 @@ function variantContext(variant: unknown, kind: MaterialKind | null, path: strin
 
 const idsText = (ids: readonly string[]): string => (ids.length <= 5 ? ids.join(', ') : `${ids.slice(0, 5).join(', ')} … всего ${ids.length}`);
 
-function collectPointSeries(series: Record<string, unknown>, variant: Record<string, unknown> | undefined, path: string, c: Collector): void {
-  checkKeys(series, POINT_KEYS, path, c, 'invalid_series');
+/** The one validator of a series of observations. A point series stores `points` (one provenance for the whole series); a tabulated series stores `rows` (a table-level
+ *  provenance mode plus an interpolation statement). Observations, units, conditions, uncertainties, correlation, applicability and versions are checked by the SAME code. */
+function collectObservationSeries(series: Record<string, unknown>, variant: Record<string, unknown> | undefined, path: string, c: Collector, table: boolean): void {
+  const rowsKey = table ? 'rows' : 'points';
+  checkKeys(series, table ? TABLE_KEYS : POINT_KEYS, path, c, 'invalid_series');
   if (!isMaterialId(series.id)) c.error('invalid_id', `${path}.id`, `${path}.id: идентификатор серии — <ref|user|fixture>:<слаг>.`);
   if (!isMaterialId(series.variant)) c.error('invalid_id', `${path}.variant`, `${path}.variant: серия ссылается на вариант материала по идентификатору.`);
   if (variant && typeof series.variant === 'string' && variant.id !== series.variant) c.error('missing_reference', `${path}.variant`, `${path}.variant: переданный вариант («${String(variant.id)}») — не тот, на который ссылается серия («${series.variant}»).`);
@@ -52,21 +58,30 @@ function collectPointSeries(series: Record<string, unknown>, variant: Record<str
   }
 
   // ---- observations ----
-  const obsPath = `${path}.points`;
-  const points = series.points;
+  const obsPath = `${path}.${rowsKey}`;
+  const points = series[rowsKey];
+  const rowStatuses: (string | null)[] = [];
+  const rowProvenance = table && isRecord(series.tableProvenance) ? series.tableProvenance.mode : undefined;
   const observationIds = new Set<string>();
-  const valid: { index: number; id: string; t: Rational; tKey: string }[] = [];
+  const valid: { index: number; id: string; t: Rational; tKey: string; group?: string }[] = [];
   if (!Array.isArray(points)) c.error('invalid_series', obsPath, `${obsPath}: ожидался список наблюдений.`);
   else {
     if (points.length < 2) c.error('series_too_short', obsPath, `${obsPath}: в серии не менее двух наблюдений (одно значение — это скалярная запись).`);
     if (points.length > MAX_OBSERVATIONS) c.error('series_too_long', obsPath, `${obsPath}: наблюдений больше технического предела ${MAX_OBSERVATIONS}.`);
     const identity = new Map<string, string>();
     const replicateGroups = new Map<string, number[]>();
+    const validByIndex = new Map<number, { tKey: string }>();
+    let replicateOf: string | undefined;
     const units = new Set<string>();
     points.slice(0, MAX_OBSERVATIONS).forEach((obs, i) => {
       const p = `${obsPath}[${i}]`;
+      replicateOf = undefined;
       if (!isRecord(obs)) { c.error('invalid_observation', p, `${p}: ожидался объект наблюдения.`); return; }
-      checkKeys(obs, ['id', 'temperature', 'value', 'uncertainty', 'replicate', 'run', 'locator'], p, c, 'invalid_observation');
+      checkKeys(obs, table ? [...OBSERVATION_KEYS, 'provenance'] : OBSERVATION_KEYS, p, c, 'invalid_observation');
+      if (table) {
+        if (rowProvenance === 'per_row') rowStatuses.push(obs.provenance === undefined ? (c.error('invalid_table_provenance', `${p}.provenance`, `${p}.provenance: в режиме per_row у каждой строки своё происхождение; источник не наследуется от таблицы молча.`), null) : collectProvenance(obs.provenance, `${p}.provenance`, c));
+        else if (rowProvenance === 'single_source' && obs.provenance !== undefined) c.error('invalid_table_provenance', `${p}.provenance`, `${p}.provenance: в режиме single_source происхождение задано один раз для всей таблицы — у строки своего происхождения быть не должно.`);
+      }
       if (typeof obs.id !== 'string' || !OBSERVATION_ID.test(obs.id) || obs.id.length > 64) c.error('invalid_observation', `${p}.id`, `${p}.id: идентификатор наблюдения — строчные латинские буквы, цифры, «-», «_», «.» (до 64 символов).`);
       else if (observationIds.has(obs.id)) c.error('duplicate_observation_id', `${p}.id`, `${p}.id: идентификатор наблюдения «${obs.id}» повторяется — это одно и то же наблюдение, а не повтор.`);
       else observationIds.add(obs.id);
@@ -92,11 +107,11 @@ function collectPointSeries(series: Record<string, unknown>, variant: Record<str
         else {
           checkKeys(r, ['group', 'relation'], `${p}.replicate`, c, 'invalid_replicate');
           if (!isNonEmptyString(r.group)) c.error('invalid_replicate', `${p}.replicate.group`, `${p}.replicate.group: ожидалась непустая строка.`);
-          else replicateGroups.set(r.group, [...(replicateGroups.get(r.group) ?? []), i]);
+          else { const list = replicateGroups.get(r.group); if (list) list.push(i); else replicateGroups.set(r.group, [i]); replicateOf = r.group; }
           if (!(REPLICATE_RELATIONS as readonly string[]).includes(r.relation as string)) c.error('invalid_replicate', `${p}.replicate.relation`, `${p}.replicate.relation: один из: ${REPLICATE_RELATIONS.join(', ')} (повтор на одном образце — не независимое измерение).`);
         }
       }
-      if (typeof obs.id === 'string' && t !== undefined) valid.push({ index: i, id: obs.id, t, tKey: `${t.n}/${t.d}` });
+      if (typeof obs.id === 'string' && t !== undefined) { valid.push({ index: i, id: obs.id, t, tKey: `${t.n}/${t.d}`, group: replicateOf }); validByIndex.set(i, { tKey: `${t.n}/${t.d}` }); }
       // Identity is the `id` alone. The same declared origin (run AND locator) at the same temperature is only SUSPICIOUS - a repeat after a cycle, a second pass over the
       // same row of a source, two samples of one run - so it is a warning that asks for a look, never an error, and the observations are kept.
       if (t !== undefined && isNonEmptyString(obs.run) && obs.locator !== undefined && locatorOk) {
@@ -108,20 +123,16 @@ function collectPointSeries(series: Record<string, unknown>, variant: Record<str
     });
     if (units.size > 1) c.error('mixed_units', obsPath, `${obsPath}: значения заданы в разных единицах (${[...units].join(', ')}) — в серии одна единица значения (температуры могут быть в K или °C).`);
     // repeats: stored as they are, never averaged, no independence required
-    const byTemperature = new Map<string, string[]>();
-    for (const o of valid) byTemperature.set(o.tKey, [...(byTemperature.get(o.tKey) ?? []), o.id]);
+    const byTemperature = new Map<string, { id: string; group?: string }[]>();
+    for (const o of valid) { const list = byTemperature.get(o.tKey); if (list) list.push({ id: o.id, group: o.group }); else byTemperature.set(o.tKey, [{ id: o.id, group: o.group }]); }
     for (const [group, indexes] of replicateGroups) {
-      const keys = new Set(indexes.map(i => valid.find(v => v.index === i)?.tKey).filter((k): k is string => k !== undefined));
+      const keys = new Set<string>();
+      for (const i of indexes) { const v = validByIndex.get(i); if (v) keys.add(v.tKey); }
       if (keys.size > 1) c.error('invalid_replicate', obsPath, `${obsPath}: группа повторов «${group}» объединяет наблюдения при разных температурах — повторы относятся к одной температуре.`);
       if (indexes.length === 1) c.warning('invalid_replicate', obsPath, `${obsPath}: группа повторов «${group}» состоит из одного наблюдения.`);
     }
-    const undeclared = [...byTemperature.values()].filter(ids => ids.length > 1 && !(Array.isArray(points) && ids.every(id => {
-      const o = points.find((x: unknown) => isRecord(x) && x.id === id) as Record<string, unknown> | undefined;
-      const g = o && isRecord(o.replicate) ? o.replicate.group : undefined;
-      const first = (points.find((x: unknown) => isRecord(x) && x.id === ids[0]) as Record<string, unknown> | undefined);
-      return g !== undefined && isRecord(first?.replicate) && g === first.replicate.group;
-    })));
-    if (undeclared.length > 0) c.info('repeats_undeclared', obsPath, `${obsPath}: при ${undeclared.length} температур(е) несколько наблюдений без общего объявления повторов (${undeclared.slice(0, 3).map(idsText).join('; ')}); они сохраняются как есть, не усредняются и не считаются независимыми.`);
+    const undeclared = [...byTemperature.values()].filter(list => list.length > 1 && !(list[0].group !== undefined && list.every(x => x.group === list[0].group)));
+    if (undeclared.length > 0) c.info('repeats_undeclared', obsPath, `${obsPath}: при ${undeclared.length} температур(е) несколько наблюдений без общего объявления повторов (${undeclared.slice(0, 3).map(list => idsText(list.map(x => x.id))).join('; ')}); они сохраняются как есть, не усредняются и не считаются независимыми.`);
   }
 
   // ---- common conditions: the temperature is the axis, everything else is common to ALL the observations ----
@@ -137,7 +148,7 @@ function collectPointSeries(series: Record<string, unknown>, variant: Record<str
         const local = new Collector();
         const { temperature: _t, temperatureRange: _r, ...common } = cond as Record<string, unknown>;
         void _t; void _r;
-        const obs = (series.points as unknown[])[o.index] as Record<string, unknown>;
+        const obs = (points as unknown[])[o.index] as Record<string, unknown>;
         collectConditions(definition, { ...common, temperature: obs.temperature }, variant, `${path}.commonConditions`, local);
         for (const issue of local.report().issues) {
           if (issue.code === 'condition_outside_phase_range') continue;             // the phase range is judged below, with the declared phase context
@@ -161,7 +172,12 @@ function collectPointSeries(series: Record<string, unknown>, variant: Record<str
   if (!(UNCERTAINTY_SCOPES as readonly string[]).includes(series.uncertaintyScope as string)) c.error('invalid_series', `${path}.uncertaintyScope`, `${path}.uncertaintyScope: один из: ${UNCERTAINTY_SCOPES.join(', ')}.`);
   else if (series.uncertaintyScope === 'fit_coefficients' || series.uncertaintyScope === 'fit_residual') c.error('invalid_series', `${path}.uncertaintyScope`, `${path}.uncertaintyScope: для серии наблюдений допустимы per_observation и unspecified; fit_* относятся к аналитическим зависимостям.`);
   collectCorrelation(series.correlation, observationIds, `${path}.correlation`, c);
-  const status = collectProvenance(series.provenance, `${path}.provenance`, c);
+  let status: string | null = null;
+  let statuses: (string | null)[] = [];
+  if (table) {
+    const parsed = collectTableProvenance(series.tableProvenance, `${path}.tableProvenance`, c);
+    statuses = parsed.single !== undefined ? [parsed.single] : rowStatuses;
+  } else { status = collectProvenance(series.provenance, `${path}.provenance`, c); statuses = [status]; }
   if (typeof series.version !== 'number' || !Number.isInteger(series.version) || series.version < 1 || series.version > MAX_VERSION) c.error('invalid_version', `${path}.version`, `${path}.version: версия серии — целое число от 1.`);
   if (!isIsoDate(series.updatedAt)) c.error('invalid_version', `${path}.updatedAt`, `${path}.updatedAt: дата актуализации — ГГГГ-ММ-ДД.`);
   if (series.supersedes !== undefined) {
@@ -169,18 +185,19 @@ function collectPointSeries(series: Record<string, unknown>, variant: Record<str
     else if (series.supersedes === series.id) c.error('supersedes_invalid', `${path}.supersedes`, `${path}.supersedes: серия не может заменять саму себя.`);
   }
   const ns = parseMaterialId(series.id)?.namespace;
-  if (ns === 'user' && status !== null && status !== 'user_input') c.error('namespace_mismatch', `${path}.id`, `${path}.id: серия пользователя (user:) должна иметь статус user_input.`);
-  if (ns === 'ref' && status === 'user_input') c.error('namespace_mismatch', `${path}.id`, `${path}.id: справочная серия (ref:) не может иметь статус user_input — данные пользователя хранятся отдельно (user:).`);
+  if (ns === 'user' && statuses.some(x => x !== null && x !== 'user_input')) c.error('namespace_mismatch', `${path}.id`, `${path}.id: серия пользователя (user:) должна иметь статус user_input.`);
+  if (ns === 'ref' && statuses.includes('user_input')) c.error('namespace_mismatch', `${path}.id`, `${path}.id: справочная серия (ref:) не может иметь статус user_input — данные пользователя хранятся отдельно (user:).`);
 
   // ---- applicability and its relation to the observed temperatures ----
   const app = collectApplicability(series.applicability, `${path}.applicability`, c);
-  diagnose(series, app, valid, variant, filmVariant, path, c);
+  diagnose(series, app, valid, variant, filmVariant, path, c, rowsKey);
+  if (table) collectInterpolation(series.interpolation, app.events, valid.map(v => v.t), `${path}.interpolation`, c);
 }
 
 
 /** Diagnostics that relate the declared applicability to the observed temperatures and to the variant. Missing information is a warning or an information note, never a
  *  proof of stability; an observation outside a stated phase range is NOT rejected on that ground alone (its nature is unknown): it is a warning of possible incomparability. */
-function diagnose(series: Record<string, unknown>, app: ParsedApplicability, valid: { index: number; id: string; t: Rational }[], variant: Record<string, unknown> | undefined, film: boolean, path: string, c: Collector): void {
+function diagnose(series: Record<string, unknown>, app: ParsedApplicability, valid: { index: number; id: string; t: Rational }[], variant: Record<string, unknown> | undefined, film: boolean, path: string, c: Collector, rowsKey: string): void {
   const ordered = [...valid].sort((a, b) => a.index - b.index);
   const lowest = valid.length > 0 ? valid.reduce((m, o) => (exact.compare(o.t, m) < 0 ? o.t : m), valid[0].t) : undefined;
   const highest = valid.length > 0 ? valid.reduce((m, o) => (exact.compare(o.t, m) > 0 ? o.t : m), valid[0].t) : undefined;
@@ -196,7 +213,7 @@ function diagnose(series: Record<string, unknown>, app: ParsedApplicability, val
   if (app.sweep === 'heating' && downs > 0) c.error('sweep_inconsistent', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: объявлен нагрев, но в порядке измерения температура убывает (${firstDown}); порядок наблюдений не пересортировывается.`);
   if (app.sweep === 'cooling' && ups > 0) c.error('sweep_inconsistent', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: объявлено охлаждение, но в порядке измерения температура растёт (${firstUp}); порядок наблюдений не пересортировывается.`);
   if (ups > 0 && downs > 0 && (app.sweep === null || app.sweep === 'unknown')) c.warning('sweep_not_described', `${path}.applicability.sweepDirection`, `${path}.applicability.sweepDirection: порядок измерения содержит и нагрев, и охлаждение, а ход температуры не описан (укажите mixed или разметьте события) — наблюдения могут быть несопоставимы.`);
-  if (ups > 0 && downs > 0) c.warning('potential_incomparability', `${path}.points`, `${path}.points: наблюдения получены и при росте, и при убывании температуры — возможна несопоставимость (гистерезис, необратимые изменения); порядок сохранён как есть.`);
+  if (ups > 0 && downs > 0) c.warning('potential_incomparability', `${path}.${rowsKey}`, `${path}.${rowsKey}: наблюдения получены и при росте, и при убывании температуры — возможна несопоставимость (гистерезис, необратимые изменения); порядок сохранён как есть.`);
 
   // events against the observed range
   for (const e of app.events) {
@@ -247,12 +264,12 @@ export function validatePropertySeries(series: unknown, variant?: unknown): Vali
 function collectSeries(series: unknown, variant: Record<string, unknown> | undefined, path: string, c: Collector): void {
   if (!isRecord(series)) { c.error('invalid_series', path, `${path}: ожидался объект серии.`); return; }
   if (!(SERIES_KINDS as readonly string[]).includes(series.kind as string)) { c.error('invalid_series', `${path}.kind`, `${path}.kind: вид серии — один из: ${SERIES_KINDS.join(', ')}.`); return; }
-  if (series.kind !== 'points') { c.error('unsupported_series_kind', `${path}.kind`, `${path}.kind: вид «${String(series.kind)}» объявлен в контракте, но ещё не реализован; сейчас поддерживаются только серии наблюдений (points).`); return; }
-  collectPointSeries(series, variant, path, c);
+  if (series.kind !== 'points' && series.kind !== 'table') { c.error('unsupported_series_kind', `${path}.kind`, `${path}.kind: вид «${String(series.kind)}» объявлен в контракте, но ещё не реализован; сейчас поддерживаются серии наблюдений (points) и таблицы (table).`); return; }
+  collectObservationSeries(series, variant, path, c, series.kind === 'table');
 }
 
 /** A validated, deep-frozen copy. Throws MaterialsError with ALL the issues when the series is invalid. */
-export function createPropertySeries(input: PointSeries, variant?: unknown): PointSeries {
+export function createPropertySeries<T extends PointSeries | TabulatedSeries>(input: T, variant?: unknown): T {
   const report = validatePropertySeries(input, variant);
   const errors = report.issues.filter(i => i.severity === 'error');
   if (errors.length > 0) throw new MaterialsError('invalid_series', `Серия некорректна: ${errors.length} ошибок. Первая — ${errors[0].path}: ${errors[0].message}`, report.issues);

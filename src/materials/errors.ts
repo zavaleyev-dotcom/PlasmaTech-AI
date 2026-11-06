@@ -21,7 +21,7 @@ export const MATERIAL_ISSUE_CODES = Object.freeze([
   // registry (M1.3.3)
   'registry_invalid', 'supersession_fork', 'records_differ', 'invalid_query',
   // property series (M1.3.4, point series)
-  'invalid_series', 'unsupported_series_kind', 'series_property_unsupported', 'series_too_short', 'series_too_long', 'invalid_observation', 'duplicate_observation_id', 'possible_duplicate_observation',
+  'invalid_series', 'unsupported_series_kind', 'series_property_unsupported', 'series_too_short', 'series_too_long', 'invalid_observation', 'duplicate_observation_id', 'possible_duplicate_observation', 'invalid_table_provenance', 'invalid_interpolation', 'interpolation_not_evaluated', 'interpolation_across_event',
   'invalid_replicate', 'repeats_undeclared', 'mixed_units', 'invalid_correlation', 'matrix_psd_not_checked', 'invalid_applicability', 'event_contradicts_domain', 'sweep_inconsistent',
   'history_inconsistent', 'stability_not_stated', 'thermal_history_not_stated', 'sweep_direction_not_stated', 'sweep_not_described', 'interval_crosses_event', 'irreversible_change_in_domain',
   'event_effect_unknown', 'beyond_stable_range', 'phase_range_not_stated', 'potential_incomparability',

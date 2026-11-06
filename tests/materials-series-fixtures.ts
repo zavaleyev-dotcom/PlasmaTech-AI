@@ -33,3 +33,25 @@ export const alphaSeries = (conditions: Record<string, unknown>, kelvin: number[
   points: kelvin.map((t, i) => ({ id: `p${i + 1}`, temperature: q(t, 'K'), value: { type: 'scalar' as const, value: 10 + i, unit: 'ppm_K' as const }, uncertainty: { kind: 'unknown' as const } })),
   ...over,
 });
+
+// ---------- tables (M1.3.4 step 2) ----------
+import type { TabulatedSeries, TableRow } from '../src/materials';
+
+/** A synthetic row: an observation that carries its own provenance (used in `per_row` tables). */
+export const row = (id: string, kelvin: number, value: number, extra: Partial<TableRow> = {}): TableRow => ({ ...obs(id, kelvin, value), provenance: syntheticProvenance(), ...extra });
+
+export const tableSource = { citation: 'СИНТЕТИЧЕСКИЙ ИСТОЧНИК таблицы' };
+
+/** A valid `single_source` table of a synthetic conductivity: rows carry no provenance of their own. */
+export const singleTable = (over: Partial<TabulatedSeries> = {}): TabulatedSeries => ({
+  id: 'fixture:table-k-bulk', kind: 'table', variant: BULK, property: 'thermal_conductivity', commonConditions: {}, uncertaintyScope: 'per_observation',
+  applicability: { events: [], stability: { kind: 'not_stated' } }, version: 1, updatedAt: '2000-01-01',
+  tableProvenance: { mode: 'single_source', provenance: syntheticProvenance() },
+  rows: [obs('r1', 300, 1), obs('r2', 400, 2), obs('r3', 500, 3)], correlation: { kind: 'unknown' }, interpolation: { permitted: false }, ...over,
+});
+
+/** A valid `per_row` table: every row has its own provenance. */
+export const perRowTable = (over: Partial<TabulatedSeries> = {}): TabulatedSeries => singleTable({
+  tableProvenance: { mode: 'per_row', compilation: tableSource },
+  rows: [row('r1', 300, 1), row('r2', 400, 2), row('r3', 500, 3)], ...over,
+});
