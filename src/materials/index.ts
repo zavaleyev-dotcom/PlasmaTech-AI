@@ -21,3 +21,6 @@ export * from './registry-types';
 export { createMaterialPropertyRegistry } from './registry';
 export { compareRecords, describeDifferences, type RecordComparison } from './registry-differences';
 export { collectQuery, normalizedIdentifier } from './registry-query';
+export * from './series-types';
+export { validatePropertySeries, validatePropertySeriesSet, createPropertySeries } from './series';
+export { collectCorrelation, collectApplicability } from './series-parts';
