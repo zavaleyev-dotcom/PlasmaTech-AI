@@ -17,10 +17,13 @@ import type { PropertyRecord } from './property-types';
 import { validatePropertyRecords } from './property-record';
 import { validateCatalog } from './catalog';
 import { describeValidatedDifferences } from './registry-differences';
+import { collectSeriesQuery, matchSeries, primaryProvenance } from './registry-series';
+import { validatePropertySeriesSet } from './series';
+import type { PropertySeries } from './series-types';
 import { collectQuery, countNotStatingQueriedConditions, matchQuery } from './registry-query';
 import type {
   CoverageEntry, MaterialPropertyRegistry, RecordDifference, RecordMatch, RegistryCreationResult, RegistryInput, RegistryQuery, RegistryQueryResult, RegistrySnapshot,
-  RegistryValidationReport, RegistryVersion, TemperatureApplicability,
+  RegistryValidationReport, RegistryVersion, SeriesMatch, SeriesQuery, SeriesQueryResult, TemperatureApplicability,
 } from './registry-types';
 import type { MaterialVariant } from './types';
 
@@ -56,7 +59,7 @@ function caveatsOf(record: PropertyRecord, superseded: boolean): readonly string
 export function createMaterialPropertyRegistry(input: unknown): RegistryCreationResult {
   const c = new Collector();
   if (!isRecord(input)) { c.error('registry_invalid', 'registry', 'registry: ожидался объект { catalog, records, dataVersion }.'); return fail(c); }
-  checkKeys(input, ['catalog', 'records', 'dataVersion'], 'registry', c, 'registry_invalid');
+  checkKeys(input, ['catalog', 'records', 'series', 'dataVersion'], 'registry', c, 'registry_invalid');
   if (typeof input.dataVersion !== 'string' || !DATA_VERSION.test(input.dataVersion)) c.error('registry_invalid', 'registry.dataVersion', 'registry.dataVersion: версия набора данных задаётся вызывающим кодом (строка до 64 символов: буквы, цифры, «.», «_», «+», «-»); из времени она не выводится.');
 
   const seen = new Set<string>();
@@ -73,6 +76,10 @@ export function createMaterialPropertyRegistry(input: unknown): RegistryCreation
   };
   forward(validateCatalog(input.catalog).issues, 'catalog.');                          // 1. the whole catalog, by the M1.3.1 validators
   forward(validatePropertyRecords(input.records, input.catalog).issues);              // 2. the records, each against ITS variant, by the M1.3.2 validators
+
+  // 2b. the series (M1.3.4), each against ITS variant and the records: absent and [] are the same. The set validator checks the ids (one id space with the records),
+  //     the versions and `supersedes` (the same kind, variant and property, a higher version, no fork, no cycle). Any error refuses the WHOLE registry.
+  if (input.series !== undefined) forward(validatePropertySeriesSet(input.series, input.catalog, input.records).issues);
 
   // 3. the registry's own checks on the replacement history: one replacement per record (no fork) and no cycle (a record cannot descend from itself)
   if (Array.isArray(input.records)) {
@@ -93,7 +100,11 @@ export function createMaterialPropertyRegistry(input: unknown): RegistryCreation
 
   // validated: an independent, deep-frozen snapshot (later changes of the input do not reach it)
   const source = input as unknown as RegistryInput;
-  const snapshot: RegistrySnapshot = deepFreeze(structuredClone({ catalog: source.catalog, records: source.records }));
+  const hasSeries = Array.isArray(source.series) && source.series.length > 0;
+  const snapshot: RegistrySnapshot = deepFreeze(structuredClone({ catalog: source.catalog, records: source.records, ...(hasSeries ? { series: source.series } : {}) }));
+  const allSeries: readonly PropertySeries[] = [...(snapshot.series ?? [])].sort(byId);
+  const seriesSuperseded = new Set<string>(allSeries.flatMap(s => (s.supersedes ? [s.supersedes] : [])));
+  const identityOfVariant = new Map<string, string>(snapshot.catalog.variants.map(v => [v.id, v.identity]));
   const variants = new Map<string, MaterialVariant>(snapshot.catalog.variants.map(v => [v.id, v]));
   const recordsById = new Map<string, PropertyRecord>(snapshot.records.map(r => [r.id, r]));
   const supersededIds = new Set<string>(snapshot.records.flatMap(r => (r.supersedes ? [r.supersedes] : [])));
@@ -111,7 +122,9 @@ export function createMaterialPropertyRegistry(input: unknown): RegistryCreation
     dataVersion: source.dataVersion,
     variantCount: snapshot.catalog.variants.length,
     recordCount: snapshot.records.length,
-    contentFingerprint: contentFingerprint({ identities: [...snapshot.catalog.identities].sort(byId), variants: [...snapshot.catalog.variants].sort(byId), records: [...snapshot.records].sort(byId) }),
+    ...(hasSeries ? { seriesCount: allSeries.length } : {}),
+    // without series the fingerprint is that of M1.3.3, byte for byte; with series they join the canonical content (in the order of the ids)
+    contentFingerprint: contentFingerprint({ identities: [...snapshot.catalog.identities].sort(byId), variants: [...snapshot.catalog.variants].sort(byId), records: [...snapshot.records].sort(byId), ...(hasSeries ? { series: allSeries } : {}) }),
   });
 
   const find = (query: RegistryQuery): RegistryQueryResult => {
@@ -140,10 +153,38 @@ export function createMaterialPropertyRegistry(input: unknown): RegistryCreation
     return Object.freeze({ status, records: Object.freeze(found), matches: Object.freeze(matches), count: found.length, suitability: 'not_assessed' as const, differences: describeValidatedDifferences(found), ...(absence ? { absence } : {}), issues: qr.issues });
   };
 
+  const findSeries = (query: SeriesQuery): SeriesQueryResult => {
+    const qc = new Collector();
+    collectSeriesQuery(query, qc);
+    const qr = qc.report();
+    if (!qr.ok) return Object.freeze({ status: 'invalid_query' as const, series: Object.freeze([]), matches: Object.freeze([]), count: 0, total: 0, suitability: 'not_assessed' as const, issues: qr.issues });
+    const all: SeriesMatch[] = [];
+    for (const s of allSeries) {
+      if (!matchSeries(s, identityOfVariant.get(s.variant), query, seriesSuperseded.has(s.id))) continue;
+      const provenance = primaryProvenance(s);
+      const caveats: string[] = ['серия — набор данных, а не скалярное значение: значения между точками не вычисляются, лучшая серия не выбирается'];
+      if (provenance.some(p => p.verification.status === 'unverified')) caveats.push('данные не сверены с первоисточником');
+      if (s.kind === 'analytic' && s.coefficientCheck.status === 'not_checked') caveats.push('коэффициенты не проверялись');
+      if (s.kind === 'table' && s.interpolation.permitted) caveats.push('утверждение об интерполяции только сохранено: линейность зависимости не доказана, значения не вычисляются');
+      if (seriesSuperseded.has(s.id)) caveats.push('серия заменена более новой');
+      all.push(Object.freeze({
+        series: s, kind: s.kind, superseded: seriesSuperseded.has(s.id),
+        provenanceStatuses: Object.freeze([...new Set(provenance.map(p => p.status))].sort()), verificationStatuses: Object.freeze([...new Set(provenance.map(p => p.verification.status))].sort()),
+        caveats: Object.freeze(caveats.filter(x => x !== '')),
+      }));
+    }
+    const page = query.page ? all.slice(query.page.offset, query.page.offset + query.page.limit) : all;
+    const status = all.length === 0 ? 'not_available' as const : all.length === 1 ? 'unique_series' as const : 'multiple_series' as const;
+    const absence = status === 'not_available' && query.variant !== undefined && query.property !== undefined
+      ? Object.freeze({ otherCurrentSeriesOfVariantAndProperty: allSeries.filter(s => !seriesSuperseded.has(s.id) && s.variant === query.variant && s.property === query.property).length }) : undefined;
+    return Object.freeze({ status, series: Object.freeze(page.map(m => m.series)), matches: Object.freeze(page), count: page.length, total: all.length, suitability: 'not_assessed' as const, ...(absence ? { absence } : {}), issues: qr.issues });
+  };
+
   const registry: MaterialPropertyRegistry = Object.freeze({
     version, snapshot, report,
     getVariant: (id: string): MaterialVariant | undefined => variants.get(id),
     findRecords: find,
+    findSeries,
     differences: (): readonly RecordDifference[] => allDifferences,
     isSuperseded: (recordId: string): boolean => supersededIds.has(recordId),
     history: (recordId: string): readonly PropertyRecord[] | undefined => {

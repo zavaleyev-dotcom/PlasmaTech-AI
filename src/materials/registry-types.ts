@@ -10,11 +10,14 @@
 import type { Quantity } from '@/physics';
 import type { ValidationIssue } from './errors';
 import type { AggregateState, MaterialCatalog, MaterialFormKind, MaterialVariant } from './types';
+import type { PropertySeries, SeriesKind } from './series-types';
 import type { Direction, ExpansionDefinition, HeatCapacityMode, IdentifierType, PropertyConditions, PropertyRecord, SourceType, ValueStatus, VerificationStatus } from './property-types';
 
 export interface RegistryInput {
   readonly catalog: MaterialCatalog;
   readonly records: readonly PropertyRecord[];
+  /** Optional property series (M1.3.4), kept apart from the scalar records. Absent and `[]` mean the same: the registry of M1.3.3, unchanged. */
+  readonly series?: readonly PropertySeries[];
   /** The version of THIS DATA SET, chosen by the caller or by a controlled publication process (for example `2025.1`). Never derived from the clock. Required. */
   readonly dataVersion: string;
 }
@@ -23,6 +26,8 @@ export interface RegistryInput {
 export interface RegistrySnapshot {
   readonly catalog: MaterialCatalog;
   readonly records: readonly PropertyRecord[];
+  /** Present only when the registry has series (a non-empty `series` extends the snapshot; without series the snapshot is exactly that of M1.3.3). */
+  readonly series?: readonly PropertySeries[];
 }
 
 /** Four DIFFERENT versions, never mixed up:
@@ -37,6 +42,8 @@ export interface RegistryVersion {
   readonly contentFingerprint: string;
   readonly variantCount: number;
   readonly recordCount: number;
+  /** Present only when the registry has series. */
+  readonly seriesCount?: number;
 }
 
 export interface RegistryValidationReport {
@@ -150,6 +157,8 @@ export interface MaterialPropertyRegistry {
   isSuperseded(recordId: string): boolean;
   /** The replacement history of a record: the oldest record it descends from, up to the newest one that replaces it. `undefined` for an unknown record. Nothing is removed. */
   history(recordId: string): readonly PropertyRecord[] | undefined;
+  /** Search of series: the matching original series with their qualifications, never a selection among them and never an evaluation. Without series the answer is empty. */
+  findSeries(query: SeriesQuery): SeriesQueryResult;
   /** For every defined property, how many current records the variant has (0 is stated explicitly); `undefined` for an unknown variant. */
   coverage(variantId: string): readonly CoverageEntry[] | undefined;
 }
@@ -157,3 +166,56 @@ export interface MaterialPropertyRegistry {
 export type RegistryCreationResult =
   | { readonly ok: true; readonly registry: MaterialPropertyRegistry; readonly report: RegistryValidationReport }
   | { readonly ok: false; readonly registry: null; readonly report: RegistryValidationReport };
+
+// ---------- property series (M1.3.4, step 4) ----------
+
+/** Equality filters for a search of series, combined with AND. The provenance filters (`status`, `verification`, `sourceType`, `sourceIdentifier`) relate ONLY to the primary
+ *  provenance of the physical values: the provenance of a point or an analytic series, the single provenance of a `single_source` table, or - for a `per_row` table - the
+ *  provenance of a row (all the given provenance filters must hold for the SAME row). The compilation of a table, the locators of segments and coefficients and the source of
+ *  an interpolation statement are not searched. There is no temperature filter: no tolerance is applied and nothing is evaluated. Superseded series are left out unless
+ *  `includeSuperseded` is true. */
+export interface SeriesQuery {
+  /** The id of a material identity. */
+  readonly materialId?: string;
+  /** The exact id of a material variant. */
+  readonly variant?: string;
+  readonly property?: string;
+  readonly seriesKind?: SeriesKind;
+  readonly seriesId?: string;
+  /** The exact version of the series (`PropertySeries.version`). */
+  readonly version?: number;
+  readonly status?: ValueStatus;
+  readonly verification?: VerificationStatus;
+  readonly sourceType?: SourceType;
+  readonly sourceIdentifier?: { readonly type: IdentifierType; readonly value: string };
+  readonly includeSuperseded?: boolean;
+  /** An explicit page of the result, in the order of the series ids. Without it ALL the matching series are returned. */
+  readonly page?: { readonly offset: number; readonly limit: number };
+}
+
+/** What qualifies a returned series, so that nothing is hidden. */
+export interface SeriesMatch {
+  readonly series: PropertySeries;
+  readonly kind: SeriesKind;
+  readonly superseded: boolean;
+  /** The distinct value-provenance statuses and verification statuses of the primary provenance (one per row for a `per_row` table). */
+  readonly provenanceStatuses: readonly ValueStatus[];
+  readonly verificationStatuses: readonly VerificationStatus[];
+  readonly caveats: readonly string[];
+}
+
+export type SeriesQueryStatus = 'unique_series' | 'multiple_series' | 'not_available' | 'invalid_query';
+
+/** The answer to a search of series: the original (frozen) series ordered by id; a page if one was asked for. Never a selection: no series is "best". */
+export interface SeriesQueryResult {
+  readonly status: SeriesQueryStatus;
+  readonly series: readonly PropertySeries[];
+  readonly matches: readonly SeriesMatch[];
+  /** The number of series RETURNED (the page). */
+  readonly count: number;
+  /** The number of series that match, whatever the page. */
+  readonly total: number;
+  readonly suitability: 'not_assessed';
+  readonly absence?: { readonly otherCurrentSeriesOfVariantAndProperty: number };
+  readonly issues: readonly ValidationIssue[];
+}

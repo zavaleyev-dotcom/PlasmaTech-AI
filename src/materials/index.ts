@@ -24,3 +24,4 @@ export { collectQuery, normalizedIdentifier } from './registry-query';
 export * from './series-types';
 export { validatePropertySeries, validatePropertySeriesSet, createPropertySeries } from './series';
 export { collectCorrelation, collectApplicability } from './series-parts';
+export { collectSeriesQuery, primaryProvenance } from './registry-series';
