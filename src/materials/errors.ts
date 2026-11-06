@@ -18,6 +18,8 @@ export const MATERIAL_ISSUE_CODES = Object.freeze([
   'invalid_condition', 'missing_condition', 'condition_not_allowed', 'condition_state_mismatch', 'condition_outside_phase_range',
   'invalid_provenance', 'source_unidentifiable', 'missing_locator', 'missing_method', 'invalid_identifier', 'identifier_unchecked', 'verification_inconsistent', 'unverified_value',
   'invalid_uncertainty', 'zero_uncertainty', 'expanded_without_k', 'uncertainty_not_convertible',
+  // registry (M1.3.3)
+  'registry_invalid', 'supersession_fork', 'records_differ', 'invalid_query',
 ] as const);
 export type MaterialIssueCode = typeof MATERIAL_ISSUE_CODES[number];
 

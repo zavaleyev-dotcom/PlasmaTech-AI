@@ -17,3 +17,7 @@ export { collectUncertainty } from './property-uncertainty';
 export { collectProvenance, isValidIsbn, MIN_SOURCE_YEAR, MAX_SOURCE_YEAR } from './provenance';
 export { validatePropertyRecord, validatePropertyRecords, createPropertyRecord, propertyDefinitionOf } from './property-record';
 export { propertyToMeasured, propertyNominal, type NominalValue } from './property-use';
+export * from './registry-types';
+export { createMaterialPropertyRegistry } from './registry';
+export { compareRecords, describeDifferences, type RecordComparison } from './registry-differences';
+export { collectQuery, normalizedIdentifier } from './registry-query';

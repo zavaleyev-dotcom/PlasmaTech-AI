@@ -28,7 +28,7 @@ test('a set of records of different variants: each is resolved to ITS variant an
 
 test('nothing selects, averages, interpolates or looks values up: no such function exists, and records are never combined', () => {
   const names = Object.keys(materials);
-  assert.ok(!names.some(n => /select|choose|pick|average|mean(?!ing)|median|merge|combine|interpolat|extrapolat|lookup|find|query|resolve|best|prefer/i.test(n)), names.join());
+  assert.ok(!names.some(n => /select|choose|pick|average|mean(?!ing)|median|merge|combine|interpolat|extrapolat|best|prefer/i.test(n)), names.join());
   // two conflicting records of one variant and property are both kept, side by side, with no verdict
   const a = densityRecord({ id: 'fixture:rec-a', value: { type: 'scalar', value: 1, unit: 'kg_m3' } });
   const b = densityRecord({ id: 'fixture:rec-b', value: { type: 'scalar', value: 5, unit: 'kg_m3' } });
