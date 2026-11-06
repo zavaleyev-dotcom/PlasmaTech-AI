@@ -10,3 +10,10 @@ export { validateForm, checkStateForm, STATE_FORM_COMPATIBILITY, type StateFormV
 export { validateStack, flattenStack, totalThickness, MAX_STACK_DEPTH, MAX_FLAT_LAYERS, type FlatLayer } from './stack';
 export { validateIdentity, validateVariant, describeMissingData, createIdentity, createVariant, type MissingDatum } from './variant';
 export { validateCatalog, createCatalog, referencedVariantIds, variantReferences, type ReferenceRole, type VariantReference } from './catalog';
+export * from './property-types';
+export { PROPERTY_DEFINITIONS, getPropertyDefinition } from './property-definitions';
+export { collectConditions } from './conditions';
+export { collectUncertainty } from './property-uncertainty';
+export { collectProvenance, isValidIsbn, MIN_SOURCE_YEAR, MAX_SOURCE_YEAR } from './provenance';
+export { validatePropertyRecord, validatePropertyRecords, createPropertyRecord, propertyDefinitionOf } from './property-record';
+export { propertyToMeasured, propertyNominal, type NominalValue } from './property-use';

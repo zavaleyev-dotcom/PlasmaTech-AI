@@ -2,7 +2,7 @@
 
 import { assertPhysicallyValid, convert, getUnit, PhysicsError, QUANTITY_KINDS, type QuantityKind, type UnitId } from '@/physics';
 import { normalizeDoi } from '@/services/scientific-search/normalization';
-import { Collector, isRecord } from './errors';
+import { Collector, isRecord, type MaterialIssueCode } from './errors';
 
 export const isNonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 
@@ -46,6 +46,20 @@ export function checkQuantity(q: unknown, kind: QuantityKind, path: string, c: C
 }
 
 /** Unknown keys are an error: a misspelt or smuggled-in field (for example a property value) is never silently ignored. */
-export function checkKeys(value: Record<string, unknown>, allowed: readonly string[], path: string, c: Collector, code: 'invalid_composition' | 'invalid_phase' | 'invalid_structure' | 'invalid_form' | 'invalid_layer' | 'invalid_stack' | 'invalid_material' | 'invalid_interface' | 'invalid_period' | 'invalid_source' | 'invalid_quantity'): void {
+export function checkKeys(value: Record<string, unknown>, allowed: readonly string[], path: string, c: Collector, code: MaterialIssueCode): void {
   for (const key of Object.keys(value)) if (!allowed.includes(key)) c.error(code, `${path}.${key}`, `${path}: неизвестное поле «${key}» (допустимо: ${allowed.join(', ')}).`);
+}
+
+/** A calendar date YYYY-MM-DD (no clock involved: leap years by the Gregorian rule). */
+export function isIsoDate(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) return false;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (year < 1 || month < 1 || month > 12 || day < 1) return false;
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return day <= days;
 }

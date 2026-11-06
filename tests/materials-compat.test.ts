@@ -38,8 +38,19 @@ test('the package ships no data: no data directory, no JSON, no reference tables
   const fixtures = readFileSync(join(root, 'tests/materials-fixtures.ts'), 'utf8');
   assert.match(fixtures, /СИНТЕТИЧЕСК/);
   assert.match(fixtures, /NOT reference data/);
-  for (const file of files.filter(f => f.endsWith('.ts'))) {
-    const code = readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  const stripped = (file: string): string => readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  // M1.3.2 defines properties, so only the identity / composition / structure files must be free of property words ...
+  const propertyFiles = /\/(property-[a-z-]+|conditions|provenance)\.ts$/;
+  // ... and the property files must contain no NUMBER at all (outside strings and comments): definitions and validators carry no property values
+  // (provenance.ts and property-record.ts hold algorithm constants - ISBN check digits, year and version bounds - and are not part of this scan)
+  const dataFreeFiles = /\/(property-definitions|property-types|property-uncertainty|conditions)\.ts$/;
+  for (const file of files.filter(f => dataFreeFiles.test(f))) {
+    const code = stripped(file).replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '""');
+    const numbers = [...code.matchAll(/(?<![\w.])\d[\d_.eE]*/g)].map(m => m[0]).filter(n => !['0', '1', '2'].includes(n));
+    assert.deepEqual(numbers, [], `${relative(root, file)} contains numeric literals`);
+  }
+  for (const file of files.filter(f => f.endsWith('.ts') && !propertyFiles.test(f))) {
+    const code = stripped(file);
     assert.ok(!/\b(density|conductivity|resistivity|meltingPoint|specificHeat|expansionCoefficient|elasticModulus|youngModulus|atomicWeight|atomicMass)\b/i.test(code), `${relative(root, file)} mentions a property`);
   }
 });

@@ -13,6 +13,11 @@ export const MATERIAL_ISSUE_CODES = Object.freeze([
   'invalid_stack', 'duplicate_layer_id', 'invalid_layer', 'invalid_period', 'invalid_interface', 'stack_too_large',
   'missing_reference', 'reference_cycle', 'nested_coating_system',
   'missing_data', 'invalid_material', 'sum_not_exact', 'order_unknown',
+  // property records (M1.3.2)
+  'unknown_property', 'invalid_property', 'invalid_value', 'unsupported_value_form', 'invalid_version', 'namespace_mismatch', 'duplicate_record', 'supersedes_invalid',
+  'invalid_condition', 'missing_condition', 'condition_not_allowed', 'condition_state_mismatch', 'condition_outside_phase_range',
+  'invalid_provenance', 'source_unidentifiable', 'missing_locator', 'missing_method', 'invalid_identifier', 'identifier_unchecked', 'verification_inconsistent', 'unverified_value',
+  'invalid_uncertainty', 'zero_uncertainty', 'expanded_without_k', 'uncertainty_not_convertible',
 ] as const);
 export type MaterialIssueCode = typeof MATERIAL_ISSUE_CODES[number];
 
