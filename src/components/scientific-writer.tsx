@@ -1,34 +1,27 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DOCUMENT_TYPES, WRITER_MODES, LANGUAGES, DOCUMENT_TYPE_LABELS, WRITER_MODE_LABELS,
   validateInput, buildEvidenceReport, buildLocalScaffold,
   type ScientificWriterInput, type DocumentType, type WriterMode, type Language,
-  type EvidenceReport, type ScaffoldSection, type PreservationCheck,
+  type EvidenceReport, type ScaffoldSection,
 } from '@/services/workspace/scientific-writer';
 import { SimilarityCheck } from './anti-plagiarism';
 import { ReferenceManager } from './reference-manager';
 import { peekPendingReferences, clearPendingReferences } from '@/services/workspace/scifinder-import';
+import {
+  applyGenerationOutcome, createAutosave, createDraftPersistence, createGenerationGuard, defaultDraftContent, defaultDraftForm, detectDraftStore, isResultStale,
+  type Autosave, type DraftContent, type DraftForm, type DraftGenerationResult, type DraftPersistence, type GenerationOutcome, type SaveOutcome,
+} from '@/services/workspace/scientific-writer-draft-store';
 import { loadReferences, saveReferences, mergeReferencesById } from '@/services/workspace/scientific-writer-references-store';
 import type { Reference, CitationStyle, DocumentProfileId } from '@/services/workspace/references';
 
 const REWRITE_LIKE_MODES: readonly WriterMode[] = ['rewrite', 'edit', 'translate_ru_en', 'translate_en_ru'];
 
-interface FormState {
-  documentType: DocumentType; mode: WriterMode; targetLanguage: Language;
-  title: string; researchField: string; goal: string; researchObject: string;
-  methods: string; results: string; conclusions: string; keywords: string;
-  sourceText: string; additionalRequirements: string;
-}
+type FormState = DraftForm;
 
-function defaultForm(): FormState {
-  return {
-    documentType: 'article', mode: 'draft', targetLanguage: 'en',
-    title: '', researchField: '', goal: '', researchObject: '', methods: '', results: '', conclusions: '', keywords: '',
-    sourceText: '', additionalRequirements: '',
-  };
-}
+const defaultForm = defaultDraftForm;
 
 function toInput(form: FormState): ScientificWriterInput {
   const opt = (v: string) => v.trim() ? v.trim() : undefined;
@@ -44,13 +37,15 @@ function toInput(form: FormState): ScientificWriterInput {
 type GenerationState = 'idle' | 'loading' | 'done' | 'not_configured' | 'unavailable' | 'error';
 type ExportState = 'idle' | 'generating' | 'done' | 'error';
 
-interface GenerationResult {
-  generatedText: string;
-  evidence: EvidenceReport;
-  preservation: PreservationCheck | null;
-  changes: string[] | null;
-  warnings: string[];
-}
+type GenerationResult = DraftGenerationResult;
+
+/** The state of the local draft shown to the user. The draft lives only in this browser: it is not sent anywhere, not encrypted and not backed up. */
+type DraftStatus =
+  | { kind: 'loading' } | { kind: 'new' } | { kind: 'restored'; savedAt: string } | { kind: 'saved'; savedAt: string }
+  | { kind: 'unreadable' } | { kind: 'unavailable' } | { kind: 'read_failed' } | { kind: 'conflict' }
+  | { kind: 'failed'; reason: 'quota' | 'error' | 'quarantine_failed' | 'quarantine_occupied' };
+
+const timeOf = (iso: string): string => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); };
 
 export function ScientificWriter() {
   const [form, setForm] = useState<FormState>(defaultForm());
@@ -70,6 +65,76 @@ export function ScientificWriter() {
   // Guards the auto-save effect below from firing (and overwriting real saved data with an
   // empty array) before the load-on-mount effect has actually run once.
   const referencesHydrated = useRef(false);
+  // Local draft (P1 fix): the form, the structure, the result and the options are restored after navigating away, a refresh or reopening the tab.
+  const [generatedFrom, setGeneratedFrom] = useState<string | null>(null);
+  const [draftStatus, setDraftStatus] = useState<DraftStatus>({ kind: 'loading' });
+  const persistence = useRef<DraftPersistence | null>(null);
+  const autosave = useRef<Autosave | null>(null);
+  const latestContent = useRef<DraftContent>(defaultDraftContent());
+  const generationGuard = useRef(createGenerationGuard());
+  const content = useMemo<DraftContent>(() => ({ form, citationStyle, profileId, exportFormat, scaffold, evidencePreview, result, generatedFrom }),
+    [form, citationStyle, profileId, exportFormat, scaffold, evidencePreview, result, generatedFrom]);
+
+  const announce = useCallback((outcome: SaveOutcome): void => {
+    if (outcome.ok) setDraftStatus({ kind: 'saved', savedAt: outcome.savedAt });
+    else if (outcome.reason === 'unavailable') setDraftStatus({ kind: 'unavailable' });
+    else if (outcome.reason === 'quota' || outcome.reason === 'error' || outcome.reason === 'quarantine_failed' || outcome.reason === 'quarantine_occupied') setDraftStatus({ kind: 'failed', reason: outcome.reason });
+  }, []);
+
+  // Applies a successfully read draft to the screen.
+  const applyRestored = useCallback((d: Extract<ReturnType<DraftPersistence['hydrate']>, { status: 'restored' }>['draft']): void => {
+    setForm(d.form); setCitationStyle(d.citationStyle); setProfileId(d.profileId); setExportFormat(d.exportFormat);
+    setScaffold(d.scaffold); setEvidencePreview(d.evidencePreview); setResult(d.result); setGeneratedFrom(d.generatedFrom);
+    setDraftStatus({ kind: 'restored', savedAt: d.savedAt });
+  }, []);
+
+  const showLoaded = useCallback((loaded: ReturnType<DraftPersistence['hydrate']>): void => {
+    if (loaded.status === 'restored') applyRestored(loaded.draft);
+    else if (loaded.status === 'unavailable') setDraftStatus({ kind: 'unavailable' });
+    else if (loaded.status === 'read_failed') setDraftStatus({ kind: 'read_failed' });
+    else if (loaded.status === 'empty') setDraftStatus({ kind: 'new' });
+    else setDraftStatus({ kind: 'unreadable' });
+  }, [applyRestored]);
+
+  // Restore on mount (browser only: nothing touches storage during server rendering). Saving opens only after a SUCCESSFUL read of what was stored, so the initial empty
+  // values can never overwrite a saved draft, and a failed read never opens writing. On leaving (unmount, `pagehide`) whatever is still waiting is saved at once.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const p = createDraftPersistence(detectDraftStore);          // the function itself: every retry looks for the storage again
+      persistence.current = p;
+      autosave.current = createAutosave(p, announce);
+      const loaded = p.hydrate();
+      showLoaded(loaded);
+      // typing that happened while an EMPTY/unreadable draft was being read is not lost (a restored draft is never replaced by the content of the first render)
+      if (loaded.status !== 'restored') autosave.current.update(latestContent.current);
+    }, 0);
+    const leave = () => autosave.current?.flush();
+    window.addEventListener('pagehide', leave);
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener('pagehide', leave);
+      autosave.current?.flush();
+      autosave.current = null; persistence.current = null;
+    };
+  }, [announce, showLoaded]);
+
+  // Automatic saving a moment after the last change.
+  useEffect(() => {
+    latestContent.current = content;
+    autosave.current?.update(content);
+  }, [content]);
+
+  // Another attempt to read the stored draft after a failed read. If the user has already typed something, the stored draft is NOT adopted (it would replace their text); it is
+  // put aside in the backup slot before the first new save.
+  function retryRead() {
+    const p = persistence.current;
+    if (!p) return;
+    const pristine = JSON.stringify(latestContent.current) === JSON.stringify(defaultDraftContent());
+    const loaded = p.hydrate({ keepExisting: !pristine });
+    if (loaded.status === 'restored' && !pristine) { setDraftStatus({ kind: 'conflict' }); autosave.current?.update(latestContent.current); return; }
+    showLoaded(loaded);
+    if (p.isHydrated()) autosave.current?.update(latestContent.current);
+  }
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -112,18 +177,38 @@ export function ScientificWriter() {
     setForm(prev => ({ ...prev, [key]: value }));
   }
 
-  function reset() {
-    setForm(defaultForm());
-    setValidationError(''); setState('idle'); setErrorMessage(''); setScaffold(null); setEvidencePreview(null); setResult(null);
+  // Clears the DRAFT of this tool (after a confirmation): the form, the structure, the result and the options. The bibliography and the data of other tools are not touched.
+  function clearDraft() {
+    if (!window.confirm('Очистить черновик? Будут удалены введённые данные, структура и результат НаучПисателя из этого браузера. Библиография и данные других инструментов не затрагиваются. Действие нельзя отменить.')) return;
+    generationGuard.current.invalidate();                       // an answer that is still on its way must not bring the cleared draft back
+    autosave.current?.cancel();                                 // a waiting save must not write the deleted draft back
+    const outcome = persistence.current ? persistence.current.clear() : null;
+    setForm(defaultForm()); setCitationStyle('apa'); setProfileId('generic_article'); setExportFormat('docx'); setGeneratedFrom(null);
+    setValidationError(''); setState('idle'); setErrorMessage(''); setScaffold(null); setEvidencePreview(null); setResult(null); setExportState('idle'); setExportError('');
+    if (!outcome) setDraftStatus({ kind: 'unavailable' });
+    else if (outcome.ok) setDraftStatus({ kind: 'new' });
+    else if (outcome.reason === 'not_hydrated') setDraftStatus({ kind: 'read_failed' });
+    else if (outcome.reason === 'unavailable') setDraftStatus({ kind: 'unavailable' });
+    else setDraftStatus({ kind: 'failed', reason: outcome.reason });
   }
 
-  async function generate(input: ScientificWriterInput) {
+  // The shown result is replaced only by a newer SUCCESSFUL one (see applyGenerationOutcome): an error or an invalid input leaves the previous result, its structure and the
+  // snapshot it was made for exactly as they were.
+  function applyOutcome(outcome: GenerationOutcome) {
+    const next = applyGenerationOutcome({ scaffold: latestContent.current.scaffold, evidencePreview: latestContent.current.evidencePreview, result: latestContent.current.result, generatedFrom: latestContent.current.generatedFrom }, outcome);
+    setScaffold(next.scaffold); setEvidencePreview(next.evidencePreview); setResult(next.result); setGeneratedFrom(next.generatedFrom);
+  }
+
+  async function generate(input: ScientificWriterInput, snapshot: string, local: { scaffold: ScaffoldSection[] | null; evidence: EvidenceReport | null }) {
+    const token = generationGuard.current.begin();
     setState('loading');
+    const failure: GenerationOutcome = { kind: 'failure', scaffold: local.scaffold, evidencePreview: local.evidence, snapshot };
     try {
       const response = await fetch('/api/workspace/scientific-writer', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
       });
       const body = await response.json();
+      if (!generationGuard.current.isCurrent(token)) return;   // the draft was cleared or a newer request started: this answer is outdated and is not applied
       if (!response.ok) {
         // code distinguishes WHY it failed: not_configured (nothing to retry), unavailable
         // (transient - network/timeout/rate-limit/upstream outage, worth retrying), error (a
@@ -131,40 +216,45 @@ export function ScientificWriter() {
         // without a real fix). Never show the raw error/stack - only our own safe message.
         setErrorMessage(body.error ?? 'Не удалось сформировать текст.');
         setState(body.code === 'not_configured' ? 'not_configured' : body.code === 'unavailable' ? 'unavailable' : 'error');
+        applyOutcome(failure);
         return;
       }
-      setResult({ generatedText: body.generatedText, evidence: body.evidence, preservation: body.preservation, changes: body.changes, warnings: body.warnings ?? [] });
+      applyOutcome({
+        kind: 'success', snapshot, scaffold: local.scaffold, evidencePreview: local.evidence,
+        result: { generatedText: body.generatedText, evidence: body.evidence, preservation: body.preservation, changes: body.changes, warnings: body.warnings ?? [] },
+      });
       setState('done');
     } catch {
+      if (!generationGuard.current.isCurrent(token)) return;
       setErrorMessage('Не удалось связаться с сервером.');
       setState('unavailable');
+      applyOutcome(failure);
     }
   }
 
-  async function submit(event: React.FormEvent) {
-    event.preventDefault();
-    setValidationError(''); setErrorMessage(''); setResult(null); setScaffold(null); setEvidencePreview(null);
+  // One path for "Сформировать" and "Повторить". Nothing shown is cleared before the new request has finished.
+  async function start() {
+    setValidationError(''); setErrorMessage('');
     const input = toInput(form);
     try {
       validateInput(input);
     } catch (err) {
       setValidationError(err instanceof Error ? err.message : 'Некорректные данные.');
+      applyOutcome({ kind: 'invalid_input' });                // the previous result stays
       return;
     }
-
     const evidence = buildEvidenceReport(input);
-    if (!REWRITE_LIKE_MODES.includes(form.mode)) {
-      setScaffold(buildLocalScaffold(input, evidence));
-      setEvidencePreview(evidence);
-    }
+    const local = REWRITE_LIKE_MODES.includes(form.mode) ? { scaffold: null, evidence: null } : { scaffold: buildLocalScaffold(input, evidence), evidence };
+    await generate(input, JSON.stringify(form), local);
+  }
 
-    await generate(input);
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    await start();
   }
 
   async function retry() {
-    setErrorMessage('');
-    const input = toInput(form);
-    await generate(input);
+    await start();
   }
 
   async function copyResult() {
@@ -222,12 +312,35 @@ export function ScientificWriter() {
   }
 
   const isRewriteLike = REWRITE_LIKE_MODES.includes(form.mode);
+  const resultStale = isResultStale(generatedFrom, form);
   const canExport = !!(result || scaffold);
 
   return <div className="flex flex-col gap-6">
     {providerConfigured === false && <p role="status" className="content-card">
       ИИ-провайдер не настроен (нет OPENAI_API_KEY). Локальная сборка структуры из ваших данных всё равно доступна ниже - без ИИ-генерации текста.
     </p>}
+
+    <section className="content-card" role="status" aria-live="polite" data-testid="draft-status">
+      <p className="small">
+        <strong>Черновик сохраняется автоматически только в этом браузере</strong> (локально, на сервер и в сторонние сервисы не отправляется). Он не шифруется и не копируется в резерв:
+        доступен всем, кто работает в этом профиле браузера, и пропадёт при очистке данных сайта.
+      </p>
+      <p className="muted small">
+        {draftStatus.kind === 'loading' && 'Проверяю сохранённый черновик…'}
+        {draftStatus.kind === 'new' && 'Сохранённого черновика нет — изменения будут сохраняться автоматически.'}
+        {draftStatus.kind === 'restored' && `Черновик восстановлен (сохранён в ${timeOf(draftStatus.savedAt)}).`}
+        {draftStatus.kind === 'saved' && `Сохранено в ${timeOf(draftStatus.savedAt)}.`}
+        {draftStatus.kind === 'unavailable' && 'Локальное хранилище браузера недоступно: черновик пока не сохраняется и пропадёт при обновлении страницы. Введённые данные остаются на экране; если доступ был временно закрыт, можно повторить попытку.'}
+        {draftStatus.kind === 'read_failed' && 'Не удалось прочитать сохранённый черновик (возможно, временно). Сохранение приостановлено, чтобы не затереть его; ранее сохранённые данные не удалены.'}
+        {draftStatus.kind === 'conflict' && 'Найден ранее сохранённый черновик, но вы уже начали новый ввод. Он не загружен и будет перемещён в отдельную ячейку хранилища перед первым новым сохранением.'}
+        {draftStatus.kind === 'unreadable' && 'Ранее сохранённый черновик повреждён или создан другой версией и не загружен. Он будет перемещён в отдельную ячейку хранилища перед первым новым сохранением.'}
+        {draftStatus.kind === 'failed' && draftStatus.reason === 'quota' && 'Не удалось сохранить: хранилище браузера переполнено. Данные на экране не потеряны, но при закрытии страницы они пропадут; освободите место или сохраните текст отдельно.'}
+        {draftStatus.kind === 'failed' && draftStatus.reason === 'error' && 'Не удалось сохранить черновик. Данные на экране не потеряны; повторная попытка будет при следующем изменении.'}
+        {draftStatus.kind === 'failed' && draftStatus.reason === 'quarantine_occupied' && 'Резервная ячейка уже занята другим сохранённым документом, который не удаляется автоматически. Новые изменения не сохраняются, чтобы не уничтожить данные. Скопируйте нужный текст отдельно.'}
+        {draftStatus.kind === 'failed' && draftStatus.reason === 'quarantine_failed' && 'Ранее сохранённые нераспознанные данные нельзя безопасно отложить, поэтому новые изменения не сохраняются, чтобы не стереть их.'}
+      </p>
+      {(draftStatus.kind === 'read_failed' || draftStatus.kind === 'unavailable') && <button type="button" className="button secondary mt-2" onClick={retryRead}>Повторить чтение черновика</button>}
+    </section>
 
     <form onSubmit={submit} className="flex flex-col gap-6">
       <fieldset className="content-card">
@@ -280,14 +393,14 @@ export function ScientificWriter() {
 
       <div className="flex gap-2">
         <button className="button primary" disabled={state === 'loading'}>{state === 'loading' ? 'Обработка…' : 'Сформировать'}</button>
-        <button type="button" className="button secondary" onClick={reset}>Очистить</button>
+        <button type="button" className="button secondary" onClick={clearDraft}>Очистить черновик</button>
         {(result || scaffold) && <button type="button" className="button secondary" onClick={copyResult}>Копировать результат</button>}
       </div>
       {validationError && <p role="alert">{validationError}</p>}
     </form>
 
     {state === 'not_configured' && <section className="content-card">
-      <p role="alert">ИИ-генерация недоступна: OPENAI_API_KEY не настроен на сервере. Ниже показана только локальная структура, собранная из введённых вами данных - это не текст, сгенерированный ИИ.</p>
+      <p role="alert">ИИ-генерация недоступна: OPENAI_API_KEY не настроен на сервере. {result ? 'Прежний успешный результат сохранён и показан ниже.' : 'Ниже показана только локальная структура, собранная из введённых вами данных - это не текст, сгенерированный ИИ.'}</p>
     </section>}
     {state === 'unavailable' && <section className="content-card">
       <p role="alert">ИИ-провайдер временно недоступен (сеть, тайм-аут или ограничение запросов): {errorMessage}</p>
@@ -300,6 +413,7 @@ export function ScientificWriter() {
 
     {result && <section className="content-card" aria-live="polite">
       <h2>Результат (сгенерировано ИИ)</h2>
+      {resultStale && <p role="status" className="muted small">Данные формы изменены после генерации: этот результат получен для прежних данных. Нажмите «Сформировать», чтобы обновить.</p>}
       {result.warnings.length > 0 && <div role="alert" className="content-card">
         <h3>Предупреждения проверки</h3>
         <ul className="list-disc">{result.warnings.map(w => <li key={w}>{w}</li>)}</ul>
@@ -327,6 +441,7 @@ export function ScientificWriter() {
 
     {scaffold && !result && <section className="content-card" aria-live="polite">
       <h2>Локальная структура (без ИИ)</h2>
+      {resultStale && <p role="status" className="muted small">Данные формы изменены после сборки структуры: она получена для прежних данных. Нажмите «Сформировать», чтобы обновить.</p>}
       <p className="muted small">Собрано напрямую из введённых вами данных, без генерации текста.</p>
       {scaffold.map(section => <div key={section.heading} className="mt-3">
         <h3>{section.heading}</h3>
