@@ -18,6 +18,9 @@ import {
   type ScientificSearchWireQuery, type ScientificSearchWireResult,
 } from '../src/services/scientific-search/types';
 import { POST } from '../src/app/api/scifinder/search/route';
+
+// A real browser request to the local app: local Host and a JSON Content-Type (a bare `new Request` carries neither).
+const LOCAL_JSON = { host: 'localhost', 'content-type': 'application/json' };
 import { searchPublications } from '../src/services/scientific-search';
 import { ContinuationStore, MAX_CONTINUATION_SESSIONS, processContinuationStore, queryFingerprint } from '../src/services/scientific-search/continuation-store';
 
@@ -135,7 +138,7 @@ test('pipeline distinguishes source total, fetched records, duplicates and filte
 
 test('API route validates bodies and returns structured errors without making external requests', async () => {
   for (const [body, status] of [['{', 400], ['{}', 400], ['x'.repeat(17000), 413], [JSON.stringify({ query: 'PVD', source: 'unknown' }), 400]] as const) {
-    const response = await POST(new Request('http://localhost/api/scifinder/search', { method: 'POST', body }));
+    const response = await POST(new Request('http://localhost/api/scifinder/search', { method: 'POST', body, headers: LOCAL_JSON }));
     assert.equal(response.status, status);
     assert.equal(response.headers.get('cache-control'), 'no-store');
     assert.ok((await response.json()).error.message);
@@ -1039,7 +1042,7 @@ test('F20 defect 2: a continuation sent with a single-provider source is ignored
 
 test('F20 route: the API issues an httpOnly anonymous client cookie, reports an unknown token as HTTP 410, and a malformed one as HTTP 400', async () => {
   const send = (body: unknown, cookie?: string) => POST(new Request('http://localhost/api/scifinder/search', {
-    method: 'POST', body: JSON.stringify(body), headers: cookie ? { cookie } : {},
+    method: 'POST', body: JSON.stringify(body), headers: cookie ? { ...LOCAL_JSON, cookie } : LOCAL_JSON,
   }));
   const expired = await send({ query: 'x', source: 'combined', limit: 10, continuation: 'ffffffff-ffff-ffff-ffff-ffffffffffff' });
   assert.equal(expired.status, 410);
@@ -1062,12 +1065,12 @@ test('F20 route: a token saved for one cookie id cannot be used with another coo
   const token = processContinuationStore.save(state, { fingerprint: queryFingerprint(parsed), clientId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' });
   const response = await POST(new Request('http://localhost/api/scifinder/search', {
     method: 'POST', body: JSON.stringify({ query: 'routeq', source: 'combined', limit: 10, continuation: token }),
-    headers: { cookie: 'sf_ctx=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' },
+    headers: { ...LOCAL_JSON, cookie: 'sf_ctx=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' },
   }));
   assert.equal(response.status, 410);
   const mismatch = await POST(new Request('http://localhost/api/scifinder/search', {
     method: 'POST', body: JSON.stringify({ query: 'different', source: 'combined', limit: 10, continuation: token }),
-    headers: { cookie: 'sf_ctx=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+    headers: { ...LOCAL_JSON, cookie: 'sf_ctx=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
   }));
   assert.equal(mismatch.status, 409);
   assert.equal((await mismatch.json()).error.code, 'CONTINUATION_MISMATCH');
@@ -1075,7 +1078,7 @@ test('F20 route: a token saved for one cookie id cannot be used with another coo
 
 test('F20 (production remediation) OVERSIZED CONTINUATION: a huge continuation value is rejected as a controlled 413, never a 500, via the REAL POST route handler', async () => {
   const oversized = JSON.stringify({ query: 'x', source: 'combined', limit: 10, continuation: 'A'.repeat(20_000) });
-  const response = await POST(new Request('http://localhost/api/scifinder/search', { method: 'POST', body: oversized }));
+  const response = await POST(new Request('http://localhost/api/scifinder/search', { method: 'POST', body: oversized, headers: LOCAL_JSON }));
   assert.equal(response.status, 413);
   const body = await response.json();
   assert.equal(body.error.code, 'QUERY_TOO_LARGE');

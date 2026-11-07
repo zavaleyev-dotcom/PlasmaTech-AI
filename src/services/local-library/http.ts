@@ -13,3 +13,28 @@ export function isLocalLibraryRequest(request: Request) {
 export function isLocalJsonLibraryRequest(request: Request): boolean {
   return isLocalLibraryRequest(request) && !!request.headers.get('content-type')?.startsWith('application/json');
 }
+
+export type BoundedBody = { ok: true; text: string } | { ok: false; reason: 'empty' | 'too_large' };
+
+/** Reads a request body with a hard byte limit, stopping the read as soon as the limit is crossed. A declared Content-Length over the limit is refused without reading
+ *  anything, but the limit is NEVER taken on trust from the header: a missing or dishonest Content-Length (chunked or streamed bodies) is bounded by counting the bytes
+ *  actually received, and the rest of an oversized stream is cancelled unread. Nothing is parsed here. */
+export async function readBoundedBody(request: Request, maxBytes: number): Promise<BoundedBody> {
+  const declared = request.headers.get('content-length');
+  if (declared !== null && /^\d+$/.test(declared.trim()) && Number(declared) > maxBytes) {
+    await request.body?.cancel().catch(() => undefined);
+    return { ok: false, reason: 'too_large' };
+  }
+  const reader = request.body?.getReader();
+  if (!reader) return { ok: false, reason: 'empty' };
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > maxBytes) { await reader.cancel().catch(() => undefined); return { ok: false, reason: 'too_large' }; }
+    chunks.push(value);
+  }
+  return size === 0 ? { ok: false, reason: 'empty' } : { ok: true, text: Buffer.concat(chunks).toString('utf8') };
+}

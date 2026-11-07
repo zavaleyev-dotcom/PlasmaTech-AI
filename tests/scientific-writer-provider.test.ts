@@ -1,6 +1,11 @@
-import test from 'node:test';
+import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { OpenAIWriterProvider, WriterProviderError, unconfiguredWriterProvider, getWriterProvider } from '../src/services/workspace/scientific-writer-provider';
+
+import { resetAiGuardForTests } from '../src/services/ai-guard';
+
+// Every test starts with an empty AI ledger: this file builds many providers within one minute and they share the process-wide guard.
+beforeEach(() => resetAiGuardForTests());
 
 const SECRET_MARKER = 'sk-TOTALLY-SECRET-MARKER-1234567890';
 

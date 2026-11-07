@@ -1,5 +1,6 @@
 import 'server-only';
 import { SYSTEM_PROMPT, buildUserTurn } from '../prompt';
+import { getAiGuard, type AiGuard, type AiLease } from '@/services/ai-guard';
 import type { AnswerProvider, AnswerProviderInput, AnswerProviderOutput } from './types';
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -34,14 +35,23 @@ export class OpenAIAnswerProvider implements AnswerProvider {
     private readonly apiKey: string | undefined = process.env.OPENAI_API_KEY?.trim(),
     private readonly model: string = process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini',
     private readonly timeoutMs = 30_000,
+    private readonly guard: AiGuard = getAiGuard(),
   ) {}
 
   configured(): boolean {
     return !!this.apiKey;
   }
 
-  async generate({ question, context }: AnswerProviderInput): Promise<AnswerProviderOutput> {
+  async generate(input: AnswerProviderInput): Promise<AnswerProviderOutput> {
     if (!this.apiKey) throw new Error('OPENAI_API_KEY не настроен.');
+    // Local protection (rate, concurrency, token budget, output cap): an AiLimitError is thrown BEFORE anything is sent to the provider.
+    const userTurn = buildUserTurn(input.question, input.context);
+    const lease = await this.guard.acquire('rag_answer', { inputChars: SYSTEM_PROMPT.length + userTurn.length, maxOutputTokens: this.guard.config.maxOutputTokens.rag_answer });
+    try { return await this.request(userTurn, lease); }
+    catch (error) { lease.fail(true); throw error; }
+  }
+
+  private async request(userTurn: string, lease: AiLease): Promise<AnswerProviderOutput> {
     let response: Response;
     try {
       response = await this.fetcher('https://api.openai.com/v1/chat/completions', {
@@ -50,10 +60,11 @@ export class OpenAIAnswerProvider implements AnswerProvider {
         body: JSON.stringify({
           model: this.model,
           temperature: 0,
+          max_completion_tokens: lease.maxOutputTokens,
           response_format: { type: 'json_object' },
           messages: [
             { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: buildUserTurn(question, context) },
+            { role: 'user', content: userTurn },
           ],
         }),
         signal: AbortSignal.timeout(this.timeoutMs),
@@ -75,6 +86,7 @@ export class OpenAIAnswerProvider implements AnswerProvider {
     let body: Record<string, unknown>;
     try { body = asRecord(await response.json()); }
     catch { throw new Error('OpenAI вернул некорректный ответ.'); } // malformed JSON despite the declared content type
+    lease.complete(body.usage); // real usage when the provider reports it, otherwise the estimate stays booked
     const choices = body.choices;
     const content = Array.isArray(choices) ? asRecord(asRecord(choices[0]).message).content : undefined;
     if (typeof content !== 'string' || !content.trim()) throw new Error('Пустой ответ модели.');

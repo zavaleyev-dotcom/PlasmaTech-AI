@@ -8,6 +8,7 @@
 
 import 'server-only';
 import type { WriterFailureReason } from './scientific-writer-status';
+import { AiLimitError, getAiGuard, type AiGuard, type AiLease } from '@/services/ai-guard';
 
 export interface WriterGenerationRequest { system: string; user: string }
 export interface WriterGenerationResult { text: string }
@@ -46,6 +47,7 @@ export class OpenAIWriterProvider implements WriterProvider {
     private readonly apiKey: string | undefined = process.env.OPENAI_API_KEY?.trim(),
     private readonly model: string = process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini',
     private readonly timeoutMs = 60_000,
+    private readonly guard: AiGuard = getAiGuard(),
   ) {}
 
   configured(): boolean {
@@ -55,6 +57,19 @@ export class OpenAIWriterProvider implements WriterProvider {
   async generate({ system, user }: WriterGenerationRequest): Promise<WriterGenerationResult> {
     if (!this.apiKey) throw new WriterProviderError('Генерация текста не настроена: не задан OPENAI_API_KEY.', 'not_configured');
 
+    // Local protection (rate, concurrency, token budget, output cap): refused BEFORE anything is sent to the provider.
+    let lease: AiLease;
+    try { lease = await this.guard.acquire('writer', { inputChars: system.length + user.length, maxOutputTokens: this.guard.config.maxOutputTokens.writer }); }
+    catch (error) {
+      if (error instanceof AiLimitError) throw new WriterProviderError(error.message, 'unavailable', error.reason === 'budget_exhausted' || error.reason === 'output_limit' ? 'local_budget' : 'local_limit');
+      throw error;
+    }
+    try { return await this.request(system, user, lease); }
+    catch (error) { lease.fail(true); throw error; }
+  }
+
+  private async request(system: string, user: string, lease: AiLease): Promise<WriterGenerationResult> {
+
     let response: Response;
     try {
       response = await this.fetcher('https://api.openai.com/v1/chat/completions', {
@@ -63,6 +78,7 @@ export class OpenAIWriterProvider implements WriterProvider {
         body: JSON.stringify({
           model: this.model,
           temperature: 0.2,
+          max_completion_tokens: lease.maxOutputTokens,
           messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
         }),
         signal: AbortSignal.timeout(this.timeoutMs),
@@ -88,8 +104,12 @@ export class OpenAIWriterProvider implements WriterProvider {
     try { body = await response.json(); }
     catch { throw new WriterProviderError('Не удалось разобрать ответ OpenAI.', 'error', 'bad_response'); }
 
-    const text = (body as { choices?: { message?: { content?: unknown } }[] })?.choices?.[0]?.message?.content;
+    lease.complete((body as { usage?: unknown } | null)?.usage); // real usage when the provider reports it, otherwise the estimate stays booked
+    const choice = (body as { choices?: { message?: { content?: unknown }; finish_reason?: unknown }[] })?.choices?.[0];
+    const text = choice?.message?.content;
     if (typeof text !== 'string' || !text.trim()) throw new WriterProviderError('OpenAI вернул пустой ответ.', 'error', 'bad_response');
+    // The answer hit the output cap: a cut-off text must not be presented as a finished one.
+    if (choice?.finish_reason === 'length') throw new WriterProviderError('Ответ ИИ оборван лимитом длины и не принят.', 'error', 'bad_response');
     return { text };
   }
 }

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { AiLimitError } from '../src/services/ai-guard';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, realpath, writeFile, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
@@ -461,6 +462,18 @@ test('a failing answer provider is normalized to a fixed message and never leaks
   assert.ok(!(result.answer.error ?? '').includes('sk-secret-key'));
   assert.ok(!(result.answer.error ?? '').includes('internal.example'));
   assert.ok(result.citations.length >= 1);
+}));
+
+test('a local AI limit keeps status generation_error and the sources, and the message does not repeat the UI sentence about the sources', () => fixture(async (root, indexFile, store, dbFile) => {
+  await writeFile(path.join(root, 'x.pdf'), 'x');
+  await runTextIndex({ root, indexFile, store, extract: async () => ({ pageCount: 1, pages: [{ page: 1, text: 'Coating hardness result of interest for the limit test.' }] }) });
+  const provider: AnswerProvider = { id: 'fake', configured: () => true, generate: async () => { throw new AiLimitError('rate_limited', 42); } };
+  const result = await askLibrary({ question: 'coating hardness result limit test' }, { openStore: askStoreFor(dbFile), provider });
+  assert.equal(result.status, 'generation_error');
+  assert.equal(result.answer.error, 'Превышена локальная частота ИИ-запросов. Повторите через 42 с.');
+  assert.ok(!/источники/i.test(result.answer.error ?? ''), 'the "sources are shown" sentence is added once, by the UI');
+  assert.ok(result.citations.length >= 1 && result.chunks.length >= 1, 'sources are kept');
+  assert.ok(result.citations.every(c => c.relativePath && c.filename), 'the PDF link data (path, filename) is kept');
 }));
 
 // ---------- citation-eligible evidence (item 3) ----------

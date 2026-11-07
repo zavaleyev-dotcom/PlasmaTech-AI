@@ -89,7 +89,7 @@ export async function handleGenerate(raw: unknown, provider: WriterProvider): Pr
       // Tagged with `error.kind` so the client can distinguish a transient outage
       // ('unavailable', worth retrying) from a non-transient failure ('error', e.g. bad
       // credentials or a malformed/empty response - retrying the same request won't help).
-      return { status: error.kind === 'not_configured' ? 503 : 502, body: { error: error.message, code: error.kind, ...(error.reason ? { reason: error.reason } : {}) } };
+      return { status: error.kind === 'not_configured' ? 503 : error.reason === 'local_limit' || error.reason === 'local_budget' ? 429 : 502, body: { error: error.message, code: error.kind, ...(error.reason ? { reason: error.reason } : {}) } };
     }
     console.error('[scientific-writer] internal error:', error);
     return { status: 502, body: { error: 'Не удалось сформировать текст.', code: 'error', reason: 'internal' } };

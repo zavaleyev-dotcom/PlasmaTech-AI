@@ -9,7 +9,7 @@
 import { isDraftGenerationResult, type DraftGenerationResult } from './scientific-writer-draft-store';
 
 /** Why the provider (or the server's call to it) failed, as the server reports it in `reason`. */
-export const WRITER_FAILURE_REASONS = ['timeout', 'network', 'rate_limit', 'upstream', 'auth', 'rejected', 'bad_response', 'internal'] as const;
+export const WRITER_FAILURE_REASONS = ['timeout', 'network', 'rate_limit', 'upstream', 'auth', 'rejected', 'bad_response', 'internal', 'local_limit', 'local_budget'] as const;
 export type WriterFailureReason = typeof WRITER_FAILURE_REASONS[number];
 
 // ---------- the status check (GET) ----------
@@ -93,7 +93,7 @@ export function describeProviderStatus(status: ProviderStatus): string | null {
 // ---------- the generation (POST) ----------
 
 export type GenerationFailureCause =
-  | 'not_configured' | 'provider_timeout' | 'provider_network' | 'rate_limit' | 'provider_unavailable' | 'provider_auth' | 'provider_rejected' | 'bad_provider_response' | 'internal_error'
+  | 'not_configured' | 'provider_timeout' | 'provider_network' | 'rate_limit' | 'provider_unavailable' | 'provider_auth' | 'provider_rejected' | 'bad_provider_response' | 'internal_error' | 'local_limit' | 'local_budget'
   | 'invalid_request' | 'forbidden' | 'too_large' | 'server_error' | 'unexpected_answer' | 'network' | 'timeout' | 'aborted' | 'connection_lost' | 'transport';
 
 export interface GenerationFailure {
@@ -104,7 +104,7 @@ export interface GenerationFailure {
   readonly message: string;
 }
 
-const TRANSIENT: ReadonlySet<GenerationFailureCause> = new Set(['provider_timeout', 'provider_network', 'rate_limit', 'provider_unavailable', 'server_error', 'network', 'timeout', 'aborted', 'connection_lost', 'transport']);
+const TRANSIENT: ReadonlySet<GenerationFailureCause> = new Set(['local_limit', 'provider_timeout', 'provider_network', 'rate_limit', 'provider_unavailable', 'server_error', 'network', 'timeout', 'aborted', 'connection_lost', 'transport']);
 
 const MESSAGES: Record<Exclude<GenerationFailureCause, 'invalid_request' | 'server_error' | 'unexpected_answer'>, string> = {
   not_configured: 'ИИ-генерация недоступна: сервер сообщает, что ИИ-провайдер не настроен (не задан ключ OPENAI_API_KEY).',
@@ -116,6 +116,8 @@ const MESSAGES: Record<Exclude<GenerationFailureCause, 'invalid_request' | 'serv
   provider_rejected: 'ИИ-провайдер вернул ошибку при генерации текста.',
   bad_provider_response: 'Ответ ИИ-провайдера не удалось использовать (пустой или в неожиданном формате).',
   internal_error: 'Внутренняя ошибка сервера при генерации текста. Подробности записаны в журнале сервера.',
+  local_limit: 'Достигнут локальный предел ИИ-нагрузки приложения (частота запросов или число одновременных операций). Запрос к ИИ-провайдеру не отправлялся. Подождите немного и повторите.',
+  local_budget: 'Достигнут локальный бюджет ИИ-токенов приложения (настраивается на сервере). Запрос к ИИ-провайдеру не отправлялся. Повтор сразу не поможет.',
   forbidden: 'Сервер отклонил запрос как нелокальный: откройте приложение по адресу localhost.',
   too_large: 'Запрос слишком большой: сократите введённый текст.',
   network: 'Не удалось связаться с сервером (сетевая ошибка или сервер остановлен). Ваши данные на экране не потеряны.',
@@ -167,6 +169,8 @@ export function classifyGenerationResponse(httpStatus: number, body: unknown): G
     if (reason === 'timeout') return make('provider_timeout', MESSAGES.provider_timeout);
     if (reason === 'network') return make('provider_network', MESSAGES.provider_network);
     if (reason === 'rate_limit') return make('rate_limit', MESSAGES.rate_limit);
+    if (reason === 'local_limit') return make('local_limit', MESSAGES.local_limit);
+    if (reason === 'local_budget') return make('local_budget', MESSAGES.local_budget);
     return make('provider_unavailable', MESSAGES.provider_unavailable);
   }
   if (code === 'error') {

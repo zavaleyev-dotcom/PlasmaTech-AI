@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { NextResponse } from 'next/server';
+import { isLocalJsonLibraryRequest } from '@/services/local-library/http';
 import { searchPublications } from '@/services/scientific-search';
 import { ScientificSearchError } from '@/services/scientific-search/errors';
 
@@ -22,6 +23,14 @@ function readClientId(request: Request): string | undefined {
 }
 
 export async function POST(request: Request) {
+  // Same local-only predicate as every other API route (src/services/local-library/http.ts): a local Host, no foreign Origin, no cross-site fetch
+  // and a JSON Content-Type. Checked FIRST - a refused request neither reads the body, nor issues a client cookie, nor reaches a search provider.
+  if (!isLocalJsonLibraryRequest(request)) {
+    return NextResponse.json(
+      { error: { code: 'FORBIDDEN', message: 'Недопустимый локальный запрос.', retryable: false } },
+      { status: 403, headers: { 'Cache-Control': 'no-store' } },
+    );
+  }
   const existingClientId = readClientId(request);
   const clientId = existingClientId ?? randomUUID();
   const respond = (body: unknown, status: number) => {

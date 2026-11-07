@@ -1,6 +1,7 @@
 import 'server-only';
 import { validateEmbeddingVector } from '../vector';
 import type { EmbeddingProvider } from '../types';
+import { getAiGuard, type AiGuard, type AiLease, type AiOperation } from '@/services/ai-guard';
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
@@ -27,6 +28,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     model: string = process.env.EMBEDDING_MODEL?.trim() || 'text-embedding-3-small',
     dimension: number = Number(process.env.EMBEDDING_DIMENSION) || 1536,
     private readonly timeoutMs = 30_000,
+    private readonly guard: AiGuard = getAiGuard(),
   ) {
     this.model = model;
     this.dimension = dimension;
@@ -37,8 +39,16 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     return !!this.apiKey;
   }
 
-  private async request(input: string[]): Promise<Float32Array[]> {
+  private async request(input: string[], operation: AiOperation): Promise<Float32Array[]> {
     if (!this.apiKey) throw new Error('OPENAI_API_KEY не настроен.');
+    // Local protection (rate, concurrency, token budget): an AiLimitError is thrown BEFORE anything is sent to the provider.
+    // Indexing batches wait briefly for a free rate slot (they pace themselves); a question's query embedding is refused at once.
+    const lease = await this.guard.acquire(operation, { inputChars: input.reduce((sum, text) => sum + text.length, 0), waitForRateMs: operation === 'embed_documents' ? 65_000 : 0 });
+    try { return await this.send(input, lease); }
+    catch (error) { lease.fail(true); throw error; }
+  }
+
+  private async send(input: string[], lease: AiLease): Promise<Float32Array[]> {
     let response: Response;
     try {
       response = await this.fetcher('https://api.openai.com/v1/embeddings', {
@@ -59,6 +69,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     let body: Record<string, unknown>;
     try { body = asRecord(await response.json()); }
     catch { throw new Error('OpenAI вернул некорректный ответ.'); }
+    lease.complete(body.usage); // real usage when the provider reports it, otherwise the estimate stays booked
     const data = body.data;
     if (!Array.isArray(data) || data.length !== input.length) throw new Error('OpenAI вернул неполный результат.');
     // Never assume data[i] corresponds to input[i] by array position alone - match by the
@@ -99,11 +110,11 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
   async embedDocuments(texts: readonly string[]): Promise<Float32Array[]> {
     if (!texts.length) return [];
-    return this.request([...texts]);
+    return this.request([...texts], 'embed_documents');
   }
 
   async embedQuery(text: string): Promise<Float32Array> {
-    const [vector] = await this.request([text]);
+    const [vector] = await this.request([text], 'embed_query');
     return vector;
   }
 }

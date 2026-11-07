@@ -13,6 +13,7 @@ import type { VectorCache } from '@/services/embeddings/cache';
 import type { ConsistencyCache } from './consistency-cache';
 import type { AnswerResult, FusedChunk, GroundingRejectionReason, RagContext, RagDiagnostics, RagResult, RagStatus, RetrievalDiagnostics, RetrievalMode, RetrievedChunk } from './types';
 import { parseAskInput } from './validation';
+import { AiLimitError } from '@/services/ai-guard';
 
 export interface AskLibraryOptions {
   /** Injected for tests; defaults to the real on-disk store via openTextStore(). */
@@ -97,6 +98,8 @@ async function generateAnswer(question: string, context: RagContext, provider: A
   let output: Awaited<ReturnType<AnswerProvider['generate']>>;
   try { output = await provider.generate({ question, context }); }
   catch (error) {
+    // A local AI limit (rate / concurrency / budget): nothing was sent to the provider; the fixed limit sentence is safe to show.
+    if (error instanceof AiLimitError) return { answer: emptyAnswer(true, error.message), status: 'generation_error', rejectedReason: null };
     console.error('[rag] answer provider failed', error);
     return { answer: emptyAnswer(true, GENERATION_ERROR_MESSAGE), status: 'generation_error', rejectedReason: null };
   }
