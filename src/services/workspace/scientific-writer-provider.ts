@@ -7,6 +7,7 @@
  *  pretending text was AI-generated when it wasn't. */
 
 import 'server-only';
+import type { WriterFailureReason } from './scientific-writer-status';
 
 export interface WriterGenerationRequest { system: string; user: string }
 export interface WriterGenerationResult { text: string }
@@ -26,10 +27,14 @@ export type WriterProviderErrorKind = 'not_configured' | 'unavailable' | 'error'
 
 export class WriterProviderError extends Error {
   readonly kind: WriterProviderErrorKind;
-  constructor(message: string, kind: WriterProviderErrorKind) {
+  /** The cause when it is known (a timeout, the network, a rate limit, an upstream failure, bad credentials, a rejected request, an unusable answer): sent to the client next
+   *  to `code` so that the screen can say WHAT happened instead of one generic text. Never contains a key or a detail of the server. */
+  readonly reason?: WriterFailureReason;
+  constructor(message: string, kind: WriterProviderErrorKind, reason?: WriterFailureReason) {
     super(message);
     this.name = 'WriterProviderError';
     this.kind = kind;
+    this.reason = reason;
   }
 }
 
@@ -63,28 +68,28 @@ export class OpenAIWriterProvider implements WriterProvider {
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (error) {
-      if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) throw new WriterProviderError('OpenAI не ответил вовремя.', 'unavailable');
-      throw new WriterProviderError('Не удалось связаться с OpenAI.', 'unavailable');
+      if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) throw new WriterProviderError('OpenAI не ответил вовремя.', 'unavailable', 'timeout');
+      throw new WriterProviderError('Не удалось связаться с OpenAI.', 'unavailable', 'network');
     }
 
     if (!response.ok) {
       // 401/403: the credential itself is bad - not transient, retrying won't help without a fix.
-      if (response.status === 401 || response.status === 403) throw new WriterProviderError('OpenAI отклонил доступ - проверьте OPENAI_API_KEY.', 'error');
+      if (response.status === 401 || response.status === 403) throw new WriterProviderError('OpenAI отклонил доступ - проверьте OPENAI_API_KEY.', 'error', 'auth');
       // 429 and any 5xx: rate limit / upstream outage - both are transient, worth retrying later.
-      if (response.status === 429) throw new WriterProviderError('OpenAI: превышен лимит запросов, попробуйте позже.', 'unavailable');
-      if (response.status >= 500) throw new WriterProviderError('OpenAI временно недоступен, попробуйте позже.', 'unavailable');
-      throw new WriterProviderError('OpenAI вернул ошибку при генерации текста.', 'error');
+      if (response.status === 429) throw new WriterProviderError('OpenAI: превышен лимит запросов, попробуйте позже.', 'unavailable', 'rate_limit');
+      if (response.status >= 500) throw new WriterProviderError('OpenAI временно недоступен, попробуйте позже.', 'unavailable', 'upstream');
+      throw new WriterProviderError('OpenAI вернул ошибку при генерации текста.', 'error', 'rejected');
     }
 
     const contentType = response.headers.get('content-type') ?? '';
-    if (!/^application\/json\b/i.test(contentType)) throw new WriterProviderError('OpenAI вернул неожиданный формат ответа.', 'error');
+    if (!/^application\/json\b/i.test(contentType)) throw new WriterProviderError('OpenAI вернул неожиданный формат ответа.', 'error', 'bad_response');
 
     let body: unknown;
     try { body = await response.json(); }
-    catch { throw new WriterProviderError('Не удалось разобрать ответ OpenAI.', 'error'); }
+    catch { throw new WriterProviderError('Не удалось разобрать ответ OpenAI.', 'error', 'bad_response'); }
 
     const text = (body as { choices?: { message?: { content?: unknown } }[] })?.choices?.[0]?.message?.content;
-    if (typeof text !== 'string' || !text.trim()) throw new WriterProviderError('OpenAI вернул пустой ответ.', 'error');
+    if (typeof text !== 'string' || !text.trim()) throw new WriterProviderError('OpenAI вернул пустой ответ.', 'error', 'bad_response');
     return { text };
   }
 }

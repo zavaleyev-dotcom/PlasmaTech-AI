@@ -7,6 +7,9 @@ import {
   type ScientificWriterInput, type DocumentType, type WriterMode, type Language,
   type EvidenceReport, type ScaffoldSection,
 } from '@/services/workspace/scientific-writer';
+import {
+  checkProviderStatus, classifyBodyReadFailure, classifyGenerationException, classifyGenerationResponse, classifyUnexpectedSuccess, describeProviderStatus, parseGenerationBody, readResponseBody, type ProviderStatus,
+} from '@/services/workspace/scientific-writer-status';
 import { SimilarityCheck } from './anti-plagiarism';
 import { ReferenceManager } from './reference-manager';
 import { peekPendingReferences, clearPendingReferences } from '@/services/workspace/scifinder-import';
@@ -49,7 +52,8 @@ const timeOf = (iso: string): string => { const d = new Date(iso); return Number
 
 export function ScientificWriter() {
   const [form, setForm] = useState<FormState>(defaultForm());
-  const [providerConfigured, setProviderConfigured] = useState<boolean | null>(null);
+  // What is KNOWN about the AI provider: configured / not configured (only when the server said so) / the check itself failed (and why).
+  const [providerStatus, setProviderStatus] = useState<ProviderStatus>({ kind: 'checking' });
   const [validationError, setValidationError] = useState('');
   const [state, setState] = useState<GenerationState>('idle');
   const [errorMessage, setErrorMessage] = useState('');
@@ -136,12 +140,15 @@ export function ScientificWriter() {
     if (p.isHydrated()) autosave.current?.update(latestContent.current);
   }
 
-  useEffect(() => {
-    const t = setTimeout(() => {
-      fetch('/api/workspace/scientific-writer').then(r => r.json()).then(body => setProviderConfigured(!!body.configured)).catch(() => setProviderConfigured(false));
-    }, 0);
-    return () => clearTimeout(t);
+  const runStatusCheck = useCallback((): void => {
+    setProviderStatus({ kind: 'checking' });
+    void checkProviderStatus().then(setProviderStatus);
   }, []);
+
+  useEffect(() => {
+    const t = setTimeout(runStatusCheck, 0);
+    return () => clearTimeout(t);
+  }, [runStatusCheck]);
 
   // F02 fix: references (manual AND SciFinder-imported) now live in Scientific Writer's own
   // durable local store, not only in React state - so they survive unmount/remount. On mount:
@@ -203,33 +210,27 @@ export function ScientificWriter() {
     const token = generationGuard.current.begin();
     setState('loading');
     const failure: GenerationOutcome = { kind: 'failure', scaffold: local.scaffold, evidencePreview: local.evidence, snapshot };
+    const fail = (f: { state: 'not_configured' | 'unavailable' | 'error'; message: string }) => { setErrorMessage(f.message); setState(f.state); applyOutcome(failure); };
+    let response: Response;
     try {
-      const response = await fetch('/api/workspace/scientific-writer', {
+      response = await fetch('/api/workspace/scientific-writer', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
       });
-      const body = await response.json();
-      if (!generationGuard.current.isCurrent(token)) return;   // the draft was cleared or a newer request started: this answer is outdated and is not applied
-      if (!response.ok) {
-        // code distinguishes WHY it failed: not_configured (nothing to retry), unavailable
-        // (transient - network/timeout/rate-limit/upstream outage, worth retrying), error (a
-        // response came back but was rejected - e.g. bad credentials - retrying won't help
-        // without a real fix). Never show the raw error/stack - only our own safe message.
-        setErrorMessage(body.error ?? 'Не удалось сформировать текст.');
-        setState(body.code === 'not_configured' ? 'not_configured' : body.code === 'unavailable' ? 'unavailable' : 'error');
-        applyOutcome(failure);
-        return;
-      }
-      applyOutcome({
-        kind: 'success', snapshot, scaffold: local.scaffold, evidencePreview: local.evidence,
-        result: { generatedText: body.generatedText, evidence: body.evidence, preservation: body.preservation, changes: body.changes, warnings: body.warnings ?? [] },
-      });
-      setState('done');
-    } catch {
+    } catch (error) {
       if (!generationGuard.current.isCurrent(token)) return;
-      setErrorMessage('Не удалось связаться с сервером.');
-      setState('unavailable');
-      applyOutcome(failure);
+      fail(classifyGenerationException(error));                 // no answer at all: the network, a stopped server, a timeout - said as exactly that
+      return;
     }
+    const read = await readResponseBody(response);               // an error page is "not JSON"; a timeout or a dropped connection while reading is neither "bad JSON" nor "no connection"
+    if (!generationGuard.current.isCurrent(token)) return;       // the draft was cleared or a newer request started: this answer is outdated and is not applied
+    if (read.kind === 'read_failed') { fail(classifyBodyReadFailure(read.failure)); return; }
+    const body = read.kind === 'json' ? read.value : undefined;
+    if (!response.ok) { fail(classifyGenerationResponse(response.status, body)); return; }
+    // A successful answer is applied only if it is complete and well-formed as a whole; otherwise nothing of it is used and the previous result stays untouched.
+    const parsed = parseGenerationBody(body);
+    if (!parsed) { fail(classifyUnexpectedSuccess()); return; }
+    applyOutcome({ kind: 'success', snapshot, scaffold: local.scaffold, evidencePreview: local.evidence, result: parsed });
+    setState('done');
   }
 
   // One path for "Сформировать" and "Повторить". Nothing shown is cleared before the new request has finished.
@@ -316,9 +317,10 @@ export function ScientificWriter() {
   const canExport = !!(result || scaffold);
 
   return <div className="flex flex-col gap-6">
-    {providerConfigured === false && <p role="status" className="content-card">
-      ИИ-провайдер не настроен (нет OPENAI_API_KEY). Локальная сборка структуры из ваших данных всё равно доступна ниже - без ИИ-генерации текста.
-    </p>}
+    {describeProviderStatus(providerStatus) !== null && <div role="status" className="content-card" data-testid="provider-status">
+      <p>{describeProviderStatus(providerStatus)}</p>
+      {providerStatus.kind === 'check_failed' && <button type="button" className="button secondary mt-2" onClick={runStatusCheck}>Проверить снова</button>}
+    </div>}
 
     <section className="content-card" role="status" aria-live="polite" data-testid="draft-status">
       <p className="small">
@@ -400,14 +402,14 @@ export function ScientificWriter() {
     </form>
 
     {state === 'not_configured' && <section className="content-card">
-      <p role="alert">ИИ-генерация недоступна: OPENAI_API_KEY не настроен на сервере. {result ? 'Прежний успешный результат сохранён и показан ниже.' : 'Ниже показана только локальная структура, собранная из введённых вами данных - это не текст, сгенерированный ИИ.'}</p>
+      <p role="alert">{errorMessage} {result ? 'Прежний успешный результат сохранён и показан ниже.' : 'Ниже показана только локальная структура, собранная из введённых вами данных - это не текст, сгенерированный ИИ.'}</p>
     </section>}
     {state === 'unavailable' && <section className="content-card">
-      <p role="alert">ИИ-провайдер временно недоступен (сеть, тайм-аут или ограничение запросов): {errorMessage}</p>
+      <p role="alert">{errorMessage}</p>
       <button type="button" className="button secondary mt-2" onClick={retry}>Повторить</button>
     </section>}
     {state === 'error' && <section className="content-card">
-      <p role="alert">Ошибка генерации: {errorMessage}</p>
+      <p role="alert">{errorMessage}</p>
       <button type="button" className="button secondary mt-2" onClick={retry}>Повторить</button>
     </section>}
 

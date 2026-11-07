@@ -110,6 +110,9 @@ const isScaffold = (v: unknown): v is ScaffoldSection[] => Array.isArray(v) && v
 const isResult = (v: unknown): v is DraftGenerationResult => isObject(v) && typeof v.generatedText === 'string' && isEvidence(v.evidence)
   && (v.preservation === null || isPreservation(v.preservation)) && (v.changes === null || isStringArray(v.changes)) && isStringArray(v.warnings);
 
+/** The same complete check is used for the answer of the generation API (see scientific-writer-status.ts), so what is accepted from the server is exactly what a saved draft may hold. */
+export { isResult as isDraftGenerationResult };
+
 /** The draft in a stored value, or `null` if the value is not a complete, valid draft of THIS version. Never throws, never returns part of a draft. */
 export function parseDraft(raw: unknown): WriterDraft | null {
   if (!isObject(raw) || raw.version !== DRAFT_VERSION) return null;
