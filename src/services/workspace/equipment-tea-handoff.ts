@@ -66,3 +66,50 @@ export function createInMemoryStoreForTests(): KeyValueStore {
     removeItem: key => { data.delete(key); },
   };
 }
+
+// ---------- delivery that is confirmed before the queue entry is removed (used by Techno-Economic Assessment) ----------
+//
+// `consumePendingEquipmentHandoff` above reads AND removes in one step, which loses the configuration if the project it was applied to cannot be saved. TEA uses these two
+// instead: it READS the pending entry (`peek`), applies it to its project, and asks to remove it (`acknowledge`) only after that project has been written for certain. The
+// entry is identified by its configuration and its `importedAt`; an entry that is already part of the saved project is therefore never applied a second time, and a newer
+// hand-over queued meanwhile is never removed by the confirmation of an older one. No new queue is introduced: the same single slot and key are used.
+
+/** True when both records are the same hand-over (the same configuration queued at the same moment). */
+export function isSameHandoff(a: EquipmentTeaHandoffRecord | null | undefined, b: EquipmentTeaHandoffRecord | null | undefined): boolean {
+  return !!a && !!b && a.importedAt === b.importedAt && a.handoff.configurationId === b.handoff.configurationId;
+}
+
+/** The storage for READING: working reads are enough (a full storage refuses writes but still holds the entry). */
+function detectReadableStorage(): KeyValueStore | null {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    localStorage.getItem(STORAGE_KEY);
+    return localStorage;
+  } catch { return null; }
+}
+
+/** The pending hand-over, WITHOUT removing it. `null` if there is none, the storage cannot be read or the entry is damaged (a damaged entry is left in place). */
+export function peekPendingEquipmentHandoff(store: KeyValueStore | null = detectReadableStorage()): EquipmentTeaHandoffRecord | null {
+  if (!store) return null;
+  try {
+    const raw = store.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    return isHandoffRecord(parsed) ? parsed : null;
+  } catch { return null; }
+}
+
+/** Removes the pending entry if, and only if, it is still THIS hand-over. Returns whether the queue no longer holds it (already gone counts as done); a failed removal
+ *  returns false and leaves the entry, so that the next opening can try again without applying it destructively a second time. */
+export function acknowledgeEquipmentHandoff(record: EquipmentTeaHandoffRecord, store: KeyValueStore | null = detectReadableStorage()): boolean {
+  if (!store) return false;
+  try {
+    const raw = store.getItem(STORAGE_KEY);
+    if (!raw) return true;
+    const parsed: unknown = JSON.parse(raw);
+    if (isHandoffRecord(parsed) && !isSameHandoff(parsed, record)) return true;       // a newer hand-over is waiting: it is not ours to remove, ours is already gone
+    if (!isHandoffRecord(parsed)) return false;                                       // damaged: left for the user's next hand-over to overwrite
+    store.removeItem(STORAGE_KEY);
+    return store.getItem(STORAGE_KEY) === null;
+  } catch { return false; }
+}

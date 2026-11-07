@@ -1,40 +1,25 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   formatCurrency, runAssessment,
   type AssessmentInput, type AssessmentResult, type Currency, type EconomicEffectMode, type OpexPeriod,
 } from '@/services/workspace/techno-economic-assessment';
-import { consumePendingEquipmentHandoff, type EquipmentTeaHandoffRecord } from '@/services/workspace/equipment-tea-handoff';
+import { acknowledgeEquipmentHandoff, peekPendingEquipmentHandoff, type EquipmentTeaHandoffRecord } from '@/services/workspace/equipment-tea-handoff';
+import {
+  TEA_PROJECT_CONFIG, applyHandoffToProject, confirmHandoffDelivery, planHandoffDelivery, defaultTeaForm, defaultTeaProject, defaultTeaScenarioForms, isCalculationStale, recomputeResults, shownResultContext, teaFormToInput,
+  type CalculatedFrom, type TeaFormState, type TeaProjectContent,
+} from '@/services/workspace/tea-project-store';
+import {
+  createAutosave, createProjectPersistence, detectProjectStore, type Autosave, type ProjectPersistence, type ProjectLoadResult, type SaveOutcome,
+} from '@/services/workspace/local-project-persistence';
 import { SCENARIO_KEYS, SCENARIO_LABELS, reportRequestBody, CURRENCY_NAMES, type ScenarioKey, type ReportVariant, type TeaReportRequest } from '@/services/workspace/techno-economic-report';
 
-// ---------- raw (string) form state - converted to numbers only at calculation time ----------
+// ---------- raw (string) form state - converted to numbers only at calculation time (the type and the defaults live with the saved project) ----------
 
-interface FormState {
-  title: string;
-  capex: Record<'equipment' | 'delivery' | 'customsLogistics' | 'installation' | 'commissioning' | 'training' | 'infrastructure' | 'tooling' | 'otherOneTime', string>;
-  opexPeriod: OpexPeriod;
-  opex: Record<'electricity' | 'processGases' | 'consumables' | 'targetsCathodes' | 'reagents' | 'maintenance' | 'repairs' | 'labor' | 'facilities' | 'disposal' | 'otherOperating', string>;
-  capacity: Record<'shiftsPerDay' | 'hoursPerShift' | 'workingDaysPerYear' | 'utilizationPercent' | 'cycleTimeMinutes' | 'unitsPerCycle', string>;
-  depreciationYears: string;
-  effectMode: EconomicEffectMode;
-  currentUnitCost: string; newUnitCost: string;
-  currentAnnualCost: string; newAnnualCost: string;
-}
-
-function defaultForm(): FormState {
-  return {
-    title: '',
-    capex: { equipment: '', delivery: '', customsLogistics: '', installation: '', commissioning: '', training: '', infrastructure: '', tooling: '', otherOneTime: '' },
-    opexPeriod: 'year',
-    opex: { electricity: '', processGases: '', consumables: '', targetsCathodes: '', reagents: '', maintenance: '', repairs: '', labor: '', facilities: '', disposal: '', otherOperating: '' },
-    capacity: { shiftsPerDay: '2', hoursPerShift: '8', workingDaysPerYear: '250', utilizationPercent: '80', cycleTimeMinutes: '20', unitsPerCycle: '1' },
-    depreciationYears: '',
-    effectMode: 'total_external_cost',
-    currentUnitCost: '', newUnitCost: '',
-    currentAnnualCost: '', newAnnualCost: '',
-  };
-}
+type FormState = TeaFormState;
+const defaultForm = defaultTeaForm;
+const toAssessmentInput = teaFormToInput;
 
 // ---------- 3-scenario analysis (Base / Conservative / Optimistic) - same engine, same form
 // shape as Variant A/B above; the user must explicitly set each scenario's own numbers, nothing
@@ -44,36 +29,7 @@ export { SCENARIO_KEYS, SCENARIO_LABELS };
 export type { ScenarioKey };
 
 export function defaultScenarioForms(): Record<ScenarioKey, FormState> {
-  return { base: defaultForm(), conservative: defaultForm(), optimistic: defaultForm() };
-}
-
-const num = (v: string): number | undefined => (v.trim() === '' ? undefined : Number(v));
-
-function toAssessmentInput(form: FormState): AssessmentInput {
-  return {
-    capex: {
-      equipment: Number(form.capex.equipment),
-      delivery: num(form.capex.delivery), customsLogistics: num(form.capex.customsLogistics), installation: num(form.capex.installation),
-      commissioning: num(form.capex.commissioning), training: num(form.capex.training), infrastructure: num(form.capex.infrastructure),
-      tooling: num(form.capex.tooling), otherOneTime: num(form.capex.otherOneTime),
-    },
-    opex: {
-      period: form.opexPeriod,
-      electricity: num(form.opex.electricity), processGases: num(form.opex.processGases), consumables: num(form.opex.consumables),
-      targetsCathodes: num(form.opex.targetsCathodes), reagents: num(form.opex.reagents), maintenance: num(form.opex.maintenance),
-      repairs: num(form.opex.repairs), labor: num(form.opex.labor), facilities: num(form.opex.facilities),
-      disposal: num(form.opex.disposal), otherOperating: num(form.opex.otherOperating),
-    },
-    capacity: {
-      shiftsPerDay: Number(form.capacity.shiftsPerDay), hoursPerShift: Number(form.capacity.hoursPerShift),
-      workingDaysPerYear: Number(form.capacity.workingDaysPerYear), utilizationPercent: Number(form.capacity.utilizationPercent),
-      cycleTimeMinutes: Number(form.capacity.cycleTimeMinutes), unitsPerCycle: Number(form.capacity.unitsPerCycle),
-    },
-    depreciationYears: num(form.depreciationYears),
-    economicEffect: form.effectMode === 'unit_cost'
-      ? { mode: 'unit_cost', currentUnitCost: num(form.currentUnitCost), newUnitCost: num(form.newUnitCost) }
-      : { mode: 'total_external_cost', currentAnnualCost: num(form.currentAnnualCost), newAnnualCost: num(form.newAnnualCost) },
-  };
+  return defaultTeaScenarioForms();
 }
 
 function NumberField({ label, value, onChange, min }: { label: string; value: string; onChange: (v: string) => void; min?: number }) {
@@ -289,6 +245,15 @@ function FormulasDisclosure({ result }: { result: AssessmentResult }) {
   </details>;
 }
 
+/** The state of the local project shown to the user. It lives only in this browser: not sent anywhere, not encrypted, not backed up. */
+type ProjectStatus =
+  | { kind: 'loading' } | { kind: 'new' } | { kind: 'restored'; savedAt: string } | { kind: 'saved'; savedAt: string }
+  | { kind: 'unreadable' } | { kind: 'unavailable' } | { kind: 'read_failed' } | { kind: 'conflict' }
+  | { kind: 'failed'; reason: 'quota' | 'error' | 'quarantine_failed' | 'quarantine_occupied' }
+  | { kind: 'invalid'; problem: string };
+
+const timeOf = (iso: string): string => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); };
+
 export function TechnoEconomicAssessment() {
   const [formA, setFormA] = useState<FormState>(defaultForm());
   const [formB, setFormB] = useState<FormState>(defaultForm());
@@ -302,28 +267,118 @@ export function TechnoEconomicAssessment() {
   const [scenarioForms, setScenarioForms] = useState<Record<ScenarioKey, FormState>>(defaultScenarioForms());
   const [scenarioResults, setScenarioResults] = useState<Record<ScenarioKey, AssessmentResult | null>>({ base: null, conservative: null, optimistic: null });
   const [reportSnapshot, setReportSnapshot] = useState<ReportSnapshot | null>(null);
+  const [calculatedFrom, setCalculatedFrom] = useState<CalculatedFrom | null>(null);
+  const [projectStatus, setProjectStatus] = useState<ProjectStatus>({ kind: 'loading' });
+  const persistence = useRef<ProjectPersistence<TeaProjectContent> | null>(null);
+  const autosave = useRef<Autosave<TeaProjectContent> | null>(null);
+  const latestProject = useRef<TeaProjectContent>(defaultTeaProject());
+  // What is saved: the INPUTS and settings. The results are derived and are calculated again from the stored inputs of the last calculation when the project is restored.
+  const project = useMemo<TeaProjectContent>(() => ({
+    formA, formB, compareB, currency, scenariosEnabled, scenarioForms, handoff: importedHandoff, calculation: reportSnapshot, calculatedFrom,
+  }), [formA, formB, compareB, currency, scenariosEnabled, scenarioForms, importedHandoff, reportSnapshot, calculatedFrom]);
+
+  // A hand-over from Equipment Selector that was applied to the screen but is not yet CONFIRMED saved: it stays in the queue until a write that contains it succeeds.
+  const pendingHandoff = useRef<EquipmentTeaHandoffRecord | null>(null);
+
+  const announce = useCallback((outcome: SaveOutcome, saved: TeaProjectContent): void => {
+    if (outcome.ok) {
+      setProjectStatus({ kind: 'saved', savedAt: outcome.savedAt });
+      // the project that contains the hand-over is now written: only now is it removed from the queue (a failed removal is retried by the next successful save or opening)
+      pendingHandoff.current = confirmHandoffDelivery(pendingHandoff.current, saved, record => acknowledgeEquipmentHandoff(record));
+    }
+    else if (outcome.reason === 'unavailable') setProjectStatus({ kind: 'unavailable' });
+    else if (outcome.reason === 'invalid') setProjectStatus({ kind: 'invalid', problem: outcome.problem ?? 'проект не проходит проверку' });
+    else if (outcome.reason === 'quota' || outcome.reason === 'error' || outcome.reason === 'quarantine_failed' || outcome.reason === 'quarantine_occupied') setProjectStatus({ kind: 'failed', reason: outcome.reason });
+  }, []);
+
+  // Shows a successfully read project: the inputs as they were, the results calculated again from the stored inputs of the last calculation.
+  const applyProject = useCallback((c: TeaProjectContent, savedAt: string): void => {
+    setFormA(c.formA); setFormB(c.formB); setCompareB(c.compareB); setCurrency(c.currency); setScenariosEnabled(c.scenariosEnabled); setScenarioForms(c.scenarioForms);
+    setImportedHandoff(c.handoff); setReportSnapshot(c.calculation); setCalculatedFrom(c.calculatedFrom);
+    const again = c.calculation ? recomputeResults(c.calculation) : null;
+    setResultA(again?.resultA ?? null); setResultB(again?.resultB ?? null); setScenarioResults(again?.scenarioResults ?? { base: null, conservative: null, optimistic: null });
+    setProjectStatus({ kind: 'restored', savedAt });
+  }, []);
+
+  const showLoaded = useCallback((loaded: ProjectLoadResult<TeaProjectContent>): void => {
+    if (loaded.status === 'restored') applyProject(loaded.project.content, loaded.project.savedAt);
+    else if (loaded.status === 'unavailable') setProjectStatus({ kind: 'unavailable' });
+    else if (loaded.status === 'read_failed') setProjectStatus({ kind: 'read_failed' });
+    else if (loaded.status === 'empty') setProjectStatus({ kind: 'new' });
+    else setProjectStatus({ kind: 'unreadable' });
+  }, [applyProject]);
+
+  // Restore on mount (browser only), THEN pick up a pending Equipment Selector hand-over. Saving opens only after a successful read of the stored project, so the empty
+  // initial form can never overwrite a saved one. Leaving the page (unmount, `pagehide`) saves whatever is still waiting.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const p = createProjectPersistence(TEA_PROJECT_CONFIG, detectProjectStore);
+      persistence.current = p;
+      autosave.current = createAutosave(p, announce);
+      const loaded = p.hydrate();
+      showLoaded(loaded);
+      if (loaded.status !== 'restored') autosave.current.update(latestProject.current);
+      // The hand-over is READ, not removed. If the restored project already contains this very hand-over (it was saved earlier but the queue entry could not be removed),
+      // it is not applied again - only the removal is retried. Otherwise it is applied on top of the restored project and removed after that project is safely saved.
+      const record = peekPendingEquipmentHandoff();
+      const plan = planHandoffDelivery(loaded.status === 'restored' ? loaded.project.content.handoff : null, record);
+      if (record && plan === 'already_saved') acknowledgeEquipmentHandoff(record);
+      else if (record && plan === 'apply') {
+        pendingHandoff.current = record;
+        const next = applyHandoffToProject(latestProject.current, record);      // only the card and the descriptive title of variant A
+        setImportedHandoff(next.handoff);
+        setFormA(prev => ({ ...prev, title: next.formA.title }));
+      }
+    }, 0);
+    const leave = () => autosave.current?.flush();
+    window.addEventListener('pagehide', leave);
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener('pagehide', leave);
+      autosave.current?.flush();
+      autosave.current = null; persistence.current = null;
+    };
+  }, [announce, showLoaded]);
+
+  useEffect(() => {
+    latestProject.current = project;
+    autosave.current?.update(project);
+  }, [project]);
+
+  // Another attempt to read the stored project after a failed read (explicit action only). If the user has already entered something, the stored project is NOT adopted
+  // (it would replace their input); it is put aside in the backup slot before the first new save.
+  function retryRead() {
+    const p = persistence.current;
+    if (!p) return;
+    const pristine = JSON.stringify(latestProject.current) === JSON.stringify(defaultTeaProject());
+    const loaded = p.hydrate({ keepExisting: !pristine });
+    if (loaded.status === 'restored' && !pristine) { setProjectStatus({ kind: 'conflict' }); autosave.current?.update(latestProject.current); return; }
+    showLoaded(loaded);
+    if (p.isHydrated()) autosave.current?.update(latestProject.current);
+  }
+
+  // Clears the PROJECT of this tool after a confirmation. The data of other tools (Scientific Writer, Equipment Selector, the library) are not touched.
+  function clearProject() {
+    if (!window.confirm('Очистить проект? Будут удалены все введённые данные, варианты, сценарии и результаты техно-экономической оценки из этого браузера. Данные других инструментов не затрагиваются. Действие нельзя отменить.')) return;
+    autosave.current?.cancel();                                // a waiting save must not write the deleted project back
+    const outcome = persistence.current ? persistence.current.clear() : null;
+    const d = defaultTeaProject();
+    setFormA(d.formA); setFormB(d.formB); setCompareB(false); setCurrency('RUB'); setScenariosEnabled(false); setScenarioForms(d.scenarioForms);
+    setImportedHandoff(null); setReportSnapshot(null); setCalculatedFrom(null); setResultA(null); setResultB(null); setScenarioResults({ base: null, conservative: null, optimistic: null }); setError('');
+    if (!outcome) setProjectStatus({ kind: 'unavailable' });
+    else if (outcome.ok) setProjectStatus({ kind: 'new' });
+    else if (outcome.reason === 'not_hydrated') setProjectStatus({ kind: 'read_failed' });
+    else if (outcome.reason === 'unavailable') setProjectStatus({ kind: 'unavailable' });
+    else setProjectStatus({ kind: 'failed', reason: outcome.reason });
+  }
 
   function updateScenarioForm(key: ScenarioKey, patch: Partial<FormState>) {
     setScenarioForms(prev => ({ ...prev, [key]: { ...prev[key], ...patch } }));
   }
 
-  // Picks up a pending handoff from Equipment Selector ("Передать в Техно-экономическую
-  // оценку") since the last time this module was open - consumed once per mount, never
-  // re-applied on remount, and never overwrites financial fields (only the descriptive title).
-  useEffect(() => {
-    const t = setTimeout(() => {
-      const record = consumePendingEquipmentHandoff();
-      if (record) {
-        setImportedHandoff(record);
-        setFormA(prev => ({ ...prev, title: record.handoff.configurationName }));
-      }
-    }, 0);
-    return () => clearTimeout(t);
-  }, []);
-
   function calculate(e: React.FormEvent) {
     e.preventDefault();
-    setError(''); setResultA(null); setResultB(null); setReportSnapshot(null);
+    setError(''); setResultA(null); setResultB(null); setReportSnapshot(null); setCalculatedFrom(null);
     setScenarioResults({ base: null, conservative: null, optimistic: null });
     try {
       const inputA = toAssessmentInput(formA);
@@ -339,12 +394,20 @@ export function TechnoEconomicAssessment() {
         snapshot.scenarios = inputs;
       }
       setReportSnapshot(snapshot);
+      setCalculatedFrom({ formA, formB, compareB, currency, scenariosEnabled, scenarioForms, handoff: importedHandoff });      // the FORM the results were calculated from (to tell when it changes)
     } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось выполнить расчёт.'); }
   }
 
+  // The shown results belong to the CALCULATION (its inputs, currency and titles), not to the form, which may have changed since. They are never recalculated without the
+  // user pressing "Рассчитать"; if the form differs from the calculation, that is said plainly.
+  const stale = isCalculationStale(project);
+  const shown = shownResultContext(project);
+  const shownCurrency = shown?.currency ?? currency;
+  const scenariosShown = reportSnapshot ? !!reportSnapshot.scenarios : scenariosEnabled;
+
   const comparisonRows = useMemo(() => {
     if (!resultA || !resultB) return null;
-    const money = (v: number) => formatCurrency(v, currency);
+    const money = (v: number) => formatCurrency(v, shownCurrency);
     return [
       ['CAPEX', money(resultA.capex.total), money(resultB.capex.total)],
       ['OPEX / год', money(resultA.opex.annualTotal), money(resultB.opex.annualTotal)],
@@ -354,13 +417,13 @@ export function TechnoEconomicAssessment() {
       ['Окупаемость, лет', resultA.payback.years?.toFixed(2) ?? '—', resultB.payback.years?.toFixed(2) ?? '—'],
       ['ROI, %', resultA.roi.percent.toFixed(1), resultB.roi.percent.toFixed(1)],
     ];
-  }, [resultA, resultB, currency]);
+  }, [resultA, resultB, shownCurrency]);
 
   const scenarioComparisonRows = useMemo(() => {
     const results = SCENARIO_KEYS.map(key => scenarioResults[key]);
     if (results.some(r => r === null)) return null;
     const rs = results as AssessmentResult[];
-    const money = (v: number) => formatCurrency(v, currency);
+    const money = (v: number) => formatCurrency(v, shownCurrency);
     return [
       ['CAPEX', ...rs.map(r => money(r.capex.total))],
       ['OPEX / год', ...rs.map(r => money(r.opex.annualTotal))],
@@ -370,10 +433,32 @@ export function TechnoEconomicAssessment() {
       ['Окупаемость, лет', ...rs.map(r => r.payback.years?.toFixed(2) ?? '—')],
       ['ROI, %', ...rs.map(r => r.roi.percent.toFixed(1))],
     ];
-  }, [scenarioResults, currency]);
+  }, [scenarioResults, shownCurrency]);
 
   return <div>
     <p className="muted small mb-4">Реальный локальный расчёт по прозрачным формулам - без внешних API и без LLM. Ниже можно раскрыть «Как рассчитано» для каждой формулы.</p>
+    <section className="content-card mb-4" role="status" aria-live="polite" data-testid="project-status">
+      <p className="small">
+        <strong>Проект сохраняется автоматически только в этом браузере</strong> (локально, на сервер и в сторонние сервисы не отправляется). Он не шифруется и не копируется в резерв:
+        доступен всем, кто работает в этом профиле браузера, и пропадёт при очистке данных сайта. Сохраняются введённые данные и настройки; результаты при восстановлении рассчитываются заново.
+      </p>
+      <p className="muted small">
+        {projectStatus.kind === 'loading' && 'Проверяю сохранённый проект…'}
+        {projectStatus.kind === 'new' && 'Сохранённого проекта нет — изменения будут сохраняться автоматически.'}
+        {projectStatus.kind === 'restored' && `Проект восстановлен (сохранён в ${timeOf(projectStatus.savedAt)}).`}
+        {projectStatus.kind === 'saved' && `Сохранено в ${timeOf(projectStatus.savedAt)}.`}
+        {projectStatus.kind === 'unavailable' && 'Локальное хранилище браузера недоступно: проект пока не сохраняется и пропадёт при обновлении страницы. Введённые данные остаются на экране; если доступ был временно закрыт, можно повторить попытку.'}
+        {projectStatus.kind === 'read_failed' && 'Не удалось прочитать сохранённый проект (возможно, временно). Сохранение приостановлено, чтобы не затереть его; ранее сохранённые данные не удалены.'}
+        {projectStatus.kind === 'conflict' && 'Найден ранее сохранённый проект, но вы уже начали новый ввод. Он не загружен и будет перемещён в отдельную ячейку хранилища перед первым новым сохранением.'}
+        {projectStatus.kind === 'unreadable' && 'Ранее сохранённый проект повреждён или создан другой версией и не загружен. Он будет перемещён в отдельную ячейку хранилища перед первым новым сохранением.'}
+        {projectStatus.kind === 'invalid' && `Проект не сохранён: ${projectStatus.problem} Данные на экране не потеряны и не изменены; ранее сохранённый проект остался без изменений.`}
+        {projectStatus.kind === 'failed' && projectStatus.reason === 'quota' && 'Не удалось сохранить: хранилище браузера переполнено. Данные на экране не потеряны, но при закрытии страницы они пропадут.'}
+        {projectStatus.kind === 'failed' && projectStatus.reason === 'error' && 'Не удалось сохранить проект. Данные на экране не потеряны; повторная попытка будет при следующем изменении.'}
+        {projectStatus.kind === 'failed' && projectStatus.reason === 'quarantine_occupied' && 'Резервная ячейка уже занята другим сохранённым документом, который не удаляется автоматически. Новые изменения не сохраняются, чтобы не уничтожить данные.'}
+        {projectStatus.kind === 'failed' && projectStatus.reason === 'quarantine_failed' && 'Ранее сохранённые нераспознанные данные нельзя безопасно отложить, поэтому новые изменения не сохраняются, чтобы не стереть их.'}
+      </p>
+      {(projectStatus.kind === 'read_failed' || projectStatus.kind === 'unavailable') && <button type="button" className="button secondary mt-2" onClick={retryRead}>Повторить чтение проекта</button>}
+    </section>
     {importedHandoff && <ImportedFromEquipmentSelector record={importedHandoff} onDismiss={() => setImportedHandoff(null)} />}
     <form onSubmit={calculate} className="flex flex-col gap-6">
       <label className="text-sm">Валюта отображения (без автоматической конвертации)
@@ -427,20 +512,24 @@ export function TechnoEconomicAssessment() {
         />
       </div>)}
 
-      <button className="button primary self-start">Рассчитать</button>
+      <div className="flex gap-2 self-start">
+        <button className="button primary">Рассчитать</button>
+        <button type="button" className="button secondary" onClick={clearProject}>Очистить проект</button>
+      </div>
       {error && <p role="alert">{error}</p>}
     </form>
 
+    {resultA && stale && <p role="status" className="content-card mt-6" data-testid="stale-results">Параметры проекта изменены после расчёта. Показаны результаты предыдущего расчёта{shown ? ` (валюта расчёта: ${shown.currency})` : ''}. Нажмите «Рассчитать», чтобы обновить.</p>}
     {resultA && <section className="mt-6" aria-live="polite">
-      <h2>E. Результаты{compareB ? ' - Вариант A' : ''}{formA.title ? `: ${formA.title}` : ''}</h2>
-      <ResultCards result={resultA} currency={currency} />
+      <h2>E. Результаты{resultB ? ' - Вариант A' : ''}{shown?.titleA ? `: ${shown.titleA}` : ''}</h2>
+      <ResultCards result={resultA} currency={shownCurrency} />
       <FormulasDisclosure result={resultA} />
       {reportSnapshot && <ReportDownload snapshot={reportSnapshot} displayCurrency={currency} />}
     </section>}
 
     {resultB && <section className="mt-6" aria-live="polite">
-      <h2>Результаты - Вариант B{formB.title ? `: ${formB.title}` : ''}</h2>
-      <ResultCards result={resultB} currency={currency} />
+      <h2>Результаты - Вариант B{shown?.titleB ? `: ${shown.titleB}` : ''}</h2>
+      <ResultCards result={resultB} currency={shownCurrency} />
       <FormulasDisclosure result={resultB} />
     </section>}
 
@@ -452,9 +541,9 @@ export function TechnoEconomicAssessment() {
       <p className="muted small mt-2">Сравнение носит информационный характер - платформа не выбирает «победителя» автоматически.</p>
     </section>}
 
-    {scenariosEnabled && SCENARIO_KEYS.map(key => scenarioResults[key] && <section className="mt-6" key={key} aria-live="polite">
-      <h2>Результаты - {SCENARIO_LABELS[key]}{scenarioForms[key].title ? `: ${scenarioForms[key].title}` : ''}</h2>
-      <ResultCards result={scenarioResults[key]!} currency={currency} />
+    {scenariosShown && SCENARIO_KEYS.map(key => scenarioResults[key] && <section className="mt-6" key={key} aria-live="polite">
+      <h2>Результаты - {SCENARIO_LABELS[key]}{shown?.scenarioTitles[key] ? `: ${shown.scenarioTitles[key]}` : ''}</h2>
+      <ResultCards result={scenarioResults[key]!} currency={shownCurrency} />
       <FormulasDisclosure result={scenarioResults[key]!} />
     </section>)}
 

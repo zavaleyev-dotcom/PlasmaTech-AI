@@ -76,7 +76,7 @@ function parseVariant(raw: unknown, label: string): ReportVariant {
   return { ...(title !== undefined ? { title } : {}), input: parseAssessmentInput(o.input, label) };
 }
 
-function parseHandoff(raw: unknown): TechnoEconomicHandoff {
+export function parseHandoff(raw: unknown): TechnoEconomicHandoff {
   const o = obj(raw, 'Конфигурация Equipment Selector');
   return {
     configurationId: reqText(o.configurationId, 'id конфигурации'),
