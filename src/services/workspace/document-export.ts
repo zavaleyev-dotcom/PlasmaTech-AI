@@ -181,8 +181,9 @@ function docxBlocks(blocks: NonNullable<ExportSection['blocks']>, bodySize: numb
   return out;
 }
 
-function metadataParagraph(item: ExportMetadataItem, size = BODY_SIZE): Paragraph {
+function metadataParagraph(item: ExportMetadataItem, size = BODY_SIZE, keepNext = false): Paragraph {
   return new Paragraph({
+    ...(keepNext ? { keepNext: true } : {}),
     children: [
       new TextRun({ text: `${item.label}: `, font: DOCX_FONT, size, bold: true }),
       new TextRun({ text: item.value, font: DOCX_FONT, size }),
@@ -200,10 +201,11 @@ function docxTable(table: ExportTable): Table {
       width: { size: columnWidth(index), type: WidthType.PERCENTAGE },
       verticalAlign: VerticalAlign.CENTER,
       shading: { fill: 'E2E2E2' },
-      children: [new Paragraph({ children: [new TextRun({ text: col, font: DOCX_FONT, size: SMALL_SIZE, bold: true })] })],
+      children: [new Paragraph({ keepNext: true, children: [new TextRun({ text: col, font: DOCX_FONT, size: SMALL_SIZE, bold: true })] })],
     })),
   });
   const bodyRows = (table.rows.length > 0 ? table.rows : [table.columns.map(() => DASH)]).map(row => new TableRow({
+    cantSplit: true,                      // a row (e.g. one coating layer) is never broken between two pages
     children: row.map((cell, index) => new TableCell({
       width: { size: columnWidth(index), type: WidthType.PERCENTAGE },
       children: [new Paragraph({ children: [new TextRun({ text: cell, font: DOCX_FONT, size: SMALL_SIZE })] })],
@@ -232,20 +234,21 @@ export async function renderGenericDocx(viewModel: GenericDocumentViewModel, opt
   for (const item of bodyItems(viewModel)) {
     if (item.kind === 'section') {
       const section = item.section;
-      if (section.heading) children.push(new Paragraph({ children: [new TextRun({ text: section.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
+      if (section.heading) children.push(new Paragraph({ children: [new TextRun({ text: section.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, keepNext: true, spacing: { before: 200, after: 100 } }));
       if (section.blocks) children.push(...docxBlocks(section.blocks, bodySize, headingSize, lineSpacing));
       else children.push(...section.paragraphs.map(p => textParagraph(p, { size: bodySize, lineSpacing })));
     } else {
       const table = item.table;
-      children.push(new Paragraph({ children: [new TextRun({ text: table.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, spacing: { before: 200, after: 100 } }));
+      children.push(new Paragraph({ children: [new TextRun({ text: table.heading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, keepNext: true, spacing: { before: 200, after: 100 } }));
       children.push(docxTable(table));
     }
   }
 
-  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.traceabilityHeading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, pageBreakBefore: appendix, spacing: { before: 300, after: 100 } }));
-  if (appendix) children.push(...viewModel.metadata.map(item => metadataParagraph(item, bodySize)));
-  children.push(...viewModel.traceability.map(item => metadataParagraph(item, bodySize)));
-  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.footer, font: DOCX_FONT, size: 18, italics: true })], spacing: { before: 300 } }));
+  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.traceabilityHeading, font: DOCX_FONT, size: headingSize, bold: true })], heading: HeadingLevel.HEADING_1, pageBreakBefore: appendix, keepNext: true, spacing: { before: 200, after: 80 } }));
+  // The heading, every item and the footer stay together: a footer or a single item is never left alone on a last page.
+  if (appendix) children.push(...viewModel.metadata.map(item => metadataParagraph(item, bodySize, true)));
+  children.push(...viewModel.traceability.map(item => metadataParagraph(item, bodySize, true)));
+  children.push(new Paragraph({ children: [new TextRun({ text: viewModel.footer, font: DOCX_FONT, size: 18, italics: true })], spacing: { before: 120 } }));
 
   const landscape = options.layout === 'landscape';
   const [width, height] = landscape ? [16838, 11906] : [11906, 16838];

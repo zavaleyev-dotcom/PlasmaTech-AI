@@ -20,7 +20,7 @@ import {
   DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, FILENAME_SEGMENT,
   type DocumentType, type ExportFormat,
 } from './techdoc-export-types';
-import { renderGenericDocx, renderGenericPdf, sanitizeFilenameSegment, type GenericDocumentViewModel } from './document-export';
+import { renderGenericDocx, renderGenericPdf, sanitizeFilenameSegment, type BodyItem, type GenericDocumentViewModel } from './document-export';
 
 export { DOCUMENT_TYPES, EXPORT_FORMATS, DOCUMENT_TYPE_LABELS, sanitizeFilenameSegment, type DocumentType, type ExportFormat };
 
@@ -303,7 +303,12 @@ export function buildDocumentViewModel(doc: TechnicalProcessDocument, documentTy
  *  `sections`/`tables` at buildDocumentViewModel() time. */
 function toGenericViewModel(viewModel: DocumentViewModel): GenericDocumentViewModel {
   const t = viewModel.traceability;
+  // The instruction's quality-control table belongs to section 8, not after section 9 / the appendix: the body is given in one explicit order.
+  const body: BodyItem[] | undefined = viewModel.documentType === 'instruction' && viewModel.tables.length > 0 && viewModel.sections.some(section => section.heading.startsWith('8.'))
+    ? viewModel.sections.flatMap((section): BodyItem[] => [{ kind: 'section', section }, ...(section.heading.startsWith('8.') ? viewModel.tables.map((table): BodyItem => ({ kind: 'table', table })) : [])])
+    : undefined;
   return {
+    ...(body ? { body } : {}),
     title: viewModel.title,
     metadata: viewModel.metadata,
     sections: viewModel.sections,

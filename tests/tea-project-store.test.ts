@@ -448,7 +448,7 @@ test('F1. what makes a calculation outdated: any field, a switch, the currency, 
   assert.equal(isCalculationStale(JSON.parse(JSON.stringify(base))), false);                                // a round trip through JSON changes nothing
   // the component: the exact warning, the labels from the calculation, and no calculation without the user
   const component = readFileSync(join(__dirname, '../src/components/techno-economic-assessment.tsx'), 'utf8');
-  assert.match(component, /Параметры проекта изменены после расчёта\. Показаны результаты предыдущего расчёта/);
+  assert.match(component, /\{STALE_RESULTS_MESSAGE\}/);                                          // T1: outdated results are replaced by this message, not shown (see tests/t1-doc-layout.test.ts)
   assert.match(component, /shown\?\.titleA/); assert.match(component, /shown\?\.titleB/); assert.match(component, /shown\?\.scenarioTitles\[key\]/);
   assert.match(component, /const shownCurrency = shown\?\.currency \?\? currency/);
   assert.ok(!/formA\.title \? `: \$\{formA\.title\}`/.test(component), 'the heading no longer uses the current title');

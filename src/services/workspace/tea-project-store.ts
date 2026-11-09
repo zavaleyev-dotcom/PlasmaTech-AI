@@ -132,6 +132,9 @@ export function isCalculationStale(project: TeaProjectContent): boolean {
   return project.calculatedFrom === null || !sameData(sourceOf(project), project.calculatedFrom);
 }
 
+/** Shown instead of the results (and the report download) whenever the form differs from the calculation they came from. */
+export const STALE_RESULTS_MESSAGE = 'Исходные данные изменены — выполните расчёт повторно. Прежние результаты скрыты, чтобы их не приняли за результаты новых данных, и отчёт по ним не предлагается.';
+
 /** What the shown results are labelled with: the currency and the titles of the CALCULATION, never those of the form that may have changed since. */
 export function shownResultContext(project: TeaProjectContent): { currency: Currency; titleA: string; titleB: string; scenarioTitles: Record<ScenarioKey, string> } | null {
   const c = project.calculation;

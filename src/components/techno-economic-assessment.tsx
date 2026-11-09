@@ -7,7 +7,7 @@ import {
 } from '@/services/workspace/techno-economic-assessment';
 import { acknowledgeEquipmentHandoff, peekPendingEquipmentHandoff, type EquipmentTeaHandoffRecord } from '@/services/workspace/equipment-tea-handoff';
 import {
-  TEA_PROJECT_CONFIG, applyHandoffToProject, confirmHandoffDelivery, planHandoffDelivery, defaultTeaForm, defaultTeaProject, defaultTeaScenarioForms, isCalculationStale, recomputeResults, shownResultContext, teaFormToInput,
+  TEA_PROJECT_CONFIG, applyHandoffToProject, confirmHandoffDelivery, planHandoffDelivery, defaultTeaForm, defaultTeaProject, defaultTeaScenarioForms, isCalculationStale, recomputeResults, shownResultContext, STALE_RESULTS_MESSAGE, teaFormToInput,
   type CalculatedFrom, type TeaFormState, type TeaProjectContent,
 } from '@/services/workspace/tea-project-store';
 import {
@@ -519,21 +519,21 @@ export function TechnoEconomicAssessment() {
       {error && <p role="alert">{error}</p>}
     </form>
 
-    {resultA && stale && <p role="status" className="content-card mt-6" data-testid="stale-results">Параметры проекта изменены после расчёта. Показаны результаты предыдущего расчёта{shown ? ` (валюта расчёта: ${shown.currency})` : ''}. Нажмите «Рассчитать», чтобы обновить.</p>}
-    {resultA && <section className="mt-6" aria-live="polite">
+    {resultA && stale && <p role="status" className="content-card mt-6" data-testid="stale-results">{STALE_RESULTS_MESSAGE}</p>}
+    {resultA && !stale && <section className="mt-6" aria-live="polite">
       <h2>E. Результаты{resultB ? ' - Вариант A' : ''}{shown?.titleA ? `: ${shown.titleA}` : ''}</h2>
       <ResultCards result={resultA} currency={shownCurrency} />
       <FormulasDisclosure result={resultA} />
       {reportSnapshot && <ReportDownload snapshot={reportSnapshot} displayCurrency={currency} />}
     </section>}
 
-    {resultB && <section className="mt-6" aria-live="polite">
+    {resultB && !stale && <section className="mt-6" aria-live="polite">
       <h2>Результаты - Вариант B{shown?.titleB ? `: ${shown.titleB}` : ''}</h2>
       <ResultCards result={resultB} currency={shownCurrency} />
       <FormulasDisclosure result={resultB} />
     </section>}
 
-    {comparisonRows && <section className="mt-6">
+    {comparisonRows && !stale && <section className="mt-6">
       <h2>Сравнение вариантов</h2>
       <table className="w-full text-sm"><thead><tr><th className="text-left">Показатель</th><th className="text-left">Вариант A</th><th className="text-left">Вариант B</th></tr></thead>
         <tbody>{comparisonRows.map(([label, a, b]) => <tr key={label}><td>{label}</td><td>{a}</td><td>{b}</td></tr>)}</tbody>
@@ -541,13 +541,13 @@ export function TechnoEconomicAssessment() {
       <p className="muted small mt-2">Сравнение носит информационный характер - платформа не выбирает «победителя» автоматически.</p>
     </section>}
 
-    {scenariosShown && SCENARIO_KEYS.map(key => scenarioResults[key] && <section className="mt-6" key={key} aria-live="polite">
+    {scenariosShown && !stale && SCENARIO_KEYS.map(key => scenarioResults[key] && <section className="mt-6" key={key} aria-live="polite">
       <h2>Результаты - {SCENARIO_LABELS[key]}{shown?.scenarioTitles[key] ? `: ${shown.scenarioTitles[key]}` : ''}</h2>
       <ResultCards result={scenarioResults[key]!} currency={shownCurrency} />
       <FormulasDisclosure result={scenarioResults[key]!} />
     </section>)}
 
-    {scenarioComparisonRows && <section className="mt-6">
+    {scenarioComparisonRows && !stale && <section className="mt-6">
       <h2>Сравнение сценариев</h2>
       <table className="w-full text-sm"><thead><tr><th className="text-left">Показатель</th>{SCENARIO_KEYS.map(key => <th key={key} className="text-left">{SCENARIO_LABELS[key]}</th>)}</tr></thead>
         <tbody>{scenarioComparisonRows.map(([label, ...values]) => <tr key={label}><td>{label}</td>{values.map((v, i) => <td key={i}>{v}</td>)}</tr>)}</tbody>
