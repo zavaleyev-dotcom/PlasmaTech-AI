@@ -95,6 +95,28 @@ function assertOneOf<T extends string>(value: T, allowed: readonly T[], label: s
   return value;
 }
 
+/** Significant-digit formatting for displayed quantities. `toFixed(4)` rounds a small but
+ *  non-zero operand (e.g. 0.00001 nm/min) to "0.0000", so the displayed formula would show a
+ *  zero operand next to a non-zero result. Values outside [1e-3, 1e6) use scientific notation;
+ *  a non-zero finite input never renders as zero. */
+export function formatSignificant(value: number, digits = 4): string {
+  if (!Number.isFinite(value)) return String(value);
+  if (value === 0) return '0';
+  const abs = Math.abs(value);
+  const text = abs < 1e-3 || abs >= 1e6 ? value.toExponential(digits - 1) : value.toPrecision(digits);
+  return text.replace(/(\.\d*?)0+(e|$)/, '$1$2').replace(/\.(e|$)/, '$1').replace('e+', 'e');
+}
+
+/** Stable key of every input that influences a deposition result. */
+export function depositionInputKey(i: { solveFor: string; thickness: string; thicknessUnit: string; rate: string; rateUnit: string; time: string; timeUnit: string }): string {
+  return JSON.stringify([i.solveFor, i.thickness.trim(), i.thicknessUnit, i.rate.trim(), i.rateUnit, i.time.trim(), i.timeUnit]);
+}
+
+/** Stable key of every input that influences a mean-free-path result. */
+export function meanFreePathInputKey(i: { pressure: string; pressureUnit: string; temperatureC: string; gas: string; customDiameterPm: string }): string {
+  return JSON.stringify([i.pressure.trim(), i.pressureUnit, i.temperatureC.trim(), i.gas, i.gas === 'custom' ? i.customDiameterPm.trim() : '']);
+}
+
 /** Solves thickness = rate * time for whichever ONE of the three the caller asks for,
  *  requiring the other two as real, validated (positive, finite) numbers - never silently
  *  substitutes a default or ignores what was actually typed. */
@@ -108,20 +130,20 @@ export function solveDeposition(input: DepositionInput): DepositionResult {
     const timeMin = requirePositiveFinite(input.time, 'Время осаждения') * TIME_TO_MIN[input.timeUnit];
     const thicknessNm = requirePositiveFiniteResult(rateNmMin * timeMin, 'Толщина покрытия');
     const value = requirePositiveFiniteResult(thicknessNm / THICKNESS_TO_NM[input.thicknessUnit], 'Толщина покрытия');
-    return { solveFor: 'thickness', value, unit: input.thicknessUnit, formula: `d = v × t = ${rateNmMin.toFixed(4)} нм/мин × ${timeMin.toFixed(4)} мин` };
+    return { solveFor: 'thickness', value, unit: input.thicknessUnit, formula: `d = v × t = ${formatSignificant(rateNmMin)} нм/мин × ${formatSignificant(timeMin)} мин` };
   }
   if (input.solveFor === 'rate') {
     const thicknessNm = requirePositiveFinite(input.thickness, 'Толщина покрытия') * THICKNESS_TO_NM[input.thicknessUnit];
     const timeMin = requirePositiveFinite(input.time, 'Время осаждения') * TIME_TO_MIN[input.timeUnit];
     const rateNmMin = requirePositiveFiniteResult(thicknessNm / timeMin, 'Скорость осаждения');
     const value = requirePositiveFiniteResult(rateNmMin / RATE_TO_NM_PER_MIN[input.rateUnit], 'Скорость осаждения');
-    return { solveFor: 'rate', value, unit: input.rateUnit, formula: `v = d / t = ${thicknessNm.toFixed(4)} нм / ${timeMin.toFixed(4)} мин` };
+    return { solveFor: 'rate', value, unit: input.rateUnit, formula: `v = d / t = ${formatSignificant(thicknessNm)} нм / ${formatSignificant(timeMin)} мин` };
   }
   const thicknessNm = requirePositiveFinite(input.thickness, 'Толщина покрытия') * THICKNESS_TO_NM[input.thicknessUnit];
   const rateNmMin = requirePositiveFinite(input.rate, 'Скорость осаждения') * RATE_TO_NM_PER_MIN[input.rateUnit];
   const timeMin = requirePositiveFiniteResult(thicknessNm / rateNmMin, 'Время осаждения');
   const value = requirePositiveFiniteResult(timeMin / TIME_TO_MIN[input.timeUnit], 'Время осаждения');
-  return { solveFor: 'time', value, unit: input.timeUnit, formula: `t = d / v = ${thicknessNm.toFixed(4)} нм / ${rateNmMin.toFixed(4)} нм/мин` };
+  return { solveFor: 'time', value, unit: input.timeUnit, formula: `t = d / v = ${formatSignificant(thicknessNm)} нм / ${formatSignificant(rateNmMin)} нм/мин` };
 }
 
 export function depositionUnitLabel(unit: ThicknessUnit | RateUnit | TimeUnit): string {
@@ -184,6 +206,6 @@ export function calculateMeanFreePath(input: MeanFreePathInput): MeanFreePathRes
   const meanFreePathMm = requirePositiveFiniteResult(meanFreePathM * 1000, 'Средняя длина свободного пробега (мм)');
   return {
     meanFreePathM, meanFreePathMm,
-    formula: `λ = kT / (√2·π·d²·p) при T = ${temperatureK.toFixed(2)} К, p = ${pressureInPa.toExponential(3)} Па, d = ${diameterPm} пм`,
+    formula: `λ = kT / (√2·π·d²·p) при T = ${formatSignificant(temperatureK, 6)} К, p = ${pressureInPa.toExponential(3)} Па, d = ${diameterPm} пм`,
   };
 }

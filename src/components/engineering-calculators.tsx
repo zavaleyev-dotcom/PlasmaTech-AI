@@ -2,7 +2,7 @@
 
 import { useState, type FormEvent } from 'react';
 import {
-  calculateMeanFreePath, depositionUnitLabel, solveDeposition,
+  calculateMeanFreePath, depositionInputKey, depositionUnitLabel, formatSignificant, meanFreePathInputKey, solveDeposition,
   type DepositionSolveFor, type GasPreset, type PressureUnit, type RateUnit, type ThicknessUnit, type TimeUnit,
 } from '@/services/workspace/engineering-calculators';
 import { Icon } from './icon';
@@ -19,18 +19,21 @@ function DepositionCalculator() {
   const [time, setTime] = useState('100');
   const [timeUnit, setTimeUnit] = useState<TimeUnit>('min');
   const [error, setError] = useState('');
-  const [result, setResult] = useState<ReturnType<typeof solveDeposition> | null>(null);
+  const [resultState, setResultState] = useState<{ key: string; result: ReturnType<typeof solveDeposition> } | null>(null);
+  const key = depositionInputKey({ solveFor, thickness, thicknessUnit, rate, rateUnit, time, timeUnit });
+  const result = resultState && resultState.key === key ? resultState.result : null;
+  const stale = resultState !== null && result === null;
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setError(''); setResult(null);
+    setError(''); setResultState(null);
     try {
-      setResult(solveDeposition({
+      setResultState({ key, result: solveDeposition({
         solveFor,
         thickness: thickness.trim() ? Number(thickness) : undefined, thicknessUnit,
         rate: rate.trim() ? Number(rate) : undefined, rateUnit,
         time: time.trim() ? Number(time) : undefined, timeUnit,
-      }));
+      }) });
     } catch (e) { setError(e instanceof Error ? e.message : 'Не удалось выполнить расчёт.'); }
   }
 
@@ -69,9 +72,9 @@ function DepositionCalculator() {
     <section className="content-card" aria-live="polite">
       <h2>Результат</h2>
       {result ? <div className="demo-result">
-        <h3>{SOLVE_FOR_LABEL[result.solveFor]}: {result.value.toPrecision(6)} {depositionUnitLabel(result.unit)}</h3>
+        <h3>{SOLVE_FOR_LABEL[result.solveFor]}: {formatSignificant(result.value, 6)} {depositionUnitLabel(result.unit)}</h3>
         <p className="muted small">{result.formula}</p>
-      </div> : <p className="mt-5">Заполните два значения и нажмите «Рассчитать».</p>}
+      </div> : stale ? <p className="mt-5" role="status">Исходные данные изменены - прежний результат неактуален. Нажмите «Рассчитать».</p> : <p className="mt-5">Заполните два значения и нажмите «Рассчитать».</p>}
     </section>
   </div>;
 }
@@ -83,17 +86,20 @@ function MeanFreePathCalculator() {
   const [gas, setGas] = useState<GasPreset>('argon');
   const [customDiameterPm, setCustomDiameterPm] = useState('350');
   const [error, setError] = useState('');
-  const [result, setResult] = useState<ReturnType<typeof calculateMeanFreePath> | null>(null);
+  const [resultState, setResultState] = useState<{ key: string; result: ReturnType<typeof calculateMeanFreePath> } | null>(null);
+  const key = meanFreePathInputKey({ pressure, pressureUnit, temperatureC, gas, customDiameterPm });
+  const result = resultState && resultState.key === key ? resultState.result : null;
+  const stale = resultState !== null && result === null;
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setError(''); setResult(null);
+    setError(''); setResultState(null);
     try {
-      setResult(calculateMeanFreePath({
+      setResultState({ key, result: calculateMeanFreePath({
         pressure: Number(pressure), pressureUnit,
         temperatureC: Number(temperatureC), gas,
         customDiameterPm: gas === 'custom' ? Number(customDiameterPm) : undefined,
-      }));
+      }) });
     } catch (e) { setError(e instanceof Error ? e.message : 'Не удалось выполнить расчёт.'); }
   }
 
@@ -128,7 +134,7 @@ function MeanFreePathCalculator() {
       {result ? <div className="demo-result">
         <h3>λ ≈ {result.meanFreePathMm.toPrecision(4)} мм ({result.meanFreePathM.toExponential(3)} м)</h3>
         <p className="muted small">{result.formula}</p>
-      </div> : <p className="mt-5">Заполните параметры и нажмите «Рассчитать».</p>}
+      </div> : stale ? <p className="mt-5" role="status">Исходные данные изменены - прежний результат неактуален. Нажмите «Рассчитать».</p> : <p className="mt-5">Заполните параметры и нажмите «Рассчитать».</p>}
     </section>
   </div>;
 }

@@ -424,6 +424,21 @@ export function matchEquipment(req: EquipmentRequirement, catalog: EquipmentConf
 
 export interface ComparisonRow { parameter: string; values: string[] }
 
+/** One immutable comparison: the ids, display names and rows are produced together, so headers
+ *  and values can never come from different selections. */
+export interface ComparisonSnapshot { ids: string[]; names: string[]; rows: ComparisonRow[] }
+
+export function buildComparisonSnapshot(configIds: string[], catalog: EquipmentConfiguration[] = EQUIPMENT_CONFIGURATIONS): ComparisonSnapshot {
+  const rows = compareConfigurations(configIds, catalog);
+  const ids = [...configIds];
+  return { ids, names: ids.map(id => catalog.find(c => c.id === id)?.name ?? id), rows };
+}
+
+/** The snapshot only if it still describes exactly the current selection (same ids, same order); otherwise null (stale). */
+export function currentComparison(snapshot: ComparisonSnapshot | null, selectedIds: string[]): ComparisonSnapshot | null {
+  return snapshot && snapshot.ids.length === selectedIds.length && snapshot.ids.every((id, i) => id === selectedIds[i]) ? snapshot : null;
+}
+
 export function compareConfigurations(configIds: string[], catalog: EquipmentConfiguration[] = EQUIPMENT_CONFIGURATIONS): ComparisonRow[] {
   if (configIds.length < 2 || configIds.length > 3) throw new Error('Для сравнения выберите от 2 до 3 конфигураций.');
   const configs = configIds.map(id => {

@@ -3,9 +3,9 @@
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import {
-  matchEquipment, compareConfigurations, buildTechnoEconomicHandoff, EQUIPMENT_CONFIGURATIONS, REQUIREMENT_PRESETS,
+  matchEquipment, buildComparisonSnapshot, currentComparison, buildTechnoEconomicHandoff, EQUIPMENT_CONFIGURATIONS, REQUIREMENT_PRESETS,
   PURPOSES, TECHNOLOGIES, SUBSTRATE_TYPES, MATERIAL_CLASSES, THROUGHPUT_CLASSES, AUTOMATION_LEVELS, CLEANROOM_CLASSES, LABELS,
-  type EquipmentRequirement, type MatchResult, type ComparisonRow, type TechnoEconomicHandoff,
+  type EquipmentRequirement, type MatchResult, type ComparisonSnapshot, type TechnoEconomicHandoff,
 } from '@/services/workspace/equipment-selector';
 import { queueEquipmentHandoff } from '@/services/workspace/equipment-tea-handoff';
 
@@ -110,12 +110,18 @@ function ResultCard({ result, onHandoff }: { result: MatchResult; onHandoff: (co
 
 export function EquipmentSelector() {
   const [form, setForm] = useState<FormState>(defaultForm());
-  const [results, setResults] = useState<MatchResult[] | null>(null);
+  const [resultsState, setResultsState] = useState<{ key: string; results: MatchResult[] } | null>(null);
   const [error, setError] = useState('');
   const [compareIds, setCompareIds] = useState<string[]>([]);
-  const [comparisonRows, setComparisonRows] = useState<ComparisonRow[] | null>(null);
+  const [comparison, setComparison] = useState<ComparisonSnapshot | null>(null);
   const [comparisonError, setComparisonError] = useState('');
   const [handoff, setHandoff] = useState<TechnoEconomicHandoff | null>(null);
+
+  const formKey = JSON.stringify(form);
+  const results = resultsState && resultsState.key === formKey ? resultsState.results : null;
+  const resultsStale = resultsState !== null && results === null;
+  const shownComparison = currentComparison(comparison, compareIds);
+  const comparisonStale = comparison !== null && shownComparison === null;
 
   function set<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm(prev => ({ ...prev, [key]: value }));
@@ -123,14 +129,14 @@ export function EquipmentSelector() {
 
   function applyPreset(id: string) {
     const preset = REQUIREMENT_PRESETS.find(p => p.id === id);
-    if (preset) { setForm(fromRequirement(preset.requirement)); setResults(null); setError(''); setHandoff(null); }
+    if (preset) { setForm(fromRequirement(preset.requirement)); setResultsState(null); setError(''); setHandoff(null); }
   }
 
   function submit(e: React.FormEvent) {
     e.preventDefault();
-    setError(''); setResults(null); setHandoff(null);
+    setError(''); setResultsState(null); setHandoff(null);
     try {
-      setResults(matchEquipment(toRequirement(form)));
+      setResultsState({ key: formKey, results: matchEquipment(toRequirement(form)) });
     } catch (err) { setError(err instanceof Error ? err.message : 'Не удалось выполнить подбор.'); }
   }
 
@@ -139,8 +145,8 @@ export function EquipmentSelector() {
   }
 
   function runComparison() {
-    setComparisonError(''); setComparisonRows(null);
-    try { setComparisonRows(compareConfigurations(compareIds)); }
+    setComparisonError(''); setComparison(null);
+    try { setComparison(buildComparisonSnapshot(compareIds)); }
     catch (err) { setComparisonError(err instanceof Error ? err.message : 'Не удалось построить сравнение.'); }
   }
 
@@ -277,6 +283,7 @@ export function EquipmentSelector() {
       {error && <p role="alert">{error}</p>}
     </form>
 
+    {resultsStale && <p className="notice" role="status">Требования изменены - прежние результаты подбора неактуальны. Нажмите «Подобрать оборудование», чтобы выполнить подбор заново.</p>}
     {results && <section className="mt-2" aria-live="polite">
       <h2>J. Результаты подбора</h2>
       <p className="muted small">Платформа не выбирает «победителя» автоматически - решение принимает пользователь.</p>
@@ -295,10 +302,11 @@ export function EquipmentSelector() {
       <h2>Сравнение конфигураций ({compareNames.join(', ')})</h2>
       <button type="button" className="button secondary mt-2" onClick={runComparison} disabled={compareIds.length < 2}>Сравнить</button>
       {comparisonError && <p role="alert">{comparisonError}</p>}
-      {comparisonRows && <div className="mt-4" style={{ overflowX: 'auto' }}>
+      {comparisonStale && <p className="notice" role="status">Выбор конфигураций изменён - прежнее сравнение неактуально. Нажмите «Сравнить», чтобы построить его заново.</p>}
+      {shownComparison && <div className="mt-4" style={{ overflowX: 'auto' }}>
         <table className="w-full text-sm">
-          <thead><tr><th className="text-left">Параметр</th>{compareNames.map(n => <th key={n} className="text-left">{n}</th>)}</tr></thead>
-          <tbody>{comparisonRows.map(row => <tr key={row.parameter}><td>{row.parameter}</td>{row.values.map((v, i) => <td key={i}>{v}</td>)}</tr>)}</tbody>
+          <thead><tr><th className="text-left">Параметр</th>{shownComparison.names.map(n => <th key={n} className="text-left">{n}</th>)}</tr></thead>
+          <tbody>{shownComparison.rows.map(row => <tr key={row.parameter}><td>{row.parameter}</td>{row.values.map((v, i) => <td key={i}>{v}</td>)}</tr>)}</tbody>
         </table>
       </div>}
     </section>}
