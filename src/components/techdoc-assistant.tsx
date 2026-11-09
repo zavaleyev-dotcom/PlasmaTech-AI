@@ -138,9 +138,9 @@ function LayerCard({ step, layer, index, total, pressureUnit, onChange, onError 
 }) {
   const run = (op: (steps: ProcessStep[]) => ProcessStep[]) => onChange(steps => { try { const next = op(steps); onError(''); return next; } catch (e) { onError(e instanceof Error ? e.message : 'Не удалось изменить данные.'); return steps; } });
   return <div className="content-card mt-3">
-    <div className="flex justify-between items-center">
+    <div className="flex justify-between items-center flex-wrap gap-2">
       <h4>Слой {index + 1}</h4>
-      <div className="flex gap-2">
+      <div className="flex gap-2 flex-wrap">
         <button type="button" className="button secondary" disabled={index === 0} onClick={() => run(steps => moveLayer(steps, step.order, layer.id, 'up'))}>↑</button>
         <button type="button" className="button secondary" disabled={index === total - 1} onClick={() => run(steps => moveLayer(steps, step.order, layer.id, 'down'))}>↓</button>
         <button type="button" className="button secondary" onClick={() => run(steps => removeLayer(steps, step.order, layer.id))}>Удалить слой</button>
@@ -199,9 +199,9 @@ function StepCard({ doc, step, onChange, onDoc, onError }: {
   const patch = (p: Parameters<typeof updateStep>[2]) => onChange(steps => updateStep(steps, step.order, p));
 
   return <article className="content-card">
-    <div className="flex justify-between items-center">
+    <div className="flex justify-between items-center flex-wrap gap-2">
       <h3>№{step.order}. {step.name}{step.name !== STEP_TYPE_LABELS[step.type] && <> <span className="muted small">[{STEP_TYPE_LABELS[step.type]}]</span></>}{!step.enabled && ' (отключён)'}</h3>
-      <div className="flex gap-2">
+      <div className="flex gap-2 flex-wrap">
         <button type="button" className="button secondary" disabled={step.order === 1} onClick={() => onChange(steps => moveStep(steps, step.order, 'up'))}>↑</button>
         <button type="button" className="button secondary" disabled={step.order === total} onClick={() => onChange(steps => moveStep(steps, step.order, 'down'))}>↓</button>
         <button type="button" className="button secondary" onClick={() => onChange(steps => duplicateStep(steps, step.order))}>Копировать</button>
@@ -557,8 +557,8 @@ export function TechDocAssistant() {
 
     <section className="content-card">
       <h2>C. Технологические этапы</h2>
-      <div className="flex gap-2 mt-3">
-        <select className="rounded-md border border-[#dce0e5] p-3" aria-label="Тип новой карточки" value={newStepType} onChange={e => setNewStepType(e.target.value as StepType)}>
+      <div className="flex gap-2 mt-3 flex-wrap">
+        <select className="rounded-md border border-[#dce0e5] p-3" style={{ maxWidth: '100%' }} aria-label="Тип новой карточки" value={newStepType} onChange={e => setNewStepType(e.target.value as StepType)}>
           {STEP_TYPES.map(t => <option key={t} value={t}>{STEP_TYPE_LABELS[t]}</option>)}
         </select>
         <button type="button" className="button primary" onClick={() => updateSteps(steps => addStep(steps, newStepType))}>Добавить этап</button>

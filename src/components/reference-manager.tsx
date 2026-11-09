@@ -91,14 +91,14 @@ export function ReferenceManager({ references, onChangeReferences, citationStyle
           const number = referenceNumber(references, reference.id);
           return <li key={reference.id} className="rounded-md border border-[#dce0e5] p-3">
             <div className="flex justify-between items-start gap-2">
-              <div>
+              <div style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
                 <p className="small"><strong>{REFERENCE_TYPE_LABELS[reference.type]}</strong>{bibliography.numbered && number !== null ? ` · №${number} в списке` : ` · позиция ${displayIndex + 1} в APA-списке`}
                   {reference.provenance?.source === 'scifinder' && <span className="mode-badge" style={{ marginLeft: '0.5em' }}>Источник: SciFinder ({reference.provenance.provider})</span>}
                 </p>
                 <p className="mt-1">{text}</p>
                 <p className="muted small mt-1">В тексте: {formatInText(references, reference.id, citationStyle)}</p>
               </div>
-              <label className="text-xs flex items-center gap-1 whitespace-nowrap">
+              <label className="text-xs flex items-center gap-1 shrink-0">
                 <input type="checkbox" checked={citedIds.has(reference.id)} onChange={() => toggleCited(reference.id)} />
                 процитировано
               </label>

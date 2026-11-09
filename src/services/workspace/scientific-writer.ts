@@ -667,6 +667,71 @@ export function checkNoFabricatedScholarlyArtifacts(generatedText: string): Scho
 /** Combines every post-generation safeguard into one human-readable list. An empty array means
  *  every check passed - the route/UI must never present a result as clean without actually
  *  running this. */
+// ---------- unsupported novelty / superiority claims (D2) ----------
+//
+// A lexical heuristic, not NLP. Markers are grouped into a few CATEGORIES (so "революционный" and "революционным" are the same
+// claim); every occurrence has a POLARITY. Only a POSITIVE occurrence in the generated text is a claim, and it is reported
+// unless the author's own material already contains a positive claim of the same category. Occurrences that do NOT support a
+// generated claim: a negated one in the source ("не впервые"), and anything in `additionalRequirements` (that field is an
+// instruction to the writer - "не используйте слово впервые" - not a statement about the research).
+const NOVELTY_NOUNS = '(?:approach|method|technique|technology|process|coating|material|concept|design|architecture|framework|solution|system|strategy|route|structure)';
+const NOVELTY_CATEGORIES: ReadonlyArray<{ id: string; pattern: RegExp }> = [
+  { id: 'first', pattern: new RegExp(`${WB_START}(?:впервые|first[-\\s]ever|for\\s+the\\s+first\\s+time)${WB_END}`, 'giu') },
+  { id: 'revolutionary', pattern: new RegExp(`(?:${WB_START}революцион\\p{L}*|${WB_START}revolutionary${WB_END})`, 'giu') },
+  { id: 'unprecedented', pattern: new RegExp(`(?:${WB_START}беспрецедентн\\p{L}*|${WB_START}unprecedented${WB_END})`, 'giu') },
+  { id: 'novel', pattern: new RegExp(`${WB_START}novel\\s+${NOVELTY_NOUNS}${WB_END}`, 'giu') },
+  { id: 'proven-performance', pattern: new RegExp(
+    `(?:${WB_START}подтвержд\\p{L}*(?:\\s+\\p{L}+){0,3}?\\s+(?:высок|превосходн)\\p{L}*\\s+эффективност\\p{L}*`
+    + `|${WB_START}(?:proven|proves?|demonstrated?|confirmed?|established)\\s+(?:the\\s+)?(?:superior|excellent|high)\\s+(?:performance|efficiency|efficacy|effectiveness)${WB_END})`, 'giu') },
+];
+const NEGATOR_BEFORE_MARKER = /^(?:не|нет|ни|not|no|never|isn't|aren't|wasn't|weren't|doesn't|don't|didn't)$/iu;
+// between a negator and the marker these AFFIRM the claim: "не только революционный" / "not only revolutionary".
+const AFFIRMING_BETWEEN = /^(?:только|лишь|просто|only|merely|just|simply)$/iu;
+
+/** True when the marker at `index` is a plain positive assertion: not preceded (in the same clause, at most one word between) by a negator, unless that "negator" is part of "не только"/"not only". */
+function isPositiveOccurrence(text: string, index: number): boolean {
+  const before = text.slice(Math.max(0, index - 60), index);
+  const clause = before.split(/[.!?;:,\n]|\s[—–-]\s/u).pop() ?? '';
+  const words = clause.match(/[\p{L}']+/gu) ?? [];
+  const tail = words.slice(-2);
+  for (let i = 0; i < tail.length; i += 1) {
+    if (!NEGATOR_BEFORE_MARKER.test(tail[i])) continue;
+    const between = tail.slice(i + 1);
+    if (between.some(w => AFFIRMING_BETWEEN.test(w))) return true;
+    return false;
+  }
+  return true;
+}
+
+function noveltyOccurrences(text: string): Array<{ category: string; phrase: string; positive: boolean }> {
+  const out: Array<{ category: string; phrase: string; positive: boolean }> = [];
+  for (const { id, pattern } of NOVELTY_CATEGORIES) {
+    for (const match of text.matchAll(pattern)) {
+      out.push({ category: id, phrase: match[0].toLowerCase().replace(/\s+/g, ' '), positive: isPositiveOccurrence(text, match.index ?? 0) });
+    }
+  }
+  return out;
+}
+
+export interface NoveltyClaimCheck { found: string[]; ok: boolean }
+
+export function checkUnsupportedNoveltyClaims(input: ScientificWriterInput, generatedText: string): NoveltyClaimCheck {
+  const supportedCategories = new Set<string>();
+  for (const field of [input.title, input.researchField, input.goal, input.researchObject, input.methods, input.results, input.conclusions, input.keywords, input.sourceText]) {
+    if (!field) continue;
+    for (const occurrence of noveltyOccurrences(field)) if (occurrence.positive) supportedCategories.add(occurrence.category);
+  }
+  const found: string[] = [];
+  const reported = new Set<string>();
+  for (const occurrence of noveltyOccurrences(generatedText)) {
+    if (!occurrence.positive || supportedCategories.has(occurrence.category) || reported.has(occurrence.category)) continue;
+    reported.add(occurrence.category);
+    found.push(occurrence.phrase);
+  }
+  return { found, ok: found.length === 0 };
+}
+
+
 export function buildSafetyWarnings(input: ScientificWriterInput, generatedText: string, preservation: PreservationCheck | null): string[] {
   const warnings: string[] = [];
   if (preservation && !preservation.ok) {
@@ -679,6 +744,8 @@ export function buildSafetyWarnings(input: ScientificWriterInput, generatedText:
   }
   const inventedNumbers = checkNoInventedNumbers(input, generatedText);
   if (!inventedNumbers.ok) warnings.push(`Обнаружены числа, не подтверждённые пользователем: ${inventedNumbers.invented.join(', ')}. Проверьте перед использованием.`);
+  const novelty = checkUnsupportedNoveltyClaims(input, generatedText);
+  if (!novelty.ok) warnings.push(`Обнаружены категоричные формулировки о новизне или превосходстве: «${novelty.found.join('», «')}». Система не проверяет их по литературе - убедитесь, что они подтверждены вашими данными и источниками, иначе смягчите или уберите.`);
   const scholarly = checkNoFabricatedScholarlyArtifacts(generatedText);
   if (scholarly.doiFound) warnings.push('Обнаружен DOI-подобный текст - система никогда не предоставляет реальные DOI, проверьте и удалите.');
   if (scholarly.citationMarkersFound) warnings.push('Обнаружены признаки цитирования (например, "[1]" или "(Автор, год)") - такие ссылки не подтверждены и не должны использоваться без проверки.');

@@ -393,7 +393,7 @@ export function ScientificWriter() {
           placeholder="Стиль, объём, особые пожелания" />
       </fieldset>
 
-      <div className="flex gap-2">
+      <div className="flex gap-2 flex-wrap">
         <button className="button primary" disabled={state === 'loading'}>{state === 'loading' ? 'Обработка…' : 'Сформировать'}</button>
         <button type="button" className="button secondary" onClick={clearDraft}>Очистить черновик</button>
         {(result || scaffold) && <button type="button" className="button secondary" onClick={copyResult}>Копировать результат</button>}

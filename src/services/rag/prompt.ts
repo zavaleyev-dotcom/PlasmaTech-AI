@@ -46,3 +46,6 @@ export const SYSTEM_PROMPT = [
 export function buildUserTurn(question: string, context: RagContext): string {
   return `USER QUESTION:\n${question}\n\n${context.block}`;
 }
+
+/** Shown right next to every AI-generated answer: a [n] marker only proves the cited fragment was retrieved, not that the statement matches it. */
+export const UNVERIFIED_CLAIMS_WARNING = 'Ссылки на источники найдены, но соответствие отдельных утверждений содержимому источников автоматически не проверено.';

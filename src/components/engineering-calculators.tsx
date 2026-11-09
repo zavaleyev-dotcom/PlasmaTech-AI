@@ -2,7 +2,7 @@
 
 import { useState, type FormEvent } from 'react';
 import {
-  calculateMeanFreePath, depositionInputKey, depositionUnitLabel, formatSignificant, meanFreePathInputKey, solveDeposition,
+  calculateMeanFreePath, depositionInputKey, depositionUnitLabel, formatSignificant, MEAN_FREE_PATH_MODEL_NOTE, meanFreePathInputKey, solveDeposition,
   type DepositionSolveFor, type GasPreset, type PressureUnit, type RateUnit, type ThicknessUnit, type TimeUnit,
 } from '@/services/workspace/engineering-calculators';
 import { Icon } from './icon';
@@ -134,6 +134,7 @@ function MeanFreePathCalculator() {
       {result ? <div className="demo-result">
         <h3>λ ≈ {result.meanFreePathMm.toPrecision(4)} мм ({result.meanFreePathM.toExponential(3)} м)</h3>
         <p className="muted small">{result.formula}</p>
+        <p className="muted small mt-2" data-testid="mfp-model-note">{MEAN_FREE_PATH_MODEL_NOTE}</p>
       </div> : stale ? <p className="mt-5" role="status">Исходные данные изменены - прежний результат неактуален. Нажмите «Рассчитать».</p> : <p className="mt-5">Заполните параметры и нажмите «Рассчитать».</p>}
     </section>
   </div>;

@@ -1,7 +1,7 @@
 'use client';
 import { useState } from 'react';
 import type { AnswerClaim, Citation, FusedChunk, RagDiagnostics, RagStatus, RetrievalMode } from '@/services/rag/types';
-import { INSUFFICIENT_DATA_ANSWER } from '@/services/rag/prompt';
+import { INSUFFICIENT_DATA_ANSWER, UNVERIFIED_CLAIMS_WARNING } from '@/services/rag/prompt';
 import styles from '@/components/scifinder/search.module.css';
 interface AskResponse {
   question: string; limit: number; mode: RetrievalMode; status: RagStatus; chunks: FusedChunk[]; citations: Citation[];
@@ -79,6 +79,7 @@ export function AskLibrary() {
         {result.status === 'insufficient_evidence' && <p className={styles.status}>{INSUFFICIENT_DATA_ANSWER} Ниже показаны найденные фрагменты для проверки.</p>}
         {result.status === 'answered' && !!answer.claims.length && <article className={styles.publication}>
           <h3>Ответ</h3>
+          <p role="note" className={styles.status} data-testid="unverified-claims-warning"><strong>Внимание:</strong> {UNVERIFIED_CLAIMS_WARNING}</p>
           {/* F21: explicit, honest distinction - a [n] marker only proves the claim cites a
               real retrieved source (see "Источники" below for its actual excerpt); it is
               never a claim that the statement's truth was semantically checked. No entailment

@@ -180,6 +180,13 @@ const PRESSURE_TO_PA: Record<PressureUnit, number> = { pa: 1, mbar: 100, torr: 1
 const GAS_DIAMETER_PM: Record<Exclude<GasPreset, 'custom'>, number> = { argon: 340, nitrogen: 364 };
 const BOLTZMANN_J_PER_K = 1.380649e-23;
 
+/** Shown next to every mean-free-path result: states what the number is and where the model stops being informative. */
+export const MEAN_FREE_PATH_MODEL_NOTE =
+  'Оценка по кинетической теории газа: идеальный газ, молекулы - твёрдые сферы с заданным эффективным диаметром столкновений. '
+  + 'Результат зависит от того, насколько эта модель применима к вашему газу и условиям. '
+  + 'λ описывает столкновения молекул газа друг с другом; когда λ сопоставима с размерами камеры или больше них (сильное разрежение), '
+  + 'поведение газа определяют столкновения со стенками и геометрия камеры, и значение λ само по себе их не описывает.';
+
 /** λ = kT / (√2 · π · d² · p) - the standard kinetic-theory mean free path formula. A
  *  well-established, independently verifiable physical relationship (see e.g. any vacuum
  *  technology reference), computed exactly, not approximated or looked up from a table. */
