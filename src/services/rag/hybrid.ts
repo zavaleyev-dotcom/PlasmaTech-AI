@@ -136,6 +136,11 @@ async function computeSemanticChunks(textStore: TextStore, provider: EmbeddingPr
   }
 }
 
+/** The store HAS vectors, but none of them was made by the current provider, model and dimension. Not "empty": nothing is deleted, rebuilt or converted - the user is told what to do. */
+export function incompatibleIndexReason(storedVectors: number, provider: Pick<EmbeddingProvider, 'id' | 'model' | 'dimension'>): string {
+  return `Индекс эмбеддингов (${storedVectors} векторов) построен другим провайдером, моделью или размерностью, чем текущие (${provider.id} / ${provider.model} / ${provider.dimension} изм.), и несовместим с ними. Он не удалён и не изменён; используется поиск по словам. Чтобы использовать семантический поиск, пересоберите индекс в разделе «Моя библиотека».`;
+}
+
 /**
  * Three modes:
  *   - 'lexical'  - FTS5 only (retrieveChunks(), unchanged from the pre-embeddings stage).
@@ -165,6 +170,7 @@ export async function hybridRetrieve(options: HybridRetrieveOptions): Promise<Hy
   if (requestedMode !== 'lexical' && !semanticReady) {
     fallbackReason = !embeddingProvider ? 'Семантический провайдер не настроен.'
       : !embeddingStore ? 'Индекс эмбеддингов недоступен.'
+      : embeddingStore.totalCount() > 0 ? incompatibleIndexReason(embeddingStore.totalCount(), embeddingProvider)
       : 'Индекс эмбеддингов пуст. Постройте его в разделе «Моя библиотека».';
   }
 

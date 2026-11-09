@@ -49,3 +49,8 @@ export function buildUserTurn(question: string, context: RagContext): string {
 
 /** Shown right next to every AI-generated answer: a [n] marker only proves the cited fragment was retrieved, not that the statement matches it. */
 export const UNVERIFIED_CLAIMS_WARNING = 'Ссылки на источники найдены, но соответствие отдельных утверждений содержимому источников автоматически не проверено.';
+
+/** Shown to every user (also in production) when a semantic/hybrid search ran over an index that does not cover all chunks. `coverage` is 0..1; the percentage is rounded DOWN so that an incomplete index never reads as 100%. */
+export function semanticCoverageWarning(coverage: number): string {
+  return `Семантический индекс содержит не все документы (проиндексировано ${Math.floor(coverage * 100)}% фрагментов). Результаты поиска могут быть неполными.`;
+}

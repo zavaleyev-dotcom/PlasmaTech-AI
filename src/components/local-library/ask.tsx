@@ -6,6 +6,7 @@ import styles from '@/components/scifinder/search.module.css';
 interface AskResponse {
   question: string; limit: number; mode: RetrievalMode; status: RagStatus; chunks: FusedChunk[]; citations: Citation[];
   answer: { claims: AnswerClaim[]; configured: boolean; error: string | null };
+  semanticWarning?: string;
   diagnostics?: RagDiagnostics;
 }
 const DEFAULT_LIMIT = 8;
@@ -66,6 +67,7 @@ export function AskLibrary() {
     {result && <div className={styles.results} aria-live="polite">
       {result.mode !== requestedMode && (requestedMode === 'hybrid' || requestedMode === 'semantic') &&
         <p className={styles.hint}>Семантический индекс пока не построен или недоступен - используется поиск по словам (FTS5).</p>}
+      {result.semanticWarning && <p role="status" className={styles.status} data-testid="semantic-coverage-warning">{result.semanticWarning}</p>}
       {(result.status === 'unavailable' || result.status === 'index_error') &&
         <p role="alert" className={`${styles.status} ${styles.error}`}>{answer?.error}</p>}
       {result.status !== 'unavailable' && result.status !== 'index_error' && !result.chunks.length &&

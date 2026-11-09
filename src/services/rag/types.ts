@@ -219,6 +219,8 @@ export interface RagResult {
   chunks: FusedChunk[];
   citations: Citation[];
   answer: AnswerResult;
+  /** Set (in every environment) when the search really used semantic vectors but the index does not cover all chunks: the results may be incomplete. Absent at full coverage and in lexical mode. */
+  semanticWarning?: string;
   /** Only populated outside production (see askLibrary in service.ts). */
   diagnostics?: RagDiagnostics;
 }

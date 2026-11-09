@@ -14,6 +14,7 @@ import type { ConsistencyCache } from './consistency-cache';
 import type { AnswerResult, FusedChunk, GroundingRejectionReason, RagContext, RagDiagnostics, RagResult, RagStatus, RetrievalDiagnostics, RetrievalMode, RetrievedChunk } from './types';
 import { parseAskInput } from './validation';
 import { AiLimitError } from '@/services/ai-guard';
+import { semanticCoverageWarning } from './prompt';
 
 export interface AskLibraryOptions {
   /** Injected for tests; defaults to the real on-disk store via openTextStore(). */
@@ -64,6 +65,11 @@ function emptyAnswer(configured: boolean, error: string | null): AnswerResult {
 
 function baseResult(question: string, limit: number, mode: RetrievalMode, status: RagStatus, answer: AnswerResult): RagResult {
   return { question, limit, mode, status, chunks: [], citations: [], answer };
+}
+
+/** The user-facing note for an index that covers only part of the chunks - from the coverage diagnostics that already exist, never from a new measurement. */
+function coverageNote(retrieval: RetrievalDiagnostics): { semanticWarning?: string } {
+  return retrieval.mode !== 'lexical' && retrieval.embeddingCoverage !== null && retrieval.embeddingCoverage < 1 ? { semanticWarning: semanticCoverageWarning(retrieval.embeddingCoverage) } : {};
 }
 
 function withDiagnostics(result: RagResult, diagnostics: RagDiagnostics, options: AskLibraryOptions): RagResult {
@@ -157,7 +163,7 @@ export async function askLibrary(input: unknown, options: AskLibraryOptions = {}
       return baseResult(question, limit, requestedMode, 'index_error', emptyAnswer(false, INDEX_ERROR_MESSAGE));
     }
     if (!chunks.length) {
-      const result: RagResult = { question, limit, mode: retrieval.mode, status: 'insufficient_evidence', chunks: [], citations: [], answer: emptyAnswer(true, null) };
+      const result: RagResult = { question, limit, mode: retrieval.mode, status: 'insufficient_evidence', chunks: [], citations: [], answer: emptyAnswer(true, null), ...coverageNote(retrieval) };
       return withDiagnostics(result, baseDiagnostics([], null, retrieval, 0, null), options);
     }
     const build = options.buildContext ?? buildContext;
@@ -166,14 +172,14 @@ export async function askLibrary(input: unknown, options: AskLibraryOptions = {}
       // Budget enforcement (context.ts) left no source with any surviving evidence text -
       // there is nothing a provider could possibly ground an answer in, so this is reported
       // (and short-circuited) the same way as an empty retrieval, without spending a call.
-      const result: RagResult = { question, limit, mode: retrieval.mode, status: 'insufficient_evidence', chunks, citations: [], answer: emptyAnswer(true, null) };
+      const result: RagResult = { question, limit, mode: retrieval.mode, status: 'insufficient_evidence', chunks, citations: [], answer: emptyAnswer(true, null), ...coverageNote(retrieval) };
       return withDiagnostics(result, baseDiagnostics(chunks, context, retrieval, 0, null), options);
     }
     const provider = options.provider ?? getAnswerProvider();
     const generationStart = Date.now();
     const { answer, status, rejectedReason } = await generateAnswer(question, context, provider);
     const generationMs = Date.now() - generationStart;
-    const result: RagResult = { question, limit, mode: retrieval.mode, status, chunks, citations: context.citations, answer };
+    const result: RagResult = { question, limit, mode: retrieval.mode, status, chunks, citations: context.citations, answer, ...coverageNote(retrieval) };
     return withDiagnostics(result, baseDiagnostics(chunks, context, retrieval, generationMs, rejectedReason), options);
   } finally { store.close(); embeddingStore?.close(); }
 }
