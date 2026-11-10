@@ -127,7 +127,10 @@ export function retrieveChunks(store: TextStore, question: string, limit: number
   // than a term common enough to match a large fraction of the corpus) - measured: several
   // individually-acceptable but moderately common terms (thousands of matches each) summed
   // to a multi-hundred-millisecond total when all run in the original question order.
-  const byFrequency = [...terms].sort((a, b) => termFrequency(store, a) - termFrequency(store, b));
+  // Terms that occur NOWHERE in the index (frequency 0 - typically generic question words such as "method" or "parameters" that this corpus never uses literally) can
+  // never match: left in, they sort first as "rarest" and fill all the fallback slots, so the terms that DO occur (a sample id, "hardness") are never searched. Only terms
+  // present in the index are candidates; the MAX_FALLBACK_TERMS rarest of those are searched.
+  const byFrequency = terms.map(term => ({ term, frequency: termFrequency(store, term) })).filter(item => item.frequency > 0).sort((a, b) => a.frequency - b.frequency).map(item => item.term);
   const perTerm = byFrequency.slice(0, MAX_FALLBACK_TERMS).map(term => collect(store, [term], limit));
   const fused = new Map<string, RetrievedChunk>();
   let rankingDegraded = strict.rankingDegraded;
